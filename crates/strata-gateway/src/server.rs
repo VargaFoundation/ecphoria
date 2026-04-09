@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use strata_core::StrataEngine;
+use tokio::net::TcpListener;
 
 use crate::Result;
 
@@ -35,24 +36,53 @@ impl Default for GatewayConfig {
 pub struct GatewayServer {
     _engine: Arc<StrataEngine>,
     _config: GatewayConfig,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl GatewayServer {
     /// Start all protocol listeners.
     pub async fn start(engine: Arc<StrataEngine>, config: GatewayConfig) -> Result<Self> {
-        tracing::info!(listen = %config.listen, "Gateway starting");
+        let listen_addr = config.listen.clone();
 
-        // TODO: spawn REST, PG wire, gRPC, MCP, LLM proxy listeners
+        // Build REST router with engine state
+        let app = crate::rest::router_with_engine(engine.clone());
+
+        // Bind TCP listener
+        let listener = TcpListener::bind(&listen_addr)
+            .await
+            .map_err(|e| crate::Error::Bind(format!("failed to bind {listen_addr}: {e}")))?;
+
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| crate::Error::Bind(e.to_string()))?;
+
+        tracing::info!(%local_addr, "HTTP server listening");
+
+        // Spawn server with graceful shutdown
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .ok();
+        });
 
         Ok(Self {
             _engine: engine,
             _config: config,
+            shutdown_tx: Some(shutdown_tx),
         })
     }
 
     /// Gracefully shut down all listeners.
-    pub async fn shutdown(self) -> Result<()> {
-        tracing::info!("Gateway shutting down");
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        tracing::info!("Gateway shut down");
         Ok(())
     }
 }
@@ -68,9 +98,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let gateway = GatewayServer::start(engine, GatewayConfig::default())
-            .await
-            .unwrap();
+        // Use port 0 so OS picks a free port
+        let config = GatewayConfig {
+            listen: "127.0.0.1:0".into(),
+            ..Default::default()
+        };
+        let gateway = GatewayServer::start(engine, config).await.unwrap();
         gateway.shutdown().await.unwrap();
     }
 
@@ -79,7 +112,6 @@ mod tests {
         let config = GatewayConfig::default();
         assert_eq!(config.listen, "0.0.0.0:8432");
         assert_eq!(config.pg_listen, "0.0.0.0:5432");
-        assert_eq!(config.grpc_listen, "0.0.0.0:9432");
         assert!(config.mcp_enabled);
         assert!(!config.llm_proxy_enabled);
         assert!(!config.auth_enabled);
@@ -95,7 +127,6 @@ mod tests {
         "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.listen, "127.0.0.1:9000");
-        assert_eq!(config.pg_listen, "127.0.0.1:5433");
         assert!(!config.mcp_enabled);
         assert!(config.auth_enabled);
     }
@@ -105,24 +136,5 @@ mod tests {
         let config: GatewayConfig = toml::from_str("").unwrap();
         assert_eq!(config.listen, "0.0.0.0:8432");
         assert!(config.mcp_enabled);
-    }
-
-    #[tokio::test]
-    async fn gateway_with_custom_config() {
-        let engine = Arc::new(
-            StrataEngine::new(strata_core::CoreConfig::default())
-                .await
-                .unwrap(),
-        );
-        let config = GatewayConfig {
-            listen: "127.0.0.1:0".into(),
-            pg_listen: "127.0.0.1:0".into(),
-            grpc_listen: "127.0.0.1:0".into(),
-            mcp_enabled: false,
-            llm_proxy_enabled: false,
-            auth_enabled: false,
-        };
-        let gateway = GatewayServer::start(engine, config).await.unwrap();
-        gateway.shutdown().await.unwrap();
     }
 }

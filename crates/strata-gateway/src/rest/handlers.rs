@@ -1,8 +1,14 @@
 //! REST API handler functions.
 
-use axum::Json;
+use std::sync::Arc;
 
-use super::models::{HealthResponse, IngestRequest, IngestResponse, QueryRequest, SearchRequest};
+use axum::extract::{Path, State};
+use axum::Json;
+use strata_core::StrataEngine;
+
+use super::models::*;
+
+// ── Health (stateless) ──────────────────────────────────────────────
 
 /// Health check endpoint.
 pub async fn health() -> Json<HealthResponse> {
@@ -12,20 +18,88 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
-/// Execute a SQL query.
-pub async fn query(Json(_req): Json<QueryRequest>) -> Json<serde_json::Value> {
-    // TODO: route to query engine
+// ── Stub handlers (no engine — for testing router shape) ────────────
+
+pub async fn query_no_engine(Json(_req): Json<QueryRequest>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "rows": [], "count": 0 }))
 }
 
-/// Ingest events.
-pub async fn ingest(Json(_req): Json<IngestRequest>) -> Json<IngestResponse> {
-    // TODO: route to ingest pipeline
+pub async fn ingest_no_engine(Json(_req): Json<IngestRequest>) -> Json<IngestResponse> {
     Json(IngestResponse { ingested: 0 })
 }
 
-/// Semantic search.
-pub async fn search(Json(_req): Json<SearchRequest>) -> Json<serde_json::Value> {
-    // TODO: route to semantic store
+pub async fn search_no_engine(Json(_req): Json<SearchRequest>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "results": [] }))
+}
+
+// ── Engine-backed handlers ──────────────────────────────────────────
+
+/// Execute a SQL query against the engine.
+pub async fn query(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<QueryRequest>,
+) -> Json<serde_json::Value> {
+    match engine.query_sql(&req.sql) {
+        Ok(rows) => {
+            let count = rows.len();
+            Json(serde_json::json!({ "rows": rows, "count": count }))
+        }
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// Ingest events into the engine.
+pub async fn ingest(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<IngestRequest>,
+) -> Json<IngestResponse> {
+    let events: Vec<strata_core::memory::episodic::Event> = req
+        .events
+        .into_iter()
+        .map(|payload| strata_core::memory::episodic::Event {
+            id: uuid::Uuid::new_v4(),
+            source: req.source.clone(),
+            event_type: payload
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            payload,
+            timestamp: chrono::Utc::now(),
+        })
+        .collect();
+
+    match engine.ingest(events).await {
+        Ok(count) => Json(IngestResponse { ingested: count }),
+        Err(_) => Json(IngestResponse { ingested: 0 }),
+    }
+}
+
+/// Get agent state.
+pub async fn state_get(
+    State(engine): State<Arc<StrataEngine>>,
+    Path((agent_id, key)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    match engine.state_get(&agent_id, &key).await {
+        Ok(Some(entry)) => Json(serde_json::json!({
+            "agent_id": entry.agent_id,
+            "key": entry.key,
+            "value": entry.value,
+            "version": entry.version,
+        })),
+        Ok(None) => Json(serde_json::json!({ "error": "not found" })),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// Set agent state.
+pub async fn state_set(
+    State(engine): State<Arc<StrataEngine>>,
+    Path((agent_id, key)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match engine.state_set(&agent_id, &key, body).await {
+        Ok(version) => Json(serde_json::json!({ "version": version })),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
 }

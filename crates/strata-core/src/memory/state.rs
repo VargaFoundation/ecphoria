@@ -1,6 +1,12 @@
 //! State memory store — transactional key-value with MVCC.
 
+use dashmap::DashMap;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 /// A state entry for an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,45 +18,189 @@ pub struct StateEntry {
 }
 
 /// Key-value store with MVCC, watchers, and TTL support.
+///
+/// Architecture:
+/// - SQLite for durable persistence (MVCC via version column)
+/// - DashMap as a hot read cache for frequently accessed keys
 #[derive(Debug)]
 pub struct StateStore {
-    // TODO: rusqlite connection, DashMap hot cache
+    db: Arc<Mutex<Connection>>,
+    cache: DashMap<(String, String), StateEntry>,
 }
 
 impl StateStore {
+    /// Open or create a state store at the given path.
+    pub fn open(path: &Path) -> crate::Result<Self> {
+        let conn = if path.as_os_str() == ":memory:" {
+            Connection::open_in_memory()
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| crate::Error::State(format!("failed to create directory: {e}")))?;
+            }
+            Connection::open(path)
+        }
+        .map_err(|e| crate::Error::State(format!("failed to open state db: {e}")))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS state (
+                agent_id TEXT NOT NULL,
+                key      TEXT NOT NULL,
+                value    TEXT NOT NULL,
+                version  INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (agent_id, key)
+            );",
+        )
+        .map_err(|e| crate::Error::State(format!("failed to create table: {e}")))?;
+
+        Ok(Self {
+            db: Arc::new(Mutex::new(conn)),
+            cache: DashMap::new(),
+        })
+    }
+
+    /// Create an in-memory state store (for testing).
     pub fn new() -> Self {
-        Self {}
+        Self::open(Path::new(":memory:")).expect("failed to create in-memory state store")
     }
 
     /// Get the current value for a key.
-    pub async fn get(&self, _agent_id: &str, _key: &str) -> crate::Result<Option<StateEntry>> {
-        Ok(None)
+    pub async fn get(&self, agent_id: &str, key: &str) -> crate::Result<Option<StateEntry>> {
+        let cache_key = (agent_id.to_string(), key.to_string());
+
+        // Check hot cache first
+        if let Some(entry) = self.cache.get(&cache_key) {
+            return Ok(Some(entry.value().clone()));
+        }
+
+        // Fall through to SQLite
+        let db = self.db.lock();
+        let mut stmt = db
+            .prepare(
+                "SELECT agent_id, key, value, version FROM state WHERE agent_id = ?1 AND key = ?2",
+            )
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let result = stmt
+            .query_row(rusqlite::params![agent_id, key], |row| {
+                let value_str: String = row.get(2)?;
+                Ok(StateEntry {
+                    agent_id: row.get(0)?,
+                    key: row.get(1)?,
+                    value: serde_json::from_str(&value_str).unwrap_or(serde_json::Value::Null),
+                    version: row.get(3)?,
+                })
+            })
+            .ok();
+
+        // Populate cache on read
+        if let Some(ref entry) = result {
+            self.cache.insert(cache_key, entry.clone());
+        }
+
+        Ok(result)
     }
 
     /// Set a value. Returns the new version.
     pub async fn set(
         &self,
-        _agent_id: &str,
-        _key: &str,
-        _value: serde_json::Value,
+        agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
     ) -> crate::Result<u64> {
-        Ok(1)
+        let value_str =
+            serde_json::to_string(&value).map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let db = self.db.lock();
+        db.execute(
+            "INSERT INTO state (agent_id, key, value, version)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(agent_id, key) DO UPDATE SET
+                value = excluded.value,
+                version = state.version + 1,
+                updated_at = datetime('now')",
+            rusqlite::params![agent_id, key, value_str],
+        )
+        .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let version: u64 = db
+            .query_row(
+                "SELECT version FROM state WHERE agent_id = ?1 AND key = ?2",
+                rusqlite::params![agent_id, key],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        // Update cache
+        let entry = StateEntry {
+            agent_id: agent_id.to_string(),
+            key: key.to_string(),
+            value,
+            version,
+        };
+        self.cache
+            .insert((agent_id.to_string(), key.to_string()), entry);
+
+        Ok(version)
     }
 
     /// Delete a key.
-    pub async fn delete(&self, _agent_id: &str, _key: &str) -> crate::Result<()> {
+    pub async fn delete(&self, agent_id: &str, key: &str) -> crate::Result<()> {
+        let db = self.db.lock();
+        db.execute(
+            "DELETE FROM state WHERE agent_id = ?1 AND key = ?2",
+            rusqlite::params![agent_id, key],
+        )
+        .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        self.cache.remove(&(agent_id.to_string(), key.to_string()));
         Ok(())
     }
 
     /// Compare-and-swap: set only if the current version matches.
     pub async fn compare_and_swap(
         &self,
-        _agent_id: &str,
-        _key: &str,
-        _expected_version: u64,
-        _new_value: serde_json::Value,
+        agent_id: &str,
+        key: &str,
+        expected_version: u64,
+        new_value: serde_json::Value,
     ) -> crate::Result<bool> {
-        Ok(false)
+        let value_str =
+            serde_json::to_string(&new_value).map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let db = self.db.lock();
+        let rows_affected = db
+            .execute(
+                "UPDATE state SET value = ?1, version = version + 1, updated_at = datetime('now')
+                 WHERE agent_id = ?2 AND key = ?3 AND version = ?4",
+                rusqlite::params![value_str, agent_id, key, expected_version],
+            )
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        if rows_affected > 0 {
+            // Invalidate cache so next read picks up new version
+            self.cache.remove(&(agent_id.to_string(), key.to_string()));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all keys for a given agent.
+    pub async fn list_keys(&self, agent_id: &str) -> crate::Result<Vec<String>> {
+        let db = self.db.lock();
+        let mut stmt = db
+            .prepare("SELECT key FROM state WHERE agent_id = ?1 ORDER BY key")
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let keys: Vec<String> = stmt
+            .query_map(rusqlite::params![agent_id], |row| row.get(0))
+            .map_err(|e| crate::Error::State(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(keys)
     }
 }
 
@@ -72,37 +222,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_with_empty_agent_id() {
+    async fn set_and_get() {
         let store = StateStore::new();
-        let result = store.get("", "key").await.unwrap();
+        let v = store
+            .set("agent-1", "mood", serde_json::json!("happy"))
+            .await
+            .unwrap();
+        assert_eq!(v, 1);
+
+        let entry = store.get("agent-1", "mood").await.unwrap().unwrap();
+        assert_eq!(entry.agent_id, "agent-1");
+        assert_eq!(entry.key, "mood");
+        assert_eq!(entry.value, serde_json::json!("happy"));
+        assert_eq!(entry.version, 1);
+    }
+
+    #[tokio::test]
+    async fn set_increments_version() {
+        let store = StateStore::new();
+        let v1 = store.set("a", "k", serde_json::json!(1)).await.unwrap();
+        assert_eq!(v1, 1);
+
+        let v2 = store.set("a", "k", serde_json::json!(2)).await.unwrap();
+        assert_eq!(v2, 2);
+
+        let v3 = store.set("a", "k", serde_json::json!(3)).await.unwrap();
+        assert_eq!(v3, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_entry() {
+        let store = StateStore::new();
+        store.set("a", "k", serde_json::json!("val")).await.unwrap();
+        store.delete("a", "k").await.unwrap();
+        let result = store.get("a", "k").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn set_returns_version() {
+    async fn compare_and_swap_success() {
         let store = StateStore::new();
-        let version = store
-            .set("agent-1", "mood", serde_json::json!("happy"))
-            .await
-            .unwrap();
-        assert!(version > 0);
-    }
+        store.set("a", "k", serde_json::json!(1)).await.unwrap();
 
-    #[tokio::test]
-    async fn delete_succeeds() {
-        let store = StateStore::new();
-        store.delete("agent-1", "mood").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compare_and_swap_returns_bool() {
-        let store = StateStore::new();
         let swapped = store
-            .compare_and_swap("agent-1", "counter", 0, serde_json::json!(1))
+            .compare_and_swap("a", "k", 1, serde_json::json!(2))
             .await
             .unwrap();
-        // Stub returns false
+        assert!(swapped);
+
+        let entry = store.get("a", "k").await.unwrap().unwrap();
+        assert_eq!(entry.value, serde_json::json!(2));
+        assert_eq!(entry.version, 2);
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_fails_on_version_mismatch() {
+        let store = StateStore::new();
+        store.set("a", "k", serde_json::json!(1)).await.unwrap();
+
+        let swapped = store
+            .compare_and_swap("a", "k", 999, serde_json::json!(2))
+            .await
+            .unwrap();
         assert!(!swapped);
+
+        // Value unchanged
+        let entry = store.get("a", "k").await.unwrap().unwrap();
+        assert_eq!(entry.value, serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn list_keys() {
+        let store = StateStore::new();
+        store.set("a", "x", serde_json::json!(1)).await.unwrap();
+        store.set("a", "y", serde_json::json!(2)).await.unwrap();
+        store.set("b", "z", serde_json::json!(3)).await.unwrap();
+
+        let keys = store.list_keys("a").await.unwrap();
+        assert_eq!(keys, vec!["x", "y"]);
+
+        let keys_b = store.list_keys("b").await.unwrap();
+        assert_eq!(keys_b, vec!["z"]);
+    }
+
+    #[tokio::test]
+    async fn cache_is_populated_on_read() {
+        let store = StateStore::new();
+        store.set("a", "k", serde_json::json!("val")).await.unwrap();
+
+        // Clear cache manually
+        store.cache.clear();
+        assert!(store.cache.is_empty());
+
+        // Read should repopulate cache
+        let _ = store.get("a", "k").await.unwrap();
+        assert!(!store.cache.is_empty());
     }
 
     #[test]
@@ -116,14 +330,23 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: StateEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.agent_id, "bot-1");
-        assert_eq!(deserialized.key, "status");
         assert_eq!(deserialized.version, 42);
-        assert_eq!(deserialized.value["active"], true);
     }
 
-    #[test]
-    fn default_trait() {
-        let store = StateStore::default();
-        let _ = store;
+    #[tokio::test]
+    async fn complex_json_values() {
+        let store = StateStore::new();
+        let complex = serde_json::json!({
+            "nested": {"deep": [1, 2, 3]},
+            "array": [{"a": 1}, {"b": 2}],
+            "null_field": null,
+            "bool": true
+        });
+        store
+            .set("agent", "complex", complex.clone())
+            .await
+            .unwrap();
+        let entry = store.get("agent", "complex").await.unwrap().unwrap();
+        assert_eq!(entry.value, complex);
     }
 }

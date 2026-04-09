@@ -1,27 +1,32 @@
 //! Ingestion pipeline — receives events, stores them, triggers embedding.
 
-use crate::memory::episodic::Event;
+use std::sync::Arc;
+
+use crate::memory::episodic::{EpisodicStore, Event};
 
 /// Pipeline that processes incoming events into the memory stores.
+#[derive(Debug)]
 pub struct IngestPipeline {
-    // TODO: references to EpisodicStore, EmbeddingProvider
+    episodic: Arc<EpisodicStore>,
 }
 
 impl IngestPipeline {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(episodic: Arc<EpisodicStore>) -> Self {
+        Self { episodic }
     }
 
     /// Ingest a batch of events.
-    pub async fn ingest(&self, _events: Vec<Event>) -> crate::Result<u64> {
-        // TODO: validate, store in episodic, auto-embed, update semantic
-        Ok(0)
-    }
-}
+    pub async fn ingest(&self, events: Vec<Event>) -> crate::Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
 
-impl Default for IngestPipeline {
-    fn default() -> Self {
-        Self::new()
+        let count = self.episodic.append(&events).await?;
+        tracing::debug!(count, "ingested events");
+
+        // TODO: auto-embed events via EmbeddingProvider and upsert to SemanticStore
+
+        Ok(count)
     }
 }
 
@@ -43,29 +48,32 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_empty_batch() {
-        let pipeline = IngestPipeline::new();
+        let store = Arc::new(EpisodicStore::new());
+        let pipeline = IngestPipeline::new(store);
         let count = pipeline.ingest(vec![]).await.unwrap();
         assert_eq!(count, 0);
     }
 
     #[tokio::test]
-    async fn ingest_single_event() {
-        let pipeline = IngestPipeline::new();
-        let count = pipeline.ingest(vec![make_event("app")]).await.unwrap();
-        assert_eq!(count, 0); // Stub returns 0
+    async fn ingest_events_persisted() {
+        let store = Arc::new(EpisodicStore::new());
+        let pipeline = IngestPipeline::new(store.clone());
+
+        let count = pipeline
+            .ingest(vec![make_event("app"), make_event("app")])
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(store.count().await.unwrap(), 2);
     }
 
     #[tokio::test]
-    async fn ingest_multiple_events() {
-        let pipeline = IngestPipeline::new();
-        let events: Vec<Event> = (0..100).map(|_| make_event("load-test")).collect();
-        let count = pipeline.ingest(events).await.unwrap();
-        assert_eq!(count, 0);
-    }
+    async fn ingest_multiple_batches() {
+        let store = Arc::new(EpisodicStore::new());
+        let pipeline = IngestPipeline::new(store.clone());
 
-    #[test]
-    fn default_trait() {
-        let pipeline = IngestPipeline::default();
-        let _ = pipeline;
+        pipeline.ingest(vec![make_event("a")]).await.unwrap();
+        pipeline.ingest(vec![make_event("b")]).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 2);
     }
 }

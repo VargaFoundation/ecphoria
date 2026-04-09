@@ -106,6 +106,28 @@ All prefixed with `STRATA_`. Nested keys use `__`. Examples:
 - `STRATA_EMBEDDING__PROVIDER` — `ollama` or `openai`
 - `STRATA_EMBEDDING__OLLAMA_URL` — Ollama URL (default: `http://localhost:11434`)
 
+## Implementation Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| **EpisodicStore** | Working | DuckDB in-memory, append/query/count |
+| **StateStore** | Working | rusqlite + DashMap, CRUD + compare-and-swap |
+| **LocalStorage** | Working | tokio::fs, put/get/delete/list |
+| **IngestPipeline** | Working | Validates events → appends to EpisodicStore |
+| **StrataEngine** | Working | Wires subsystems, exposes public API |
+| **REST API** | Working | Health, query, ingest, state endpoints with engine |
+| **HTTP Server** | Working | axum with graceful shutdown |
+| **Ollama embedding** | Working | HTTP client to /api/embed |
+| **OpenAI embedding** | Working | HTTP client to /v1/embeddings |
+| **Config loading** | Working | TOML + env vars layered |
+| SemanticStore | Stub | USearch HNSW pending |
+| PG wire protocol | Stub | pgwire handler pending |
+| gRPC | Stub | tonic service pending |
+| MCP server | Stub | Transport pending, tools/resources defined |
+| LLM proxy | Stub | Router/providers pending |
+| S3 storage | Stub | aws-sdk-s3 pending |
+| Cluster/Raft | Stub | openraft pending (Phase 3) |
+
 ## Parallel Development Guidelines
 
 Each crate is designed for independent development by different agents:

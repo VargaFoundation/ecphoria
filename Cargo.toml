@@ -92,6 +92,9 @@ rand = { version = "0.9" }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# Testing
+tempfile = { version = "3" }
+
 [profile.dev.package."*"]
 opt-level = 2
 

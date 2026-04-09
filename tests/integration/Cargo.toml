@@ -5,10 +5,10 @@ version.workspace = true
 license.workspace = true
 publish = false
 
-# This crate has no library or binary — only integration tests.
+# Empty lib to satisfy Cargo; all tests are in tests/*.rs
 [lib]
 name = "strata_integration_tests"
-path = "tests/lib.rs"
+path = "src/lib.rs"
 
 [dev-dependencies]
 strata-core.workspace = true

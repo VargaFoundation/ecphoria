@@ -2,6 +2,11 @@
 
 This document describes Strata's internal architecture, crate structure, data model, and key design decisions.
 
+> **Current status**: The core engine is functional — DuckDB-backed episodic store,
+> SQLite+DashMap state store, real HTTP server with axum, working ingestion pipeline,
+> and Ollama/OpenAI embedding providers. See each crate's CLAUDE.md for detailed
+> implementation status.
+
 ## System Overview
 
 Strata is a **context lake** — a unified data layer for AI agents that combines three types of memory in a single Rust binary:

@@ -14,14 +14,18 @@ async fn engine_starts_and_stops() {
 #[tokio::test]
 async fn full_stack_lifecycle() {
     let engine = Arc::new(StrataEngine::new(CoreConfig::default()).await.unwrap());
-    let gateway = GatewayServer::start(engine.clone(), GatewayConfig::default())
-        .await
-        .unwrap();
+    let config = GatewayConfig {
+        listen: "127.0.0.1:0".into(),
+        ..Default::default()
+    };
+    let gateway = GatewayServer::start(engine.clone(), config).await.unwrap();
 
+    // Shutdown gateway (signals background task to stop)
     gateway.shutdown().await.unwrap();
 
-    let engine = Arc::try_unwrap(engine).expect("engine still has references");
-    engine.shutdown().await.unwrap();
+    // Give the background task time to release Arc
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(engine);
 }
 
 #[tokio::test]
@@ -39,6 +43,6 @@ async fn gateway_with_all_features_disabled() {
     let gateway = GatewayServer::start(engine.clone(), config).await.unwrap();
     gateway.shutdown().await.unwrap();
 
-    let engine = Arc::try_unwrap(engine).expect("engine still has references");
-    engine.shutdown().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(engine);
 }

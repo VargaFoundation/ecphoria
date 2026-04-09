@@ -5,38 +5,38 @@
 Protocol layer. Translates external protocols (PostgreSQL wire, REST, gRPC, MCP,
 LLM proxy) into calls on `strata_core::StrataEngine`. Also handles authentication.
 
+## Implementation Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| REST API | **Working** | axum router, health/query/ingest/search/state endpoints |
+| HTTP Server | **Working** | Binds port, graceful shutdown via oneshot channel |
+| MCP definitions | Defined | Tools/resources/prompts listed, transport stub |
+| PG wire | Stub | pgwire handler skeleton |
+| gRPC | Stub | tonic service skeleton |
+| LLM proxy | Stub | Router/providers/cache skeletons |
+| Auth | Stub | API key/JWT validation, middleware types defined |
+
 ## Public API
 
-- `GatewayServer::start(engine, config)` — starts all protocol listeners
+- `GatewayServer::start(engine, config)` — binds HTTP port, starts serving
 - `GatewayServer::shutdown()` — graceful shutdown
+- `rest::router()` — stateless router for testing
+- `rest::router_with_engine(engine)` — full router with engine state
 
 ## REST Routes
 
-- `GET  /health` — health check
-- `POST /api/v1/query` — SQL query execution
-- `POST /api/v1/ingest` — event ingestion
-- `POST /api/v1/search` — semantic search
-- `GET  /mcp` — MCP SSE endpoint
-- `POST /mcp` — MCP message endpoint
-- `POST /v1/chat/completions` — LLM proxy (OpenAI-compatible)
-
-## Internal Architecture
-
-```
-src/
-  lib.rs           GatewayServer, re-exports
-  error.rs         GatewayError (wraps CoreError + protocol errors)
-  server.rs        GatewayServer + GatewayConfig
-  pg_wire/         PostgreSQL wire protocol (pgwire crate)
-  rest/            REST API (axum): routes, handlers, models
-  grpc/            gRPC server (tonic) — stub pending proto
-  mcp/             MCP server: transport (SSE), resources, tools, prompts
-  llm_proxy/       OpenAI-compatible proxy: router, providers, cache
-  auth/            Authentication: api_key, jwt, middleware
-```
+| Method | Path | Handler | Status |
+|--------|------|---------|--------|
+| GET | `/health` | health check | **Working** |
+| POST | `/api/v1/query` | SQL query via DuckDB | **Working** |
+| POST | `/api/v1/ingest` | event ingestion | **Working** |
+| POST | `/api/v1/search` | semantic search | Stub |
+| GET | `/api/v1/state/{agent_id}/{key}` | get state | **Working** |
+| PUT | `/api/v1/state/{agent_id}/{key}` | set state | **Working** |
 
 ## Testing
 
-- `cargo test -p strata-gateway`
-- Handler tests: construct engine with default config, test handler functions
-- MCP tests: HTTP client to verify SSE stream and tool calls
+- `cargo test -p strata-gateway` (32 tests)
+- Integration tests in `tests/integration/` test full router with tower::ServiceExt::oneshot
+- Gateway lifecycle tests verify start/shutdown with port 0
