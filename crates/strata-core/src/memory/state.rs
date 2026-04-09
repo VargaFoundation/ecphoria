@@ -94,9 +94,10 @@ impl StateStore {
             })
             .ok();
 
-        // Populate cache on read
+        // Populate cache on read — use or_insert to avoid overwriting a
+        // concurrent write that happened between our cache miss and DB read.
         if let Some(ref entry) = result {
-            self.cache.insert(cache_key, entry.clone());
+            self.cache.entry(cache_key).or_insert_with(|| entry.clone());
         }
 
         Ok(result)
@@ -187,15 +188,26 @@ impl StateStore {
         }
     }
 
-    /// List all keys for a given agent.
+    /// List keys for a given agent (limited to max_keys, default 10,000).
     pub async fn list_keys(&self, agent_id: &str) -> crate::Result<Vec<String>> {
+        self.list_keys_limited(agent_id, 10_000).await
+    }
+
+    /// List keys for a given agent with an explicit limit.
+    pub async fn list_keys_limited(
+        &self,
+        agent_id: &str,
+        max_keys: usize,
+    ) -> crate::Result<Vec<String>> {
         let db = self.db.lock();
         let mut stmt = db
-            .prepare("SELECT key FROM state WHERE agent_id = ?1 ORDER BY key")
+            .prepare("SELECT key FROM state WHERE agent_id = ?1 ORDER BY key LIMIT ?2")
             .map_err(|e| crate::Error::State(e.to_string()))?;
 
         let keys: Vec<String> = stmt
-            .query_map(rusqlite::params![agent_id], |row| row.get(0))
+            .query_map(rusqlite::params![agent_id, max_keys as i64], |row| {
+                row.get(0)
+            })
             .map_err(|e| crate::Error::State(e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();

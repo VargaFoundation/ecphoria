@@ -13,14 +13,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Install Prometheus metrics recorder
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
     banner::print();
 
     let server_config = config::load()?;
 
     let engine = Arc::new(strata_core::StrataEngine::new(server_config.core).await?);
 
-    let gateway =
-        strata_gateway::GatewayServer::start(engine.clone(), server_config.gateway).await?;
+    let gateway = strata_gateway::GatewayServer::start(
+        engine.clone(),
+        server_config.gateway,
+        Some(prometheus_handle),
+    )
+    .await?;
 
     signals::wait_for_shutdown().await;
 

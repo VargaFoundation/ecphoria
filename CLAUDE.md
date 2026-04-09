@@ -123,10 +123,13 @@ All prefixed with `STRATA_`. Nested keys use `__`. Examples:
 | **SemanticStore** | Working | USearch HNSW index, upsert/search/delete with cosine similarity |
 | **PG wire protocol** | Working | pgwire SimpleQuery+ExtendedQuery, routes SQL to DuckDB |
 | **MCP server** | Working | JSON-RPC at /mcp, tools/call for query/ingest/state, resources/list |
-| gRPC | Stub | tonic service pending |
-| LLM proxy | Stub | Router/providers pending |
-| S3 storage | Stub | aws-sdk-s3 pending |
-| Cluster/Raft | Stub | openraft pending (Phase 3) |
+| **LLM Proxy** | Working | /v1/chat/completions with auto-RAG from episodic context, multi-provider (OpenAI/Ollama/Anthropic) |
+| **S3 Storage** | Working | aws-sdk-s3, put/get/delete/list, MinIO-compatible |
+| **MaterializedViews** | Working | DuckDB CREATE TABLE AS, refresh, drop, list |
+| **IngestPipeline** | Working | Auto-embed via EmbeddingProvider when configured |
+| **gRPC** | Working | tonic, proto/strata.proto, Query/Ingest/Search/State/Health RPCs |
+| **Webhook normalizers** | Working | GitHub, Sentry, Slack, PagerDuty + generic |
+| Cluster/Raft | Stub | openraft (Phase 3) |
 
 ## Parallel Development Guidelines
 

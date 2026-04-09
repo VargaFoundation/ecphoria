@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package strata;
+
+// Strata Context Lake gRPC Service
+service Strata {
+  // Execute a SQL query
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Ingest events into episodic memory
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+
+  // Semantic search
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Get agent state
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+
+  // Set agent state
+  rpc SetState(SetStateRequest) returns (SetStateResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message QueryRequest {
+  string sql = 1;
+}
+
+message QueryResponse {
+  repeated string rows_json = 1; // Each row as a JSON string
+  int64 count = 2;
+}
+
+message IngestRequest {
+  string source = 1;
+  repeated string events_json = 2; // Each event as a JSON string
+}
+
+message IngestResponse {
+  uint64 ingested = 1;
+}
+
+message SearchRequest {
+  string query = 1;
+  repeated float vector = 2;
+  uint32 k = 3;
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+}
+
+message SearchResult {
+  string id = 1;
+  string content = 2;
+  float score = 3;
+  string metadata_json = 4;
+}
+
+message GetStateRequest {
+  string agent_id = 1;
+  string key = 2;
+}
+
+message GetStateResponse {
+  string agent_id = 1;
+  string key = 2;
+  string value_json = 3;
+  uint64 version = 4;
+  bool found = 5;
+}
+
+message SetStateRequest {
+  string agent_id = 1;
+  string key = 2;
+  string value_json = 3;
+}
+
+message SetStateResponse {
+  uint64 version = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}

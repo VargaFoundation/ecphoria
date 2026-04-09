@@ -18,7 +18,7 @@ async fn full_stack_lifecycle() {
         listen: "127.0.0.1:0".into(),
         ..Default::default()
     };
-    let gateway = GatewayServer::start(engine.clone(), config).await.unwrap();
+    let gateway = GatewayServer::start(engine.clone(), config, None).await.unwrap();
 
     // Shutdown gateway (signals background task to stop)
     gateway.shutdown().await.unwrap();
@@ -38,9 +38,10 @@ async fn gateway_with_all_features_disabled() {
         mcp_enabled: false,
         llm_proxy_enabled: false,
         auth_enabled: false,
+        ..Default::default()
     };
 
-    let gateway = GatewayServer::start(engine.clone(), config).await.unwrap();
+    let gateway = GatewayServer::start(engine.clone(), config, None).await.unwrap();
     gateway.shutdown().await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

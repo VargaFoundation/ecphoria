@@ -216,7 +216,11 @@ async fn call_tool(
                 .ok_or("missing 'sql' parameter")?;
             engine
                 .query_sql(sql)
-                .map(|rows| serde_json::json!({"rows": rows, "count": rows.len()}))
+                .await
+                .map(|rows| {
+                    let count = rows.len();
+                    serde_json::json!({"rows": rows, "count": count})
+                })
                 .map_err(|e| e.to_string())
         }
 

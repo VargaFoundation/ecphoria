@@ -1,9 +1,15 @@
 use crate::client::StrataClient;
-use crate::output;
 
 pub async fn run(url: &str) -> anyhow::Result<()> {
     let client = StrataClient::new(url);
     let health = client.health().await?;
-    output::print_json(&health, false);
+
+    let status = health["status"].as_str().unwrap_or("unknown");
+    let version = health["version"].as_str().unwrap_or("unknown");
+
+    println!("Status:  {status}");
+    println!("Version: {version}");
+    println!("URL:     {url}");
+
     Ok(())
 }

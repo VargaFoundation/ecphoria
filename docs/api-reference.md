@@ -107,6 +107,38 @@ Response:
 }
 ```
 
+### Agent State
+
+Read and write per-agent key-value state.
+
+```
+GET /api/v1/state/{agent_id}/{key}
+```
+
+Response:
+```json
+{
+  "agent_id": "support-bot",
+  "key": "mood",
+  "value": "happy",
+  "version": 3
+}
+```
+
+```
+PUT /api/v1/state/{agent_id}/{key}
+Content-Type: application/json
+
+"happy"
+```
+
+Response:
+```json
+{
+  "version": 4
+}
+```
+
 ## PostgreSQL Wire Protocol
 
 Strata speaks the PostgreSQL wire protocol on port 5432. Connect with any PostgreSQL client.
@@ -207,13 +239,18 @@ Request (same as OpenAI API):
 ```
 
 Strata automatically:
-1. Embeds the user message
-2. Searches semantic memory for relevant context
+1. Extracts the last user message
+2. Queries episodic memory for recent relevant events
 3. Prepends context to the system prompt
-4. Forwards to the configured LLM provider
-5. Caches the response by semantic similarity
+4. Determines the LLM provider from the model name (gpt-* → OpenAI, claude-* → Anthropic, other → Ollama)
+5. Forwards the enriched request to the provider
 
-Enable with `gateway.llm_proxy_enabled = true` in configuration.
+Supported providers:
+- **OpenAI**: models starting with `gpt`, `o1`, `o3`
+- **Anthropic**: models starting with `claude` (API translation pending)
+- **Ollama**: all other models (local inference)
+
+The endpoint is always available at `/v1/chat/completions`.
 
 ## CLI Commands
 

@@ -23,6 +23,7 @@ reqwest.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+sqlparser.workspace = true
 
 thiserror.workspace = true
 anyhow.workspace = true

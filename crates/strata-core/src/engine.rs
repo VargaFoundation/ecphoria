@@ -2,6 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::CoreConfig;
+use crate::embedding::ollama::OllamaProvider;
+use crate::embedding::openai::OpenAiProvider;
+use crate::embedding::EmbeddingProvider;
 use crate::ingest::IngestPipeline;
 use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
@@ -21,8 +24,15 @@ pub struct StrataEngine {
 impl StrataEngine {
     /// Create and initialize a new Strata engine.
     pub async fn new(config: CoreConfig) -> Result<Self> {
-        // Initialize episodic store (in-memory DuckDB)
-        let episodic = Arc::new(EpisodicStore::new());
+        // Initialize episodic store (file-backed or in-memory DuckDB)
+        let episodic_path = Path::new(&config.memory.episodic.db_path);
+        let episodic = Arc::new(EpisodicStore::open(episodic_path).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "falling back to in-memory episodic store");
+            EpisodicStore::new()
+        }));
+        if config.memory.episodic.db_path != ":memory:" {
+            tracing::info!(path = %config.memory.episodic.db_path, "episodic store: file-backed");
+        }
 
         // Initialize semantic store
         let semantic = Arc::new(
@@ -37,8 +47,48 @@ impl StrataEngine {
             StateStore::new()
         }));
 
+        // Initialize embedding provider from config
+        let embedding: Option<Arc<dyn EmbeddingProvider>> = match config.embedding.provider.as_str()
+        {
+            "ollama" => {
+                tracing::info!(
+                    model = %config.embedding.model,
+                    url = %config.embedding.ollama_url,
+                    "embedding provider: ollama"
+                );
+                Some(Arc::new(OllamaProvider::new(
+                    config.embedding.ollama_url.clone(),
+                    config.embedding.model.clone(),
+                    config.embedding.dimension,
+                )))
+            }
+            "openai" if !config.embedding.openai_api_key.is_empty() => {
+                tracing::info!(model = %config.embedding.model, "embedding provider: openai");
+                Some(Arc::new(OpenAiProvider::new(
+                    config.embedding.openai_api_key.clone(),
+                    config.embedding.model.clone(),
+                    config.embedding.dimension,
+                )))
+            }
+            other => {
+                tracing::warn!(
+                    provider = %other,
+                    "unknown or unconfigured embedding provider, auto-embedding disabled"
+                );
+                None
+            }
+        };
+
         // Initialize ingest pipeline
-        let ingest = IngestPipeline::new(episodic.clone());
+        let ingest = match embedding {
+            Some(emb) => IngestPipeline::with_embedding(
+                episodic.clone(),
+                semantic.clone(),
+                emb,
+                config.embedding.batch_size,
+            ),
+            None => IngestPipeline::new(episodic.clone()),
+        };
 
         tracing::info!("Strata engine initialized");
 
@@ -69,8 +119,23 @@ impl StrataEngine {
     }
 
     /// Execute raw SQL against the episodic store.
-    pub fn query_sql(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
-        self.episodic.query_sql(sql)
+    ///
+    /// Runs on a blocking thread to avoid starving the tokio runtime,
+    /// since the underlying DuckDB operations hold a parking_lot Mutex.
+    /// Enforces the configured query timeout.
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
+        let episodic = self.episodic.clone();
+        let sql = sql.to_string();
+        let max_rows = self.config.query.max_rows;
+        let timeout = std::time::Duration::from_millis(self.config.query.timeout_ms);
+
+        tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || episodic.query_sql_limited(&sql, max_rows)),
+        )
+        .await
+        .map_err(|_| crate::Error::Query("query timed out".into()))?
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("task join error: {e}")))?
     }
 
     /// Count total events.
@@ -193,7 +258,10 @@ mod tests {
     #[tokio::test]
     async fn engine_query_sql() {
         let engine = StrataEngine::new(CoreConfig::default()).await.unwrap();
-        let rows = engine.query_sql("SELECT 42::VARCHAR as answer").unwrap();
+        let rows = engine
+            .query_sql("SELECT 42::VARCHAR as answer")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["answer"], "42");
     }

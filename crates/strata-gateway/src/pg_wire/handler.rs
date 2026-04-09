@@ -48,7 +48,7 @@ impl SimpleQueryHandler for PgWireHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         // Route all queries through the engine's DuckDB
-        match self.engine.query_sql(query) {
+        match self.engine.query_sql(query).await {
             Ok(rows) => {
                 if rows.is_empty() {
                     // Could be a DDL/DML statement
@@ -137,7 +137,7 @@ impl ExtendedQueryHandler for PgWireHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let query = &portal.statement.statement;
-        match self.engine.query_sql(query) {
+        match self.engine.query_sql(query).await {
             Ok(rows) if rows.is_empty() => Ok(Response::Execution(Tag::new("OK"))),
             Ok(rows) => {
                 let field_names: Vec<String> = rows
@@ -258,22 +258,38 @@ impl PgWireServerHandlers for PgWireFactory {
 }
 
 /// Start the PG wire server on the given address.
+///
+/// `max_connections` limits concurrent PG wire connections via a semaphore.
 pub async fn start_pg_wire(
     addr: &str,
     engine: Arc<StrataEngine>,
+    max_connections: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let factory = Arc::new(PgWireFactory::new(engine));
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
 
-    tracing::info!(addr, "PG wire server listening");
+    tracing::info!(addr, max_connections, "PG wire server listening");
 
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((socket, _)) => {
+                Ok((socket, peer_addr)) => {
+                    let permit = match semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!(
+                                %peer_addr,
+                                "PG wire connection rejected: max connections reached"
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                    };
                     let factory_ref = factory.clone();
                     tokio::spawn(async move {
                         let _ = pgwire::tokio::process_socket(socket, None, factory_ref).await;
+                        drop(permit);
                     });
                 }
                 Err(e) => {

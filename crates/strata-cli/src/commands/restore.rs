@@ -1,5 +1,9 @@
 pub async fn run(_url: &str, from: &str) -> anyhow::Result<()> {
-    // TODO: call /api/v1/restore endpoint
-    println!("Restoring from: {from}");
+    println!("Restore source: {from}");
+    println!("Note: restore requires direct access to the Strata data directory");
+    println!(
+        "      Use 'docker compose exec strata strata-server restore' for production restores"
+    );
+
     Ok(())
 }

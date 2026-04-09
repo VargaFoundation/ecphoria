@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use strata_core::StrataEngine;
 use tokio::net::TcpListener;
 
@@ -17,6 +18,7 @@ pub struct GatewayConfig {
     pub mcp_enabled: bool,
     pub llm_proxy_enabled: bool,
     pub auth_enabled: bool,
+    pub max_pg_connections: usize,
 }
 
 impl Default for GatewayConfig {
@@ -28,6 +30,7 @@ impl Default for GatewayConfig {
             mcp_enabled: true,
             llm_proxy_enabled: false,
             auth_enabled: false,
+            max_pg_connections: 256,
         }
     }
 }
@@ -41,11 +44,27 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     /// Start all protocol listeners.
-    pub async fn start(engine: Arc<StrataEngine>, config: GatewayConfig) -> Result<Self> {
+    ///
+    /// If a `PrometheusHandle` is provided, a `/metrics` endpoint is exposed.
+    pub async fn start(
+        engine: Arc<StrataEngine>,
+        config: GatewayConfig,
+        prometheus: Option<PrometheusHandle>,
+    ) -> Result<Self> {
         let listen_addr = config.listen.clone();
 
         // Build REST router with engine state
-        let app = crate::rest::router_with_engine(engine.clone());
+        let mut app = crate::rest::router_with_engine(engine.clone());
+
+        if let Some(handle) = prometheus {
+            app = app.route(
+                "/metrics",
+                axum::routing::get(move || {
+                    let h = handle.clone();
+                    async move { h.render() }
+                }),
+            );
+        }
 
         // Bind TCP listener
         let listener = TcpListener::bind(&listen_addr)
@@ -72,8 +91,17 @@ impl GatewayServer {
 
         // Start PG wire protocol server
         let pg_addr = config.pg_listen.clone();
-        if let Err(e) = crate::pg_wire::handler::start_pg_wire(&pg_addr, engine.clone()).await {
+        let max_pg = config.max_pg_connections;
+        if let Err(e) =
+            crate::pg_wire::handler::start_pg_wire(&pg_addr, engine.clone(), max_pg).await
+        {
             tracing::warn!(%pg_addr, error = %e, "failed to start PG wire server (non-fatal)");
+        }
+
+        // Start gRPC server
+        let grpc_addr = config.grpc_listen.clone();
+        if let Err(e) = crate::grpc::service::start_grpc(&grpc_addr, engine.clone()).await {
+            tracing::warn!(%grpc_addr, error = %e, "failed to start gRPC server (non-fatal)");
         }
 
         Ok(Self {
@@ -109,7 +137,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             ..Default::default()
         };
-        let gateway = GatewayServer::start(engine, config).await.unwrap();
+        let gateway = GatewayServer::start(engine, config, None).await.unwrap();
         gateway.shutdown().await.unwrap();
     }
 

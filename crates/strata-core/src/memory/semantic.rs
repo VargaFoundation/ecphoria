@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
-/// A semantic memory entry with vector embedding and metadata.
+/// A semantic memory entry with vector embedding and metadata (used for upsert).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticEntry {
     pub id: Uuid,
@@ -15,18 +15,29 @@ pub struct SemanticEntry {
     pub metadata: serde_json::Value,
 }
 
+/// Lightweight metadata stored in the DashMap (no embedding vector).
+///
+/// This avoids duplicating the embedding between USearch and DashMap,
+/// halving memory usage per entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryMetadata {
+    pub id: Uuid,
+    pub content: String,
+    pub metadata: serde_json::Value,
+}
+
 /// Search result with similarity score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub entry: SemanticEntry,
+    pub entry: EntryMetadata,
     pub score: f32,
 }
 
 /// Vector storage backed by USearch HNSW index.
 pub struct SemanticStore {
     index: Mutex<usearch::Index>,
-    /// Maps USearch u64 key → SemanticEntry (stores metadata + content)
-    entries: DashMap<u64, SemanticEntry>,
+    /// Maps USearch u64 key → EntryMetadata (no embedding — stored only in USearch)
+    entries: DashMap<u64, EntryMetadata>,
     /// Maps UUID → USearch u64 key
     uuid_to_key: DashMap<Uuid, u64>,
     /// Auto-incrementing key counter
@@ -126,8 +137,15 @@ impl SemanticStore {
                 .map_err(|e| crate::Error::Storage(format!("add to index failed: {e}")))?;
         }
 
-        // Store metadata
-        self.entries.insert(key, entry.clone());
+        // Store metadata only (embedding lives in USearch only)
+        self.entries.insert(
+            key,
+            EntryMetadata {
+                id: entry.id,
+                content: entry.content.clone(),
+                metadata: entry.metadata.clone(),
+            },
+        );
         self.uuid_to_key.insert(entry.id, key);
 
         Ok(())
@@ -332,7 +350,11 @@ mod tests {
     #[test]
     fn search_result_serialization() {
         let result = SearchResult {
-            entry: make_entry("result", vec![0.1; 4]),
+            entry: EntryMetadata {
+                id: Uuid::new_v4(),
+                content: "result".into(),
+                metadata: serde_json::json!({"source": "test"}),
+            },
             score: 0.95,
         };
         let json = serde_json::to_string(&result).unwrap();

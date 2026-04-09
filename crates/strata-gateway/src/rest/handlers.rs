@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use strata_core::StrataEngine;
 
@@ -39,13 +40,20 @@ pub async fn query(
     State(engine): State<Arc<StrataEngine>>,
     Json(req): Json<QueryRequest>,
 ) -> Json<serde_json::Value> {
-    match engine.query_sql(&req.sql) {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "query").increment(1);
+    let start = std::time::Instant::now();
+
+    let result = match engine.query_sql(&req.sql).await {
         Ok(rows) => {
             let count = rows.len();
             Json(serde_json::json!({ "rows": rows, "count": count }))
         }
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+    };
+
+    metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "query")
+        .record(start.elapsed().as_secs_f64());
+    result
 }
 
 /// Ingest events into the engine.
@@ -53,6 +61,7 @@ pub async fn ingest(
     State(engine): State<Arc<StrataEngine>>,
     Json(req): Json<IngestRequest>,
 ) -> Json<IngestResponse> {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "ingest").increment(1);
     let events: Vec<strata_core::memory::episodic::Event> = req
         .events
         .into_iter()
@@ -72,6 +81,28 @@ pub async fn ingest(
     match engine.ingest(events).await {
         Ok(count) => Json(IngestResponse { ingested: count }),
         Err(_) => Json(IngestResponse { ingested: 0 }),
+    }
+}
+
+/// Webhook ingestion — normalizes vendor payloads into Strata events.
+pub async fn webhook(
+    State(engine): State<Arc<StrataEngine>>,
+    Path(source): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match strata_core::ingest::webhook::normalize_webhook(&source, &payload) {
+        Ok(events) => {
+            let count = events.len();
+            match engine.ingest(events).await {
+                Ok(ingested) => Json(serde_json::json!({
+                    "source": source,
+                    "normalized": count,
+                    "ingested": ingested,
+                })),
+                Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+            }
+        }
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
@@ -132,5 +163,17 @@ pub async fn state_set(
     match engine.state_set(&agent_id, &key, body).await {
         Ok(version) => Json(serde_json::json!({ "version": version })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+/// Prometheus metrics endpoint.
+pub async fn metrics() -> (StatusCode, String) {
+    match metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle()
+        .render()
+    {
+        output if !output.is_empty() => (StatusCode::OK, output),
+        _ => (StatusCode::OK, "# No metrics collected yet\n".to_string()),
     }
 }

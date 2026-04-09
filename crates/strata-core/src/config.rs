@@ -48,6 +48,7 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EpisodicConfig {
+    pub db_path: String,
     pub wal_dir: String,
     pub default_retention_days: u32,
 }
@@ -55,6 +56,7 @@ pub struct EpisodicConfig {
 impl Default for EpisodicConfig {
     fn default() -> Self {
         Self {
+            db_path: ":memory:".into(),
             wal_dir: "./data/wal".into(),
             default_retention_days: 365,
         }
