@@ -58,7 +58,7 @@ impl GatewayServer {
 
         tracing::info!(%local_addr, "HTTP server listening");
 
-        // Spawn server with graceful shutdown
+        // Spawn HTTP server with graceful shutdown
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
@@ -69,6 +69,14 @@ impl GatewayServer {
                 .await
                 .ok();
         });
+
+        // Start PG wire protocol server
+        let pg_addr = config.pg_listen.clone();
+        if let Err(e) =
+            crate::pg_wire::handler::start_pg_wire(&pg_addr, engine.clone()).await
+        {
+            tracing::warn!(%pg_addr, error = %e, "failed to start PG wire server (non-fatal)");
+        }
 
         Ok(Self {
             _engine: engine,

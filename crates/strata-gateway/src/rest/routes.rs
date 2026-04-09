@@ -31,10 +31,7 @@ pub fn router_with_engine(engine: Arc<StrataEngine>) -> Router {
         .route("/health", axum::routing::get(handlers::health))
         .route("/api/v1/query", axum::routing::post(handlers::query))
         .route("/api/v1/ingest", axum::routing::post(handlers::ingest))
-        .route(
-            "/api/v1/search",
-            axum::routing::post(handlers::search_no_engine),
-        )
+        .route("/api/v1/search", axum::routing::post(handlers::search))
         .route(
             "/api/v1/state/{agent_id}/{key}",
             axum::routing::get(handlers::state_get).put(handlers::state_set),

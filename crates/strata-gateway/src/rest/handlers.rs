@@ -75,6 +75,37 @@ pub async fn ingest(
     }
 }
 
+/// Semantic search against the engine.
+pub async fn search(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<SearchRequest>,
+) -> Json<serde_json::Value> {
+    // For now, we need a vector to search. If the request has a "vector" field, use it.
+    // Otherwise, return empty (embedding integration will come later).
+    if let Some(vector) = req.vector {
+        match engine.semantic_search(&vector, req.k).await {
+            Ok(results) => {
+                let items: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.entry.id.to_string(),
+                            "content": r.entry.content,
+                            "metadata": r.entry.metadata,
+                            "score": r.score,
+                        })
+                    })
+                    .collect();
+                Json(serde_json::json!({ "results": items }))
+            }
+            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+        }
+    } else {
+        // Text-based search would require embedding first — future enhancement
+        Json(serde_json::json!({ "results": [] }))
+    }
+}
+
 /// Get agent state.
 pub async fn state_get(
     State(engine): State<Arc<StrataEngine>>,

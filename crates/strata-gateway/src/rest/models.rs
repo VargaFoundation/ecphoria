@@ -26,7 +26,10 @@ pub struct IngestResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
+    #[serde(default)]
     pub query: String,
+    /// Optional pre-computed vector for direct similarity search.
+    pub vector: Option<Vec<f32>>,
     #[serde(default = "default_k")]
     pub k: usize,
 }

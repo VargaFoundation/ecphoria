@@ -1,6 +1,9 @@
 //! Semantic memory store — HNSW vector index with metadata.
 
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// A semantic memory entry with vector embedding and metadata.
@@ -20,28 +23,160 @@ pub struct SearchResult {
 }
 
 /// Vector storage backed by USearch HNSW index.
-#[derive(Debug)]
 pub struct SemanticStore {
-    // TODO: USearch index handle, metadata storage
+    index: Mutex<usearch::Index>,
+    /// Maps USearch u64 key → SemanticEntry (stores metadata + content)
+    entries: DashMap<u64, SemanticEntry>,
+    /// Maps UUID → USearch u64 key
+    uuid_to_key: DashMap<Uuid, u64>,
+    /// Auto-incrementing key counter
+    next_key: AtomicU64,
+    dimension: usize,
+}
+
+impl std::fmt::Debug for SemanticStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemanticStore")
+            .field("dimension", &self.dimension)
+            .field("size", &self.entries.len())
+            .finish()
+    }
 }
 
 impl SemanticStore {
+    /// Create a new semantic store with the given vector dimension.
+    pub fn with_dimension(dimension: usize) -> crate::Result<Self> {
+        let options = usearch::ffi::IndexOptions {
+            dimensions: dimension,
+            metric: usearch::ffi::MetricKind::Cos,
+            quantization: usearch::ffi::ScalarKind::F32,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+            multi: false,
+        };
+
+        let index = usearch::Index::new(&options)
+            .map_err(|e| crate::Error::Storage(format!("failed to create index: {e}")))?;
+
+        index
+            .reserve(1024)
+            .map_err(|e| crate::Error::Storage(format!("failed to reserve: {e}")))?;
+
+        Ok(Self {
+            index: Mutex::new(index),
+            entries: DashMap::new(),
+            uuid_to_key: DashMap::new(),
+            next_key: AtomicU64::new(1),
+            dimension,
+        })
+    }
+
+    /// Create a new semantic store with default dimension (768).
     pub fn new() -> Self {
-        Self {}
+        Self::with_dimension(768).expect("failed to create semantic store")
+    }
+
+    /// Number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The vector dimension.
+    pub fn dimension(&self) -> usize {
+        self.dimension
     }
 
     /// Upsert an entry into the semantic store.
-    pub async fn upsert(&self, _entry: &SemanticEntry) -> crate::Result<()> {
+    pub async fn upsert(&self, entry: &SemanticEntry) -> crate::Result<()> {
+        if entry.embedding.len() != self.dimension {
+            return Err(crate::Error::Storage(format!(
+                "embedding dimension mismatch: expected {}, got {}",
+                self.dimension,
+                entry.embedding.len()
+            )));
+        }
+
+        // Remove old entry if exists
+        if let Some((_, old_key)) = self.uuid_to_key.remove(&entry.id) {
+            let index = self.index.lock();
+            let _ = index.remove(old_key);
+            self.entries.remove(&old_key);
+        }
+
+        // Assign new key
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+
+        // Add to USearch index
+        {
+            let index = self.index.lock();
+            // Ensure capacity
+            if index.size() >= index.capacity() {
+                index
+                    .reserve(index.capacity() * 2 + 1024)
+                    .map_err(|e| crate::Error::Storage(format!("reserve failed: {e}")))?;
+            }
+            index
+                .add(key, &entry.embedding)
+                .map_err(|e| crate::Error::Storage(format!("add to index failed: {e}")))?;
+        }
+
+        // Store metadata
+        self.entries.insert(key, entry.clone());
+        self.uuid_to_key.insert(entry.id, key);
+
         Ok(())
     }
 
     /// Search for the k nearest neighbors to the given vector.
-    pub async fn search(&self, _vector: &[f32], _k: usize) -> crate::Result<Vec<SearchResult>> {
-        Ok(vec![])
+    pub async fn search(&self, vector: &[f32], k: usize) -> crate::Result<Vec<SearchResult>> {
+        if k == 0 || self.entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if vector.len() != self.dimension {
+            return Err(crate::Error::Query(format!(
+                "query dimension mismatch: expected {}, got {}",
+                self.dimension,
+                vector.len()
+            )));
+        }
+
+        let matches = {
+            let index = self.index.lock();
+            index
+                .search(vector, k)
+                .map_err(|e| crate::Error::Query(format!("search failed: {e}")))?
+        };
+
+        let mut results = Vec::with_capacity(matches.keys.len());
+        for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
+            if let Some(entry) = self.entries.get(key) {
+                // USearch returns distance — convert to similarity score
+                // For cosine: similarity = 1 - distance
+                let score = 1.0 - distance;
+                results.push(SearchResult {
+                    entry: entry.value().clone(),
+                    score,
+                });
+            }
+        }
+
+        Ok(results)
     }
 
-    /// Delete an entry by ID.
-    pub async fn delete(&self, _id: Uuid) -> crate::Result<()> {
+    /// Delete an entry by UUID.
+    pub async fn delete(&self, id: Uuid) -> crate::Result<()> {
+        if let Some((_, key)) = self.uuid_to_key.remove(&id) {
+            let index = self.index.lock();
+            let _ = index.remove(key);
+            self.entries.remove(&key);
+        }
         Ok(())
     }
 }
@@ -56,68 +191,168 @@ impl Default for SemanticStore {
 mod tests {
     use super::*;
 
-    fn make_entry(content: &str, dim: usize) -> SemanticEntry {
+    fn make_entry(content: &str, embedding: Vec<f32>) -> SemanticEntry {
         SemanticEntry {
             id: Uuid::new_v4(),
             content: content.into(),
-            embedding: vec![0.1; dim],
+            embedding,
             metadata: serde_json::json!({"source": "test"}),
         }
     }
 
     #[tokio::test]
-    async fn search_empty_store_returns_empty() {
-        let store = SemanticStore::new();
-        let results = store.search(&[0.0; 768], 5).await.unwrap();
+    async fn new_store_is_empty() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.dimension(), 4);
+    }
+
+    #[tokio::test]
+    async fn upsert_and_search() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+
+        // Insert 3 vectors
+        store
+            .upsert(&make_entry("cat", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .upsert(&make_entry("dog", vec![0.9, 0.1, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .upsert(&make_entry("fish", vec![0.0, 0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+
+        assert_eq!(store.len(), 3);
+
+        // Search for something similar to "cat"
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 2).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // "cat" should be the closest match
+        assert_eq!(results[0].entry.content, "cat");
+        assert!(results[0].score > 0.9);
+    }
+
+    #[tokio::test]
+    async fn search_empty_store() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 5).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
     async fn search_with_zero_k() {
-        let store = SemanticStore::new();
-        let results = store.search(&[0.0; 768], 0).await.unwrap();
+        let store = SemanticStore::with_dimension(4).unwrap();
+        store
+            .upsert(&make_entry("a", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 0).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[tokio::test]
-    async fn upsert_succeeds() {
-        let store = SemanticStore::new();
-        let entry = make_entry("test content", 768);
-        store.upsert(&entry).await.unwrap();
+    async fn upsert_overwrites() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        let id = Uuid::new_v4();
+
+        let entry1 = SemanticEntry {
+            id,
+            content: "version 1".into(),
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            metadata: serde_json::json!({}),
+        };
+        store.upsert(&entry1).await.unwrap();
+
+        let entry2 = SemanticEntry {
+            id,
+            content: "version 2".into(),
+            embedding: vec![0.0, 1.0, 0.0, 0.0],
+            metadata: serde_json::json!({}),
+        };
+        store.upsert(&entry2).await.unwrap();
+
+        // Should still have 1 entry
+        assert_eq!(store.len(), 1);
+
+        // Search for the new vector
+        let results = store.search(&[0.0, 1.0, 0.0, 0.0], 1).await.unwrap();
+        assert_eq!(results[0].entry.content, "version 2");
     }
 
     #[tokio::test]
-    async fn delete_succeeds() {
-        let store = SemanticStore::new();
-        let id = Uuid::new_v4();
+    async fn delete_entry() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        let entry = make_entry("to delete", vec![1.0, 0.0, 0.0, 0.0]);
+        let id = entry.id;
+        store.upsert(&entry).await.unwrap();
+        assert_eq!(store.len(), 1);
+
         store.delete(id).await.unwrap();
+        assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_is_ok() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        store.delete(Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dimension_mismatch_on_upsert() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        let entry = make_entry("wrong dim", vec![1.0, 0.0]); // 2 dims, expect 4
+        let result = store.upsert(&entry).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dimension_mismatch_on_search() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        store
+            .upsert(&make_entry("a", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let result = store.search(&[1.0, 0.0], 1).await;
+        assert!(result.is_err());
     }
 
     #[test]
-    fn semantic_entry_serialization_roundtrip() {
-        let entry = make_entry("hello world", 384);
+    fn entry_serialization_roundtrip() {
+        let entry = make_entry("hello", vec![0.1, 0.2, 0.3, 0.4]);
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: SemanticEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.id, entry.id);
-        assert_eq!(deserialized.content, "hello world");
-        assert_eq!(deserialized.embedding.len(), 384);
+        assert_eq!(deserialized.content, "hello");
+        assert_eq!(deserialized.embedding.len(), 4);
     }
 
     #[test]
     fn search_result_serialization() {
         let result = SearchResult {
-            entry: make_entry("result", 768),
+            entry: make_entry("result", vec![0.1; 4]),
             score: 0.95,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.score, 0.95);
-        assert_eq!(deserialized.entry.content, "result");
     }
 
-    #[test]
-    fn default_trait() {
-        let store = SemanticStore::default();
-        let _ = store;
+    #[tokio::test]
+    async fn many_vectors() {
+        let store = SemanticStore::with_dimension(4).unwrap();
+        for i in 0..100 {
+            let v = vec![i as f32 / 100.0, 0.0, 0.0, 1.0 - i as f32 / 100.0];
+            store
+                .upsert(&make_entry(&format!("entry-{i}"), v))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.len(), 100);
+
+        let results = store.search(&[1.0, 0.0, 0.0, 0.0], 3).await.unwrap();
+        assert_eq!(results.len(), 3);
     }
 }
