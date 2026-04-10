@@ -65,15 +65,32 @@ impl SimpleQueryHandler for PgWireHandler {
                     vec![]
                 };
 
+                // Infer types from first row's values
+                let field_types: Vec<Type> = if let Some(first) = rows.first() {
+                    field_names
+                        .iter()
+                        .map(|name| {
+                            first
+                                .as_object()
+                                .and_then(|obj| obj.get(name))
+                                .map(infer_pg_type)
+                                .unwrap_or(Type::VARCHAR)
+                        })
+                        .collect()
+                } else {
+                    field_names.iter().map(|_| Type::VARCHAR).collect()
+                };
+
                 let fields: Vec<FieldInfo> = field_names
                     .iter()
+                    .zip(field_types.iter())
                     .enumerate()
-                    .map(|(i, name)| {
+                    .map(|(i, (name, pg_type))| {
                         FieldInfo::new(
                             name.clone(),
                             None,
                             None,
-                            Type::VARCHAR,
+                            pg_type.clone(),
                             pgwire::api::portal::Format::UnifiedText.format_for(i),
                         )
                     })
@@ -146,15 +163,31 @@ impl ExtendedQueryHandler for PgWireHandler {
                     .map(|obj| obj.keys().cloned().collect())
                     .unwrap_or_default();
 
+                let field_types: Vec<Type> = if let Some(first) = rows.first() {
+                    field_names
+                        .iter()
+                        .map(|name| {
+                            first
+                                .as_object()
+                                .and_then(|obj| obj.get(name))
+                                .map(infer_pg_type)
+                                .unwrap_or(Type::VARCHAR)
+                        })
+                        .collect()
+                } else {
+                    field_names.iter().map(|_| Type::VARCHAR).collect()
+                };
+
                 let fields: Vec<FieldInfo> = field_names
                     .iter()
+                    .zip(field_types.iter())
                     .enumerate()
-                    .map(|(i, name)| {
+                    .map(|(i, (name, pg_type))| {
                         FieldInfo::new(
                             name.clone(),
                             None,
                             None,
-                            Type::VARCHAR,
+                            pg_type.clone(),
                             portal.result_column_format.format_for(i),
                         )
                     })
@@ -301,4 +334,28 @@ pub async fn start_pg_wire(
     });
 
     Ok(())
+}
+
+/// Infer a PostgreSQL type from a JSON value.
+fn infer_pg_type(value: &serde_json::Value) -> Type {
+    match value {
+        serde_json::Value::Number(n) => {
+            if n.is_i64() {
+                Type::INT8
+            } else {
+                Type::FLOAT8
+            }
+        }
+        serde_json::Value::Bool(_) => Type::BOOL,
+        serde_json::Value::Null => Type::VARCHAR,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Type::JSON,
+        serde_json::Value::String(s) => {
+            // Try to detect timestamps
+            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                Type::TIMESTAMPTZ
+            } else {
+                Type::VARCHAR
+            }
+        }
+    }
 }

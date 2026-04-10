@@ -32,6 +32,15 @@ pub struct SearchRequest {
     pub vector: Option<Vec<f32>>,
     #[serde(default = "default_k")]
     pub k: usize,
+    /// Optional metadata filters for search refinement.
+    #[serde(default)]
+    pub filters: Option<SearchFilters>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchFilters {
+    pub source: Option<String>,
+    pub event_type: Option<String>,
 }
 
 fn default_k() -> usize {

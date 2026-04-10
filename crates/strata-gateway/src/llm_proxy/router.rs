@@ -120,17 +120,19 @@ pub async fn chat_completions(
         }
     }
 
-    // 4. Determine provider and forward
+    // 4. Determine provider and forward (shared client for connection reuse)
     let config = engine.config();
     let provider = determine_provider(&req.model);
-    let http = Client::new();
+    // Use a thread-local shared client to avoid per-request allocation
+    static HTTP_CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    let http = HTTP_CLIENT.get_or_init(Client::new);
 
     match provider {
         LlmProvider::OpenAi => {
-            forward_to_openai(&http, &config.embedding.openai_api_key, &req).await
+            forward_to_openai(http, &config.embedding.openai_api_key, &req).await
         }
-        LlmProvider::Ollama => forward_to_ollama(&http, &config.embedding.ollama_url, &req).await,
-        LlmProvider::Anthropic => forward_to_anthropic(&http, &req).await,
+        LlmProvider::Ollama => forward_to_ollama(http, &config.embedding.ollama_url, &req).await,
+        LlmProvider::Anthropic => forward_to_anthropic(http, &req).await,
     }
 }
 

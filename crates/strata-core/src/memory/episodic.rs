@@ -87,6 +87,11 @@ impl EpisodicStore {
         })
     }
 
+    /// Acquire the write connection (for DDL, backup, retention operations).
+    pub fn write_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.write_db.lock()
+    }
+
     /// Acquire a connection for reading from the round-robin pool.
     fn read_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
         let idx = self.read_next.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();

@@ -44,15 +44,19 @@ impl StateStore {
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS state (
-                agent_id TEXT NOT NULL,
-                key      TEXT NOT NULL,
-                value    TEXT NOT NULL,
-                version  INTEGER NOT NULL DEFAULT 1,
+                agent_id   TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                version    INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT,
                 PRIMARY KEY (agent_id, key)
             );",
         )
         .map_err(|e| crate::Error::State(format!("failed to create table: {e}")))?;
+
+        // Migration: add expires_at column if it doesn't exist (for existing DBs)
+        let _ = conn.execute_batch("ALTER TABLE state ADD COLUMN expires_at TEXT");
 
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
@@ -78,7 +82,9 @@ impl StateStore {
         let db = self.db.lock();
         let mut stmt = db
             .prepare(
-                "SELECT agent_id, key, value, version FROM state WHERE agent_id = ?1 AND key = ?2",
+                "SELECT agent_id, key, value, version FROM state
+                 WHERE agent_id = ?1 AND key = ?2
+                 AND (expires_at IS NULL OR expires_at > datetime('now'))",
             )
             .map_err(|e| crate::Error::State(e.to_string()))?;
 
@@ -144,6 +150,85 @@ impl StateStore {
             .insert((agent_id.to_string(), key.to_string()), entry);
 
         Ok(version)
+    }
+
+    /// Set a value with a TTL. The key automatically expires after the given duration.
+    pub async fn set_with_ttl(
+        &self,
+        agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        ttl: std::time::Duration,
+    ) -> crate::Result<u64> {
+        let value_str =
+            serde_json::to_string(&value).map_err(|e| crate::Error::State(e.to_string()))?;
+        let expires_at = (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default())
+            .to_rfc3339();
+
+        let db = self.db.lock();
+        db.execute(
+            "INSERT INTO state (agent_id, key, value, version, expires_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(agent_id, key) DO UPDATE SET
+                value = excluded.value,
+                version = state.version + 1,
+                updated_at = datetime('now'),
+                expires_at = excluded.expires_at",
+            rusqlite::params![agent_id, key, value_str, expires_at],
+        )
+        .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let version: u64 = db
+            .query_row(
+                "SELECT version FROM state WHERE agent_id = ?1 AND key = ?2",
+                rusqlite::params![agent_id, key],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+        let entry = StateEntry {
+            agent_id: agent_id.to_string(),
+            key: key.to_string(),
+            value,
+            version,
+        };
+        self.cache
+            .insert((agent_id.to_string(), key.to_string()), entry);
+
+        Ok(version)
+    }
+
+    /// Remove all expired state entries. Returns the number of entries deleted.
+    pub async fn cleanup_expired(&self) -> crate::Result<u64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let db = self.db.lock();
+
+        // Find expired keys to invalidate cache
+        let mut stmt = db
+            .prepare("SELECT agent_id, key FROM state WHERE expires_at IS NOT NULL AND expires_at < ?1")
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+        let expired: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![now], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| crate::Error::State(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = expired.len() as u64;
+
+        if count > 0 {
+            db.execute(
+                "DELETE FROM state WHERE expires_at IS NOT NULL AND expires_at < ?1",
+                rusqlite::params![now],
+            )
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+
+            // Invalidate cache for expired entries
+            for (agent_id, key) in &expired {
+                self.cache.remove(&(agent_id.clone(), key.clone()));
+            }
+        }
+
+        Ok(count)
     }
 
     /// Delete a key.

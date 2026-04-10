@@ -155,6 +155,46 @@ impl StrataEngine {
         self.semantic.search(vector, k).await
     }
 
+    /// Search semantic memory with metadata filters.
+    ///
+    /// Filters can match on source, event_type, or any metadata field.
+    pub async fn semantic_search_filtered(
+        &self,
+        vector: &[f32],
+        k: usize,
+        source: Option<&str>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let source_owned = source.map(|s| s.to_string());
+        let event_type_owned = event_type.map(|s| s.to_string());
+
+        self.semantic
+            .search_filtered(vector, k, move |entry| {
+                if let Some(ref src) = source_owned {
+                    if let Some(meta_src) = entry.metadata.get("source").and_then(|v| v.as_str()) {
+                        if meta_src != src {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                if let Some(ref et) = event_type_owned {
+                    if let Some(meta_et) =
+                        entry.metadata.get("event_type").and_then(|v| v.as_str())
+                    {
+                        if meta_et != et {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await
+    }
+
     /// Delete a semantic entry by UUID.
     pub async fn semantic_delete(&self, id: uuid::Uuid) -> Result<()> {
         self.semantic.delete(id).await
@@ -196,10 +236,79 @@ impl StrataEngine {
         self.state.list_keys(agent_id).await
     }
 
+    // ── Retention ─────────────────────────────────────────────────────
+
+    /// Delete events older than the configured retention period.
+    ///
+    /// Returns the number of events deleted.
+    pub async fn enforce_retention(&self) -> Result<u64> {
+        let retention_days = self.config.memory.episodic.default_retention_days;
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let episodic = self.episodic.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = episodic.write_conn();
+            let deleted = db
+                .execute(
+                    "DELETE FROM episodic WHERE ts < ?::TIMESTAMPTZ",
+                    duckdb::params![cutoff_str],
+                )
+                .map_err(|e| crate::Error::Storage(format!("retention delete: {e}")))?;
+            Ok(deleted as u64)
+        })
+        .await
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("join: {e}")))?
+    }
+
+    // ── Backup / Restore ─────────────────────────────────────────────
+
+    /// Save all persistent stores to a directory for backup.
+    ///
+    /// Creates: episodic.duckdb (EXPORT), vectors/ (USearch index), state.db (SQLite copy).
+    pub async fn backup(&self, dir: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
+
+        // Backup episodic store via DuckDB EXPORT
+        let export_dir = dir.join("episodic_export");
+        let export_dir_str = export_dir.to_string_lossy().to_string();
+        let episodic = self.episodic.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&export_dir)
+                .map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
+            let db = episodic.write_conn();
+            db.execute_batch(&format!("EXPORT DATABASE '{export_dir_str}'"))
+                .map_err(|e| crate::Error::Storage(format!("duckdb export: {e}")))?;
+            Ok::<(), crate::Error>(())
+        })
+        .await
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("join: {e}")))??;
+
+        // Backup semantic index
+        let vectors_dir = dir.join("vectors");
+        self.semantic.save(&vectors_dir)?;
+
+        tracing::info!(path = %dir.display(), "backup complete");
+        Ok(())
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────
 
-    /// Gracefully shut down the engine.
+    /// Gracefully shut down the engine, persisting semantic index.
     pub async fn shutdown(self) -> Result<()> {
+        // Save semantic index if index_dir is configured
+        let index_dir = &self.config.memory.semantic.index_dir;
+        if !index_dir.is_empty() && index_dir != ":memory:" {
+            if let Err(e) = self.semantic.save(std::path::Path::new(index_dir)) {
+                tracing::warn!(error = %e, "failed to save semantic index on shutdown");
+            } else {
+                tracing::info!(path = %index_dir, "semantic index saved");
+            }
+        }
         tracing::info!("Strata engine shutting down");
         Ok(())
     }

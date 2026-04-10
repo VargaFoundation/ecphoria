@@ -189,6 +189,60 @@ impl SemanticStore {
         Ok(results)
     }
 
+    /// Search with metadata filters (post-filter approach).
+    ///
+    /// Fetches k * oversample_factor candidates from the index, then filters by
+    /// the provided predicate, returning at most k results.
+    pub async fn search_filtered<F>(
+        &self,
+        vector: &[f32],
+        k: usize,
+        filter: F,
+    ) -> crate::Result<Vec<SearchResult>>
+    where
+        F: Fn(&EntryMetadata) -> bool,
+    {
+        if k == 0 || self.entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if vector.len() != self.dimension {
+            return Err(crate::Error::Query(format!(
+                "query dimension mismatch: expected {}, got {}",
+                self.dimension,
+                vector.len()
+            )));
+        }
+
+        // Oversample to compensate for filtered-out results
+        let oversample = (k * 4).min(self.entries.len());
+
+        let matches = {
+            let index = self.index.lock();
+            index
+                .search(vector, oversample)
+                .map_err(|e| crate::Error::Query(format!("search failed: {e}")))?
+        };
+
+        let mut results = Vec::with_capacity(k);
+        for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
+            if results.len() >= k {
+                break;
+            }
+            if let Some(entry) = self.entries.get(key) {
+                if filter(entry.value()) {
+                    let score = 1.0 - distance;
+                    results.push(SearchResult {
+                        entry: entry.value().clone(),
+                        score,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Delete an entry by UUID.
     pub async fn delete(&self, id: Uuid) -> crate::Result<()> {
         if let Some((_, key)) = self.uuid_to_key.remove(&id) {
