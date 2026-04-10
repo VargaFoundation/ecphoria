@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusHandle;
-use strata_cluster::coordinator::StrataRaft;
+use strata_cluster::ClusterCoordinator;
 use strata_core::StrataEngine;
 use tokio::net::TcpListener;
 
@@ -54,7 +54,7 @@ impl GatewayServer {
         engine: Arc<StrataEngine>,
         config: GatewayConfig,
         prometheus: Option<PrometheusHandle>,
-        raft: Option<Arc<StrataRaft>>,
+        coordinator: Option<Arc<tokio::sync::RwLock<ClusterCoordinator>>>,
     ) -> Result<Self> {
         let listen_addr = config.listen.clone();
 
@@ -68,8 +68,19 @@ impl GatewayServer {
             }
             None
         };
-        let mut app =
-            crate::rest::router_with_engine_and_auth(engine.clone(), api_key_store);
+
+        // Build cluster state for leader-forwarding middleware
+        let cluster_state = coordinator.as_ref().map(|coord| {
+            crate::cluster::leader_forward::ClusterState {
+                coordinator: coord.clone(),
+            }
+        });
+
+        let mut app = crate::rest::router_with_engine_and_auth(
+            engine.clone(),
+            api_key_store,
+            cluster_state,
+        );
 
         if let Some(handle) = prometheus {
             app = app.route(
@@ -82,10 +93,14 @@ impl GatewayServer {
         }
 
         // Mount Raft RPC endpoints if cluster mode is active
-        if let Some(raft_instance) = raft {
-            let raft_router = crate::cluster::raft_routes::raft_router(raft_instance);
-            app = app.merge(raft_router);
-            tracing::info!("Raft RPC endpoints mounted (/raft/*, /cluster/status)");
+        if let Some(ref coord) = coordinator {
+            let coord_read = coord.read().await;
+            if let Some(raft_instance) = coord_read.raft() {
+                let raft_router =
+                    crate::cluster::raft_routes::raft_router(Arc::new(raft_instance.clone()));
+                app = app.merge(raft_router);
+                tracing::info!("Raft RPC endpoints mounted (/raft/*, /cluster/status)");
+            }
         }
 
         // Bind TCP listener
@@ -159,7 +174,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             ..Default::default()
         };
-        let gateway = GatewayServer::start(engine, config, None, None).await.unwrap();
+        let gateway = GatewayServer::start(engine, config, None, None::<Arc<tokio::sync::RwLock<ClusterCoordinator>>>).await.unwrap();
         gateway.shutdown().await.unwrap();
     }
 

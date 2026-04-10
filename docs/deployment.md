@@ -6,7 +6,8 @@
 |------|---------|----------|
 | Docker | `docker run` | Development, single-node production |
 | Docker Compose | `docker compose up` | Teams, development with full stack |
-| Kubernetes | `helm install` | Production, high availability |
+| Docker Compose Cluster | `docker compose -f deploy/docker-compose.cluster.yml up` | Local 3-node HA testing |
+| Kubernetes | `helm install strata deploy/helm/strata/` | Production, high availability |
 | Binary | `./strata-server` | Embedded, custom deployments |
 
 ## Docker (Standalone)
@@ -17,23 +18,25 @@ docker run -d \
   -p 5432:5432 \
   -p 8432:8432 \
   -v strata-data:/data \
-  -e STRATA_STORAGE__DATA_DIR=/data \
   ghcr.io/vargafoundation/strata:latest
 ```
+
+The Docker image includes a built-in HEALTHCHECK on the `/health` endpoint.
 
 ### Volumes
 
 | Path | Purpose |
 |------|---------|
-| `/data` | All persistent data: WAL, vectors, state DB |
+| `/data` | All persistent data: DuckDB episodic database, USearch vector index, SQLite state DB |
 
 ### Ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 5432 | TCP | PostgreSQL wire protocol |
-| 8432 | HTTP | REST API, MCP server, LLM proxy, health checks |
-| 9432 | HTTP/2 | gRPC (optional) |
+| 8432 | HTTP | REST API, MCP server, LLM proxy, Prometheus metrics, health checks |
+| 9432 | HTTP/2 | gRPC |
+| 9433 | HTTP | Raft inter-node RPC (cluster mode only) |
 
 ## Docker Compose (Full Stack)
 
@@ -55,15 +58,100 @@ First-time setup for embeddings:
 docker exec strata-ollama-1 ollama pull nomic-embed-text
 ```
 
+## Docker Compose (3-Node Cluster)
+
+Test a Raft cluster locally:
+
+```bash
+docker compose -f deploy/docker-compose.cluster.yml up -d
+```
+
+This starts:
+- **strata-1** (node_id=1, leader candidate) on port 8432
+- **strata-2** (node_id=2) on port 8433
+- **strata-3** (node_id=3) on port 8434
+- **ollama** — shared embedding server
+
+Check cluster status:
+
+```bash
+curl http://localhost:8432/cluster/status
+# {"node_id":1,"state":"Leader","current_leader":1,"current_term":1,...}
+```
+
+Writes to a follower node return a 307 redirect to the leader:
+
+```bash
+curl -X POST http://localhost:8433/api/v1/ingest -d '...'
+# 307 {"error":"not_leader","leader_id":1,"message":"..."}
+```
+
 ## Kubernetes (Helm)
 
-> Helm chart is planned for Phase 3 (M6-M9).
+### Quick Start
 
-Example values for a 3-replica production deployment:
+```bash
+helm install strata deploy/helm/strata/ \
+  --set replicaCount=3 \
+  --set config.embedding.ollamaUrl=http://ollama:11434
+```
+
+### Architecture
+
+The Helm chart deploys a StatefulSet with automatic cluster configuration:
+
+```
+StatefulSet (3 replicas)
+  strata-0 (node_id=1) ─┐
+  strata-1 (node_id=2) ─┤── Raft consensus via headless service DNS
+  strata-2 (node_id=3) ─┘
+
+Service (ClusterIP)       → load-balanced client reads
+Headless Service          → direct pod-to-pod Raft RPCs
+PodDisruptionBudget       → min 2 pods during rolling updates
+ServiceMonitor (optional) → Prometheus scraping
+```
+
+Each pod automatically:
+1. Derives its `node_id` from the StatefulSet ordinal (strata-0 → node_id=1)
+2. Discovers peers via headless service DNS (`strata-1.strata-headless.namespace.svc.cluster.local:9433`)
+3. Forms a Raft cluster and elects a leader
+
+### Production Values
 
 ```yaml
 # values-production.yaml
 replicaCount: 3
+
+image:
+  repository: ghcr.io/vargafoundation/strata
+  tag: "0.1.0"
+
+config:
+  storage:
+    engine: local
+  memory:
+    episodic:
+      dbPath: /data/episodic.duckdb
+    semantic:
+      indexDir: /data/vectors
+    state:
+      dbPath: /data/state.db
+  gateway:
+    authEnabled: true
+    apiKeys:
+      - "your-secret-api-key"
+  cluster:
+    enabled: true
+  embedding:
+    provider: ollama
+    model: nomic-embed-text
+    ollamaUrl: "http://ollama.default.svc.cluster.local:11434"
+
+persistence:
+  enabled: true
+  storageClass: gp3
+  size: 50Gi
 
 resources:
   requests:
@@ -73,23 +161,40 @@ resources:
     cpu: "4"
     memory: "8Gi"
 
-storage:
-  engine: s3
-  s3:
-    endpoint: "s3.amazonaws.com"
-    bucket: "strata-prod"
-    region: "eu-west-1"
-
-embedding:
-  provider: ollama
-  model: nomic-embed-text
-
-cluster:
+serviceMonitor:
   enabled: true
+  interval: 15s
 
-monitoring:
-  prometheus: true
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
 ```
+
+Install:
+
+```bash
+helm install strata deploy/helm/strata/ -f values-production.yaml
+```
+
+### Helm Values Reference
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `replicaCount` | `3` | Number of Strata nodes |
+| `image.repository` | `ghcr.io/vargafoundation/strata` | Docker image |
+| `image.tag` | `latest` | Image tag |
+| `config.cluster.enabled` | `true` | Enable Raft consensus |
+| `config.gateway.authEnabled` | `false` | Enable API key auth |
+| `config.gateway.apiKeys` | `[]` | List of valid API keys |
+| `config.embedding.provider` | `ollama` | Embedding provider |
+| `config.embedding.ollamaUrl` | `http://ollama:11434` | Ollama server URL |
+| `persistence.enabled` | `true` | Enable persistent volumes |
+| `persistence.size` | `10Gi` | Volume size per node |
+| `persistence.storageClass` | `""` | Storage class (default: cluster default) |
+| `service.type` | `ClusterIP` | Service type |
+| `serviceMonitor.enabled` | `false` | Enable Prometheus ServiceMonitor |
+| `podDisruptionBudget.enabled` | `true` | Enable PDB |
+| `podDisruptionBudget.minAvailable` | `2` | Minimum available pods |
 
 ## Configuration Reference
 
@@ -108,7 +213,8 @@ Strata loads configuration from three sources (in order of precedence):
 | `gateway.grpc_listen` | `STRATA_GATEWAY__GRPC_LISTEN` | `0.0.0.0:9432` | gRPC listen address |
 | `gateway.mcp_enabled` | `STRATA_GATEWAY__MCP_ENABLED` | `true` | Enable MCP server |
 | `gateway.llm_proxy_enabled` | `STRATA_GATEWAY__LLM_PROXY_ENABLED` | `false` | Enable LLM proxy |
-| `gateway.auth_enabled` | `STRATA_GATEWAY__AUTH_ENABLED` | `false` | Enable authentication |
+| `gateway.auth_enabled` | `STRATA_GATEWAY__AUTH_ENABLED` | `false` | Enable API key authentication |
+| `gateway.max_pg_connections` | `STRATA_GATEWAY__MAX_PG_CONNECTIONS` | `256` | Max concurrent PG wire connections |
 
 ### Storage
 
@@ -126,11 +232,12 @@ Strata loads configuration from three sources (in order of precedence):
 
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
+| `memory.episodic.db_path` | `STRATA_MEMORY__EPISODIC__DB_PATH` | `:memory:` | DuckDB path (`:memory:` or file path) |
 | `memory.episodic.wal_dir` | `STRATA_MEMORY__EPISODIC__WAL_DIR` | `./data/wal` | WAL directory |
 | `memory.episodic.default_retention_days` | `STRATA_MEMORY__EPISODIC__DEFAULT_RETENTION_DAYS` | `365` | Default event retention |
 | `memory.semantic.index_dir` | `STRATA_MEMORY__SEMANTIC__INDEX_DIR` | `./data/vectors` | Vector index directory |
 | `memory.semantic.default_dimension` | `STRATA_MEMORY__SEMANTIC__DEFAULT_DIMENSION` | `768` | Default vector dimensions |
-| `memory.semantic.metric` | `STRATA_MEMORY__SEMANTIC__METRIC` | `cosine` | Distance metric: `cosine`, `l2`, `ip` |
+| `memory.semantic.metric` | `STRATA_MEMORY__SEMANTIC__METRIC` | `cosine` | Distance metric |
 | `memory.state.db_path` | `STRATA_MEMORY__STATE__DB_PATH` | `./data/state.db` | State DB file path |
 
 ### Embedding
@@ -140,7 +247,7 @@ Strata loads configuration from three sources (in order of precedence):
 | `embedding.provider` | `STRATA_EMBEDDING__PROVIDER` | `ollama` | `ollama` or `openai` |
 | `embedding.model` | `STRATA_EMBEDDING__MODEL` | `nomic-embed-text` | Model name |
 | `embedding.dimension` | `STRATA_EMBEDDING__DIMENSION` | `768` | Vector dimension |
-| `embedding.batch_size` | `STRATA_EMBEDDING__BATCH_SIZE` | `64` | Embedding batch size |
+| `embedding.batch_size` | `STRATA_EMBEDDING__BATCH_SIZE` | `64` | Max texts per embedding API call |
 | `embedding.ollama_url` | `STRATA_EMBEDDING__OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `embedding.openai_api_key` | `STRATA_EMBEDDING__OPENAI_API_KEY` | | OpenAI API key |
 
@@ -148,28 +255,31 @@ Strata loads configuration from three sources (in order of precedence):
 
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
-| `query.max_rows` | `STRATA_QUERY__MAX_ROWS` | `10000` | Max rows per query |
-| `query.timeout_ms` | `STRATA_QUERY__TIMEOUT_MS` | `30000` | Query timeout in ms |
+| `query.max_rows` | `STRATA_QUERY__MAX_ROWS` | `10000` | Max rows returned per query |
+| `query.timeout_ms` | `STRATA_QUERY__TIMEOUT_MS` | `30000` | Query timeout in milliseconds |
 
 ### Cluster
 
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
-| `cluster.enabled` | `STRATA_CLUSTER__ENABLED` | `false` | Enable cluster mode |
-| `cluster.node_id` | `STRATA_CLUSTER__NODE_ID` | `1` | This node's ID |
-| `cluster.listen` | `STRATA_CLUSTER__LISTEN` | `0.0.0.0:9433` | Cluster listen address |
-| `cluster.peers` | `STRATA_CLUSTER__PEERS` | `[]` | Peer addresses |
+| `cluster.enabled` | `STRATA_CLUSTER__ENABLED` | `false` | Enable Raft cluster mode |
+| `cluster.node_id` | `STRATA_CLUSTER__NODE_ID` | `1` | This node's Raft ID |
+| `cluster.listen` | `STRATA_CLUSTER__LISTEN` | `0.0.0.0:9433` | Raft RPC listen address |
+| `cluster.peers` | `STRATA_CLUSTER__PEERS` | `[]` | Comma-separated peer addresses |
 
 ## Production Checklist
 
-- [ ] **Storage**: Configure S3 backend for durability
+- [ ] **Persistence**: Set `memory.episodic.db_path` to a file path (not `:memory:`)
+- [ ] **Storage**: Configure persistent volumes for `/data`
 - [ ] **Embedding**: Set up Ollama or configure OpenAI API key
-- [ ] **Auth**: Enable authentication (`gateway.auth_enabled = true`)
-- [ ] **TLS**: Place Strata behind a TLS-terminating reverse proxy
-- [ ] **Monitoring**: Expose `/metrics` to Prometheus
-- [ ] **Backups**: Schedule regular backups via `strata backup`
+- [ ] **Auth**: Enable authentication (`gateway.auth_enabled = true`) and set `gateway.api_keys`
+- [ ] **TLS**: Place Strata behind a TLS-terminating reverse proxy or Ingress
+- [ ] **Monitoring**: Enable ServiceMonitor or scrape `/metrics` with Prometheus
+- [ ] **Cluster**: Enable `cluster.enabled = true` with 3+ replicas for HA
+- [ ] **PDB**: Ensure PodDisruptionBudget is enabled for rolling updates
+- [ ] **Backups**: Schedule regular backups of `/data` volume
 - [ ] **Retention**: Configure `memory.episodic.default_retention_days`
-- [ ] **Resources**: Allocate sufficient memory for vector indices
+- [ ] **Resources**: Allocate sufficient memory for vector indices (~4 bytes × dimensions × vectors)
 - [ ] **Logging**: Set `RUST_LOG=info,strata=debug` for production logging
 
 ## Health Checks
@@ -177,9 +287,18 @@ Strata loads configuration from three sources (in order of precedence):
 ```bash
 # HTTP health check
 curl http://localhost:8432/health
+# {"status":"ok","version":"0.1.0"}
 
-# Response
-{"status":"ok","version":"0.1.0"}
+# Cluster status (when cluster mode enabled)
+curl http://localhost:8432/cluster/status
+# {"node_id":1,"state":"Leader","current_leader":1,"current_term":2,...}
+
+# Prometheus metrics
+curl http://localhost:8432/metrics
+# strata_episodic_events_ingested_total 1234
+# strata_episodic_query_duration_seconds_bucket{le="0.01"} 567
+# ...
 ```
 
-For Docker/Kubernetes, use the health endpoint for liveness and readiness probes.
+For Docker, the built-in HEALTHCHECK uses `curl http://localhost:8432/health`.
+For Kubernetes, liveness and readiness probes are configured in the Helm chart.

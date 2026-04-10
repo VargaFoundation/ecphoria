@@ -13,6 +13,7 @@ Get Strata running in under a minute.
 docker run -d --name strata \
   -p 5432:5432 -p 8432:8432 \
   -v strata-data:/data \
+  -e STRATA_MEMORY__EPISODIC__DB_PATH=/data/episodic.duckdb \
   ghcr.io/vargafoundation/strata:latest
 ```
 
@@ -30,15 +31,26 @@ psql -h localhost -p 5432
 ```
 
 ```sql
--- Ingest an event
-INSERT INTO episodic (source, event_type, payload)
-VALUES ('my-app', 'user.signup', '{"user_id": "u1", "plan": "pro"}');
+-- Query events
+SELECT * FROM episodic WHERE source = 'my-app' LIMIT 10;
 
--- Semantic search
-SELECT * FROM strata_search('frustrated customer billing issue', 5);
+-- Count by source
+SELECT source, count(*) FROM episodic GROUP BY source;
+```
 
--- Read agent state
-SELECT * FROM state WHERE agent_id = 'support-bot';
+## Ingest Events via REST
+
+```bash
+curl -X POST http://localhost:8432/api/v1/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": "my-app",
+    "events": [
+      {"event_type": "user.signup", "user_id": "u1", "plan": "pro"},
+      {"event_type": "page.view", "user_id": "u1", "page": "/dashboard"}
+    ]
+  }'
+# {"ingested":2}
 ```
 
 ## Full Stack with Docker Compose
@@ -60,6 +72,31 @@ Pull the embedding model on first run:
 
 ```bash
 docker exec strata-ollama-1 ollama pull nomic-embed-text
+```
+
+Events ingested via `/api/v1/ingest` are now automatically embedded and searchable via `/api/v1/search`.
+
+## Cluster Mode (3-Node HA)
+
+Test a Raft cluster locally:
+
+```bash
+docker compose -f deploy/docker-compose.cluster.yml up -d
+```
+
+Check cluster health:
+
+```bash
+curl http://localhost:8432/cluster/status
+# {"node_id":1,"state":"Leader","current_leader":1,...}
+```
+
+All three nodes share the same data via Raft consensus. Reads are served by any node; writes go through the leader.
+
+For Kubernetes deployment, see the [Helm chart](../deploy/helm/strata/):
+
+```bash
+helm install strata deploy/helm/strata/ --set replicaCount=3
 ```
 
 ## Build from Source
@@ -112,12 +149,6 @@ strata query "SELECT count(*) FROM episodic"
 
 # Ingest from a file
 strata ingest --source my-app --file events.json
-
-# GDPR export
-strata export --entity user-123
-
-# Backup
-strata backup --target s3://my-bucket/backups/
 ```
 
 Set `STRATA_URL` to point at a remote server:
@@ -126,6 +157,20 @@ Set `STRATA_URL` to point at a remote server:
 export STRATA_URL=http://strata.internal:8432
 strata status
 ```
+
+## Monitoring
+
+Strata exposes Prometheus-compatible metrics:
+
+```bash
+curl http://localhost:8432/metrics
+```
+
+Key metrics:
+- `strata_episodic_events_ingested_total` — total events ingested
+- `strata_episodic_queries_total` — total queries executed
+- `strata_episodic_append_duration_seconds` — ingest latency
+- `strata_episodic_query_duration_seconds` — query latency
 
 ## Configuration
 
@@ -140,6 +185,6 @@ See [deployment.md](deployment.md) for the full configuration reference.
 ## Next Steps
 
 - [Architecture](architecture.md) — understand Strata's internals
-- [API Reference](api-reference.md) — full REST, PG wire, and MCP documentation
-- [Deployment](deployment.md) — production deployment and configuration
+- [API Reference](api-reference.md) — full REST, PG wire, MCP, and cluster documentation
+- [Deployment](deployment.md) — production deployment, Kubernetes Helm chart, and configuration
 - [Contributing](contributing.md) — how to contribute to Strata

@@ -31,13 +31,14 @@ pub fn router() -> Router {
 ///
 /// If `api_key_store` is provided, all `/api/v1/*` routes require authentication.
 pub fn router_with_engine(engine: Arc<StrataEngine>) -> Router {
-    router_with_engine_and_auth(engine, None)
+    router_with_engine_and_auth(engine, None, None)
 }
 
-/// Build the full REST API router with optional auth middleware.
+/// Build the full REST API router with optional auth and cluster middleware.
 pub fn router_with_engine_and_auth(
     engine: Arc<StrataEngine>,
     api_key_store: Option<crate::auth::middleware::ApiKeyStore>,
+    cluster_state: Option<crate::cluster::leader_forward::ClusterState>,
 ) -> Router {
     // Public routes (no auth required)
     let mut app = Router::new()
@@ -63,6 +64,14 @@ pub fn router_with_engine_and_auth(
         api_routes = api_routes.route_layer(axum::middleware::from_fn_with_state(
             store,
             crate::auth::middleware::require_auth,
+        ));
+    }
+
+    // Apply leader-forwarding middleware if cluster mode is active
+    if let Some(cluster_state) = cluster_state {
+        api_routes = api_routes.route_layer(axum::middleware::from_fn_with_state(
+            cluster_state,
+            crate::cluster::leader_forward::require_leader_for_writes,
         ));
     }
 

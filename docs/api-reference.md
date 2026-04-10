@@ -6,6 +6,16 @@ Strata exposes multiple protocol interfaces. All access the same underlying engi
 
 Base URL: `http://localhost:8432`
 
+### Authentication
+
+When `gateway.auth_enabled = true`, all `/api/v1/*` endpoints require a Bearer token:
+
+```
+Authorization: Bearer <api-key>
+```
+
+The API key must match one of the keys in `gateway.api_keys`. Health, metrics, MCP, and cluster endpoints are unauthenticated.
+
 ### Health Check
 
 ```
@@ -20,9 +30,23 @@ Response:
 }
 ```
 
+### Prometheus Metrics
+
+```
+GET /metrics
+```
+
+Returns Prometheus text format with counters and histograms:
+- `strata_episodic_events_ingested_total` — total events ingested
+- `strata_episodic_append_duration_seconds` — ingest latency histogram
+- `strata_episodic_queries_total` — total SQL queries executed
+- `strata_episodic_query_duration_seconds` — query latency histogram
+- `strata_rest_requests_total{endpoint="..."}` — REST requests by endpoint
+- `strata_rest_request_duration_seconds{endpoint="..."}` — REST latency by endpoint
+
 ### Query
 
-Execute SQL against the context lake.
+Execute read-only SQL against the episodic store. Only SELECT statements are allowed (enforced by SQL parser). Results are capped at `query.max_rows` (default 10,000).
 
 ```
 POST /api/v1/query
@@ -32,7 +56,7 @@ Content-Type: application/json
 Request:
 ```json
 {
-  "sql": "SELECT * FROM episodic WHERE source = 'my-app' LIMIT 10"
+  "sql": "SELECT * FROM episodic WHERE source = 'my-app' ORDER BY ts DESC LIMIT 10"
 }
 ```
 
@@ -46,7 +70,7 @@ Response:
 
 ### Ingest
 
-Ingest events into episodic memory.
+Ingest events into episodic memory. When an embedding provider is configured, events are automatically embedded and indexed in semantic memory (batched by `embedding.batch_size`).
 
 ```
 POST /api/v1/ingest
@@ -60,8 +84,8 @@ Request:
   "events": [
     {
       "event_type": "user.signup",
-      "payload": {"user_id": "u1", "plan": "pro"},
-      "timestamp": "2026-04-09T10:00:00Z"
+      "user_id": "u1",
+      "plan": "pro"
     }
   ]
 }
@@ -74,9 +98,20 @@ Response:
 }
 ```
 
+### Webhook Ingest
+
+Ingest from third-party webhook providers (GitHub, Sentry, Slack, PagerDuty).
+
+```
+POST /api/v1/webhook/{source}
+Content-Type: application/json
+```
+
+The payload is normalized into Strata events based on the source.
+
 ### Semantic Search
 
-Search across semantic memory by natural language query.
+Search across semantic memory by vector similarity.
 
 ```
 POST /api/v1/search
@@ -87,6 +122,7 @@ Request:
 ```json
 {
   "query": "frustrated customer billing issue",
+  "vector": [0.1, 0.2, ...],
   "k": 5
 }
 ```
@@ -96,11 +132,9 @@ Response:
 {
   "results": [
     {
-      "entry": {
-        "id": "...",
-        "content": "Customer complained about billing...",
-        "metadata": {}
-      },
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "content": "Customer complained about billing...",
+      "metadata": {"source": "support", "event_type": "ticket.created"},
       "score": 0.92
     }
   ]
@@ -139,6 +173,51 @@ Response:
 }
 ```
 
+## Cluster Endpoints
+
+Available when `cluster.enabled = true`.
+
+### Cluster Status
+
+```
+GET /cluster/status
+```
+
+Response:
+```json
+{
+  "node_id": 1,
+  "state": "Leader",
+  "current_leader": 1,
+  "current_term": 3,
+  "last_log_index": 42,
+  "last_applied": 42,
+  "membership": "..."
+}
+```
+
+### Leader Forwarding
+
+When a write request (POST, PUT, DELETE) arrives at a follower node, it returns a 307 redirect:
+
+```json
+{
+  "error": "not_leader",
+  "leader_id": 1,
+  "message": "This node is not the leader. Retry on the leader node."
+}
+```
+
+GET requests (reads) are always served locally from the follower's engine for low-latency reads.
+
+### Raft RPC Endpoints (Internal)
+
+These are used for inter-node Raft communication and should not be called by clients:
+
+- `POST /raft/append` — AppendEntries RPC
+- `POST /raft/vote` — RequestVote RPC
+- `POST /raft/snapshot` — InstallSnapshot RPC
+
 ## PostgreSQL Wire Protocol
 
 Strata speaks the PostgreSQL wire protocol on port 5432. Connect with any PostgreSQL client.
@@ -147,34 +226,32 @@ Strata speaks the PostgreSQL wire protocol on port 5432. Connect with any Postgr
 psql -h localhost -p 5432
 ```
 
+Connection limit is configurable via `gateway.max_pg_connections` (default 256). Excess connections are rejected.
+
 ### Supported SQL
 
-```sql
--- Insert events
-INSERT INTO episodic (source, event_type, payload)
-VALUES ('app', 'click', '{"page": "/home"}');
+Only SELECT queries are allowed via the SQL validation layer:
 
+```sql
 -- Query events
 SELECT * FROM episodic
-WHERE source = 'app' AND timestamp > '2026-01-01'
-ORDER BY timestamp DESC
+WHERE source = 'app'
+ORDER BY ts DESC
 LIMIT 100;
 
--- Semantic search via SQL function
-SELECT * FROM strata_search('billing problem', 5);
+-- Count events
+SELECT count(*) FROM episodic WHERE source = 'app';
 
--- Agent state
-SELECT * FROM state WHERE agent_id = 'my-bot';
-SET state.my_bot.status = '{"active": true}';
+-- Filter by time range
+SELECT * FROM episodic
+WHERE ts >= '2026-01-01T00:00:00Z'::TIMESTAMPTZ
+ORDER BY ts ASC;
 
--- Embedding via SQL function
-SELECT embed('Hello world');
-
--- Cosine similarity
-SELECT cosine_similarity(embed('query'), embedding) AS score
-FROM semantic
-ORDER BY score DESC
-LIMIT 10;
+-- Aggregate by source
+SELECT source, count(*) as cnt
+FROM episodic
+GROUP BY source
+ORDER BY cnt DESC;
 ```
 
 ## MCP (Model Context Protocol)
@@ -182,6 +259,8 @@ LIMIT 10;
 Strata includes a built-in MCP server at `/mcp` using Streamable HTTP (SSE) transport.
 
 ### Configuration
+
+Add to Claude Desktop, VS Code, Cursor, or any MCP client:
 
 ```json
 {
@@ -221,7 +300,7 @@ Strata includes a built-in MCP server at `/mcp` using Streamable HTTP (SSE) tran
 
 ## LLM Proxy
 
-OpenAI-compatible endpoint with automatic RAG enrichment.
+OpenAI-compatible endpoint with automatic RAG enrichment from episodic memory.
 
 ```
 POST /v1/chat/completions
@@ -242,19 +321,17 @@ Strata automatically:
 1. Extracts the last user message
 2. Queries episodic memory for recent relevant events
 3. Prepends context to the system prompt
-4. Determines the LLM provider from the model name (gpt-* → OpenAI, claude-* → Anthropic, other → Ollama)
+4. Determines the LLM provider from the model name
 5. Forwards the enriched request to the provider
 
-Supported providers:
-- **OpenAI**: models starting with `gpt`, `o1`, `o3`
-- **Anthropic**: models starting with `claude` (API translation pending)
-- **Ollama**: all other models (local inference)
-
-The endpoint is always available at `/v1/chat/completions`.
+Provider detection:
+- `gpt-*`, `o1-*`, `o3-*` → OpenAI
+- `claude-*` → Anthropic
+- All others → Ollama (local inference)
 
 ## CLI Commands
 
-```
+```bash
 strata status                          # Server health check
 strata query "SELECT ..."              # Execute SQL
 strata ingest --source X --file Y      # Bulk ingest from file
@@ -281,10 +358,13 @@ All endpoints return errors in this format:
 
 HTTP status codes:
 - `200` — Success
+- `307` — Temporary Redirect (follower node, retry on leader)
 - `400` — Bad request (malformed JSON, invalid parameters)
-- `401` — Unauthorized (missing or invalid credentials)
+- `401` — Unauthorized (missing or invalid API key)
 - `403` — Forbidden (insufficient permissions)
 - `404` — Not found
-- `415` — Unsupported media type (missing Content-Type header)
-- `422` — Unprocessable entity (valid JSON, invalid semantics)
+- `408` — Request Timeout (query exceeded `query.timeout_ms`)
+- `422` — Unprocessable entity (valid JSON, invalid semantics — e.g., non-SELECT SQL)
 - `500` — Internal server error
+- `503` — Service Unavailable (no leader elected yet)
+- `504` — Gateway Timeout (request exceeded 30s HTTP timeout)

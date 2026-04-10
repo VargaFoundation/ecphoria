@@ -2,27 +2,59 @@
 
 ## Responsibility
 
-Distributed mode. Implements Raft consensus (via openraft), data replication,
-and node coordination. Phase 3 deliverable (M6-M9) — stub implementation initially.
+Distributed mode. Implements Raft consensus via openraft v0.9, routes writes through
+the leader, and provides cluster coordination. Each write (ingest, state_set, etc.)
+is proposed as an `AppRequest` through Raft and applied to the local `StrataEngine`
+upon commit.
+
+## Implementation Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| `TypeConfig` | **Working** | `declare_raft_types!` macro, AppRequest/AppResponse enums, NodeInfo, MessagePack serde |
+| `MemStore` | **Working** | Full `RaftStorage` trait impl: log (BTreeMap), vote, state machine (applies to StrataEngine), snapshots |
+| `NetworkClient` | **Working** | HTTP JSON POST for AppendEntries, Vote, InstallSnapshot RPCs |
+| `NetworkFactory` | **Working** | Creates `NetworkClient` per target node with shared reqwest::Client |
+| `ClusterCoordinator` | **Working** | Owns the `openraft::Raft` instance, `client_write()`, `is_leader()`, `leader_id()`, single-node init, graceful shutdown |
+| `ClusterConfig` | **Working** | TOML deserialization, node_id, listen, peers |
+| `LogShipper` | Stub | WAL segment shipping between peers |
+| `SnapshotManager` | Stub | Snapshot creation and transfer |
 
 ## Internal Architecture
 
 ```
 src/
-  lib.rs           Re-exports
-  error.rs         ClusterError
-  config.rs        ClusterConfig
-  coordinator.rs   ClusterCoordinator: leader election, request routing
+  lib.rs           Re-exports (ClusterConfig, ClusterCoordinator, Error, Result)
+  error.rs         ClusterError (Raft, Replication, Coordination, NotLeader, Core, Internal)
+  config.rs        ClusterConfig (enabled, node_id, listen, peers)
+  coordinator.rs   ClusterCoordinator: Raft lifecycle, client_write, leader detection
   raft/
-    types.rs       TypeConfig, NodeId, LogEntry, SnapshotData
-    network.rs     RaftNetwork (HTTP-based)
-    store.rs       RaftLogStore + RaftStateMachine
+    types.rs       TypeConfig, AppRequest, AppResponse, NodeInfo (openraft types)
+    network.rs     NetworkClient + NetworkFactory (HTTP JSON transport)
+    store.rs       MemStore: RaftStorage + RaftLogReader + RaftSnapshotBuilder
   replication/
-    log_shipper.rs WAL segment shipping
-    snapshot.rs    Snapshot transfer
+    log_shipper.rs WAL segment shipping (stub)
+    snapshot.rs    Snapshot transfer (stub)
 ```
+
+## AppRequest Variants
+
+All mutating operations are serialized as `AppRequest` through Raft:
+
+| Variant | Description | Response |
+|---------|-------------|----------|
+| `Ingest { source, events }` | Ingest events into episodic + semantic | `Ingested(count)` |
+| `StateSet { agent_id, key, value }` | Set agent state | `StateVersion(version)` |
+| `StateDelete { agent_id, key }` | Delete agent state | `Deleted` |
+| `SemanticUpsert { id, content, embedding, metadata }` | Upsert semantic entry | `Ok` |
+| `SemanticDelete { id }` | Delete semantic entry | `Ok` |
 
 ## Testing
 
-- `cargo test -p strata-cluster`
+- `cargo test -p strata-cluster` (15 tests)
+- Config deserialization tests (TOML, defaults, clone)
+- MemStore tests (create, save/read vote, log state)
+- AppRequest/AppResponse serialization roundtrip (MessagePack + JSON)
+- NetworkClient URL construction
+- ClusterCoordinator single-node Raft lifecycle (start → is_leader → shutdown)
 - In-memory Raft network for unit tests (no real TCP)

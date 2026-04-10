@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 mod banner;
 mod config;
 mod signals;
@@ -25,10 +27,18 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(strata_core::StrataEngine::new(server_config.core).await?);
 
     // Start Raft cluster if enabled
-    let mut coordinator = strata_cluster::ClusterCoordinator::new(server_config.cluster.clone());
-    let raft_handle = if server_config.cluster.enabled {
-        coordinator.start_raft(engine.clone()).await?;
-        coordinator.raft().map(|r| Arc::new(r.clone()))
+    let coordinator = Arc::new(RwLock::new(
+        strata_cluster::ClusterCoordinator::new(server_config.cluster.clone()),
+    ));
+
+    if server_config.cluster.enabled {
+        let mut coord = coordinator.write().await;
+        coord.start_raft(engine.clone()).await?;
+        drop(coord);
+    }
+
+    let cluster_handle = if server_config.cluster.enabled {
+        Some(coordinator.clone())
     } else {
         None
     };
@@ -37,13 +47,13 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
         server_config.gateway,
         Some(prometheus_handle),
-        raft_handle,
+        cluster_handle,
     )
     .await?;
 
     signals::wait_for_shutdown().await;
 
-    coordinator.shutdown().await?;
+    coordinator.write().await.shutdown().await?;
     gateway.shutdown().await?;
     Arc::try_unwrap(engine)
         .map_err(|_| anyhow::anyhow!("engine still has active references"))?
