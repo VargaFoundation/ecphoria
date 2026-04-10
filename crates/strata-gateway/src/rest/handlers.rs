@@ -106,6 +106,9 @@ pub async fn ingest(
                 .to_string(),
             payload,
             timestamp: chrono::Utc::now(),
+            parent_id: None,
+            trace_id: None,
+            tags: vec![],
         })
         .collect();
 

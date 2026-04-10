@@ -17,6 +17,31 @@ pub struct Event {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// Optional parent event for causal chains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    /// Optional trace ID for grouping related events across agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Tags for structured filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl Event {
+    /// Create a new event with only the required fields.
+    pub fn new(source: impl Into<String>, event_type: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source: source.into(),
+            event_type: event_type.into(),
+            payload,
+            timestamp: Utc::now(),
+            parent_id: None,
+            trace_id: None,
+            tags: vec![],
+        }
+    }
 }
 
 /// Append-only event store backed by DuckDB.
@@ -105,10 +130,21 @@ impl EpisodicStore {
                 source     VARCHAR NOT NULL,
                 event_type VARCHAR NOT NULL,
                 payload    JSON NOT NULL,
-                ts         TIMESTAMPTZ NOT NULL
+                ts         TIMESTAMPTZ NOT NULL,
+                parent_id  VARCHAR,
+                trace_id   VARCHAR,
+                tags       VARCHAR
             );",
         )
         .map_err(|e| crate::Error::Storage(format!("failed to create table: {e}")))?;
+
+        // Migration: add new columns for existing DBs
+        let _ = conn.execute_batch(
+            "ALTER TABLE episodic ADD COLUMN IF NOT EXISTS parent_id VARCHAR;
+             ALTER TABLE episodic ADD COLUMN IF NOT EXISTS trace_id VARCHAR;
+             ALTER TABLE episodic ADD COLUMN IF NOT EXISTS tags VARCHAR;",
+        );
+
         Ok(())
     }
 
@@ -127,8 +163,8 @@ impl EpisodicStore {
         let result = (|| {
             let mut stmt = db
                 .prepare(
-                    "INSERT INTO episodic (id, source, event_type, payload, ts)
-                     VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
 
@@ -136,12 +172,21 @@ impl EpisodicStore {
                 let payload_str = serde_json::to_string(&event.payload)
                     .map_err(|e| crate::Error::Ingest(e.to_string()))?;
                 let ts_str = event.timestamp.to_rfc3339();
+                let parent_str = event.parent_id.map(|id| id.to_string());
+                let tags_str = if event.tags.is_empty() {
+                    None
+                } else {
+                    Some(event.tags.join(","))
+                };
                 stmt.execute(duckdb::params![
                     event.id.to_string(),
                     event.source,
                     event.event_type,
                     payload_str,
                     ts_str,
+                    parent_str,
+                    event.trace_id,
+                    tags_str,
                 ])
                 .map_err(|e| crate::Error::Ingest(format!("insert error: {e}")))?;
             }
@@ -169,6 +214,36 @@ impl EpisodicStore {
         result
     }
 
+    /// Parse an Event from a DuckDB row.
+    /// Expected columns: id(0), source(1), event_type(2), payload::VARCHAR(3), ts::VARCHAR(4),
+    ///                    parent_id(5), trace_id(6), tags(7)
+    fn parse_event(row: &duckdb::Row<'_>) -> duckdb::Result<Event> {
+        let id_str: String = row.get(0)?;
+        let payload_str: String = row.get(3)?;
+        let ts_str: String = row.get(4)?;
+        let parent_str: Option<String> = row.get(5).ok();
+        let trace_id: Option<String> = row.get(6).ok();
+        let tags_str: Option<String> = row.get(7).ok();
+
+        Ok(Event {
+            id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil()),
+            source: row.get(1)?,
+            event_type: row.get(2)?,
+            payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+            timestamp: DateTime::parse_from_rfc3339(&ts_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            parent_id: parent_str.and_then(|s| Uuid::parse_str(&s).ok()),
+            trace_id,
+            tags: tags_str
+                .map(|s| s.split(',').map(|t| t.to_string()).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    const SELECT_COLS: &'static str =
+        "id, source, event_type, payload::VARCHAR, ts::VARCHAR, parent_id, trace_id, tags";
+
     /// Query events within a time range.
     pub async fn query_time_range(
         &self,
@@ -179,30 +254,14 @@ impl EpisodicStore {
         let end_str = end.to_rfc3339();
 
         let db = self.read_conn();
-        let mut stmt = db
-            .prepare(
-                "SELECT id, source, event_type, payload::VARCHAR, ts::VARCHAR
-                 FROM episodic
-                 WHERE ts >= ?::TIMESTAMPTZ AND ts <= ?::TIMESTAMPTZ
-                 ORDER BY ts ASC",
-            )
-            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let sql = format!(
+            "SELECT {} FROM episodic WHERE ts >= ?::TIMESTAMPTZ AND ts <= ?::TIMESTAMPTZ ORDER BY ts ASC",
+            Self::SELECT_COLS
+        );
+        let mut stmt = db.prepare(&sql).map_err(|e| crate::Error::Query(e.to_string()))?;
 
         let rows = stmt
-            .query_map(duckdb::params![start_str, end_str], |row| {
-                let id_str: String = row.get(0)?;
-                let payload_str: String = row.get(3)?;
-                let ts_str: String = row.get(4)?;
-                Ok(Event {
-                    id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil()),
-                    source: row.get(1)?,
-                    event_type: row.get(2)?,
-                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
-                    timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                })
-            })
+            .query_map(duckdb::params![start_str, end_str], Self::parse_event)
             .map_err(|e| crate::Error::Query(e.to_string()))?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -211,31 +270,14 @@ impl EpisodicStore {
     /// Query events by source.
     pub async fn query_by_source(&self, source: &str, limit: usize) -> crate::Result<Vec<Event>> {
         let db = self.read_conn();
-        let mut stmt = db
-            .prepare(
-                "SELECT id, source, event_type, payload::VARCHAR, ts::VARCHAR
-                 FROM episodic
-                 WHERE source = ?
-                 ORDER BY ts DESC
-                 LIMIT ?",
-            )
-            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let sql = format!(
+            "SELECT {} FROM episodic WHERE source = ? ORDER BY ts DESC LIMIT ?",
+            Self::SELECT_COLS
+        );
+        let mut stmt = db.prepare(&sql).map_err(|e| crate::Error::Query(e.to_string()))?;
 
         let rows = stmt
-            .query_map(duckdb::params![source, limit as i64], |row| {
-                let id_str: String = row.get(0)?;
-                let payload_str: String = row.get(3)?;
-                let ts_str: String = row.get(4)?;
-                Ok(Event {
-                    id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil()),
-                    source: row.get(1)?,
-                    event_type: row.get(2)?,
-                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
-                    timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                })
-            })
+            .query_map(duckdb::params![source, limit as i64], Self::parse_event)
             .map_err(|e| crate::Error::Query(e.to_string()))?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -356,6 +398,9 @@ mod tests {
             event_type: event_type.into(),
             payload: serde_json::json!({"key": "value"}),
             timestamp: Utc::now(),
+            parent_id: None,
+            trace_id: None,
+            tags: vec![],
         }
     }
 

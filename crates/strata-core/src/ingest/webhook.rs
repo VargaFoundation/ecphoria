@@ -55,6 +55,9 @@ fn normalize_github(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
             "raw": payload,
         }),
         timestamp: Utc::now(),
+        parent_id: None,
+        trace_id: None,
+        tags: vec![],
     }])
 }
 
@@ -89,6 +92,9 @@ fn normalize_sentry(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
             "action": action,
         }),
         timestamp: Utc::now(),
+        parent_id: None,
+        trace_id: None,
+        tags: vec![],
     }])
 }
 
@@ -120,6 +126,9 @@ fn normalize_slack(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
             "text": text,
         }),
         timestamp: Utc::now(),
+        parent_id: None,
+        trace_id: None,
+        tags: vec![],
     }])
 }
 
@@ -147,6 +156,9 @@ fn normalize_pagerduty(payload: &serde_json::Value) -> crate::Result<Vec<Event>>
             "event_type": event_type,
         }),
         timestamp: Utc::now(),
+        parent_id: None,
+        trace_id: None,
+        tags: vec![],
     }])
 }
 
@@ -165,6 +177,9 @@ fn normalize_generic(source: &str, payload: &serde_json::Value) -> crate::Result
         event_type,
         payload: payload.clone(),
         timestamp: Utc::now(),
+        parent_id: None,
+        trace_id: None,
+        tags: vec![],
     }])
 }
 

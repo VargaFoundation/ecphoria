@@ -246,6 +246,9 @@ async fn call_tool(
                         .to_string(),
                     payload: payload.clone(),
                     timestamp: chrono::Utc::now(),
+                    parent_id: None,
+                    trace_id: None,
+                    tags: vec![],
                 })
                 .collect();
 

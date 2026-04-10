@@ -50,6 +50,60 @@ impl IngestPipeline {
         }
     }
 
+    /// Max characters for embedding text (roughly ~512 tokens).
+    const MAX_EMBED_CHARS: usize = 2048;
+
+    /// Extract semantic content from an event for embedding.
+    ///
+    /// Strategy: extract human-readable values from the payload JSON,
+    /// excluding high-cardinality IDs and numeric-only fields.
+    /// Metadata (source, event_type) is NOT included in the embedding text —
+    /// it's stored separately for pre-filter search.
+    fn extract_embedding_text(event: &Event) -> String {
+        let mut parts = Vec::new();
+
+        // Include event_type as a semantic signal (it's descriptive)
+        parts.push(event.event_type.replace('.', " "));
+
+        // Extract string values from payload (skip IDs, numbers-only)
+        if let Some(obj) = event.payload.as_object() {
+            for (key, value) in obj {
+                match value {
+                    serde_json::Value::String(s) => {
+                        // Skip likely IDs (UUID-like, short hex, pure numbers)
+                        if s.len() > 2 && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                            parts.push(format!("{key}: {s}"));
+                        }
+                    }
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        // Recursively extract from nested structures (truncated)
+                        let nested = serde_json::to_string(value).unwrap_or_default();
+                        if nested.len() < 500 {
+                            parts.push(nested);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            // Non-object payload — use as-is
+            parts.push(serde_json::to_string(&event.payload).unwrap_or_default());
+        }
+
+        // Include tags as semantic content
+        if !event.tags.is_empty() {
+            parts.push(event.tags.join(" "));
+        }
+
+        let text = parts.join(". ");
+        // Truncate to max embedding length
+        if text.len() > Self::MAX_EMBED_CHARS {
+            text[..Self::MAX_EMBED_CHARS].to_string()
+        } else {
+            text
+        }
+    }
+
     /// Ingest a batch of events.
     ///
     /// 1. Append all events to episodic store
@@ -65,16 +119,11 @@ impl IngestPipeline {
 
         // Step 2: Auto-embed if provider is available (batched)
         if let (Some(semantic), Some(embedding)) = (&self.semantic, &self.embedding) {
+            // Build embedding texts: extract semantic content from payload,
+            // NOT metadata like source/event_type (those go in metadata filters).
             let texts: Vec<String> = events
                 .iter()
-                .map(|e| {
-                    format!(
-                        "[{}] {}: {}",
-                        e.source,
-                        e.event_type,
-                        serde_json::to_string(&e.payload).unwrap_or_default()
-                    )
-                })
+                .map(Self::extract_embedding_text)
                 .collect();
 
             // Process embeddings in batches to respect API limits
@@ -95,6 +144,8 @@ impl IngestPipeline {
                                     "source": event.source,
                                     "event_type": event.event_type,
                                     "timestamp": event.timestamp.to_rfc3339(),
+                                    "trace_id": event.trace_id,
+                                    "tags": event.tags,
                                 }),
                             };
                             if let Err(e) = semantic.upsert(&entry).await {
@@ -104,7 +155,6 @@ impl IngestPipeline {
                         embedded += chunk.len();
                     }
                     Err(e) => {
-                        // Non-fatal: continue with next batch
                         tracing::warn!(
                             error = %e,
                             batch_size = chunk.len(),
@@ -136,6 +186,9 @@ mod tests {
             event_type: "test.event".into(),
             payload: serde_json::json!({"data": 1}),
             timestamp: Utc::now(),
+            parent_id: None,
+            trace_id: None,
+            tags: vec![],
         }
     }
 

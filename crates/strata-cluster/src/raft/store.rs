@@ -89,6 +89,9 @@ impl MemStore {
                             .to_string(),
                         payload: payload.clone(),
                         timestamp: chrono::Utc::now(),
+                        parent_id: None,
+                        trace_id: None,
+                        tags: vec![],
                     })
                     .collect();
                 match engine.ingest(strata_events).await {

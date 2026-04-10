@@ -340,6 +340,9 @@ mod tests {
             event_type: "click".into(),
             payload: serde_json::json!({"page": "/home"}),
             timestamp: chrono::Utc::now(),
+            parent_id: None,
+            trace_id: None,
+            tags: vec![],
         }];
 
         let count = engine.ingest(events).await.unwrap();
