@@ -28,23 +28,48 @@ pub fn router() -> Router {
 }
 
 /// Build the full REST API router with engine state and production middleware.
+///
+/// If `api_key_store` is provided, all `/api/v1/*` routes require authentication.
 pub fn router_with_engine(engine: Arc<StrataEngine>) -> Router {
-    Router::new()
-        // Health (metrics endpoint added by server.rs with PrometheusHandle)
-        .route("/health", axum::routing::get(handlers::health))
-        // Core API
-        .route("/api/v1/query", axum::routing::post(handlers::query))
-        .route("/api/v1/ingest", axum::routing::post(handlers::ingest))
+    router_with_engine_and_auth(engine, None)
+}
+
+/// Build the full REST API router with optional auth middleware.
+pub fn router_with_engine_and_auth(
+    engine: Arc<StrataEngine>,
+    api_key_store: Option<crate::auth::middleware::ApiKeyStore>,
+) -> Router {
+    // Public routes (no auth required)
+    let mut app = Router::new()
+        .route("/health", axum::routing::get(handlers::health));
+
+    // Protected API routes
+    let mut api_routes = Router::new()
+        .route("/query", axum::routing::post(handlers::query))
+        .route("/ingest", axum::routing::post(handlers::ingest))
         .route(
-            "/api/v1/webhook/{source}",
+            "/webhook/{source}",
             axum::routing::post(handlers::webhook),
         )
-        .route("/api/v1/search", axum::routing::post(handlers::search))
+        .route("/search", axum::routing::post(handlers::search))
         .route(
-            "/api/v1/state/{agent_id}/{key}",
+            "/state/{agent_id}/{key}",
             axum::routing::get(handlers::state_get).put(handlers::state_set),
         )
-        // MCP & LLM proxy
+        .with_state(engine.clone());
+
+    // Apply auth middleware if configured
+    if let Some(store) = api_key_store {
+        api_routes = api_routes.route_layer(axum::middleware::from_fn_with_state(
+            store,
+            crate::auth::middleware::require_auth,
+        ));
+    }
+
+    app = app.nest("/api/v1", api_routes);
+
+    // MCP & LLM proxy (use engine state, resolved separately)
+    let protocol_routes = Router::new()
         .route(
             "/mcp",
             axum::routing::post(crate::mcp::transport::handle_mcp),
@@ -53,9 +78,12 @@ pub fn router_with_engine(engine: Arc<StrataEngine>) -> Router {
             "/v1/chat/completions",
             axum::routing::post(crate::llm_proxy::router::chat_completions),
         )
-        .with_state(engine)
-        // Middleware stack (applied bottom-up)
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        .with_state(engine);
+
+    app = app.merge(protocol_routes);
+
+    // Global middleware stack (applied bottom-up)
+    app.layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(30),
         ))

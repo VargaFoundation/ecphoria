@@ -1,0 +1,107 @@
+# Default values for Strata Helm chart.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/vargafoundation/strata
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# -- Strata server configuration (maps to strata.toml / env vars)
+config:
+  storage:
+    dataDir: /data
+    engine: local
+  memory:
+    episodic:
+      dbPath: /data/episodic.duckdb
+    semantic:
+      indexDir: /data/vectors
+      defaultDimension: 768
+    state:
+      dbPath: /data/state.db
+  gateway:
+    listen: "0.0.0.0:8432"
+    pgListen: "0.0.0.0:5432"
+    grpcListen: "0.0.0.0:9432"
+    mcpEnabled: true
+    llmProxyEnabled: false
+    authEnabled: false
+    apiKeys: []
+  cluster:
+    enabled: true
+    # nodeId is auto-assigned from StatefulSet ordinal
+  embedding:
+    provider: ollama
+    model: nomic-embed-text
+    dimension: 768
+    ollamaUrl: "http://ollama:11434"
+
+# -- Service configuration
+service:
+  type: ClusterIP
+  httpPort: 8432
+  pgPort: 5432
+  grpcPort: 9432
+  raftPort: 9433
+
+# -- Headless service for StatefulSet peer discovery
+headlessService:
+  enabled: true
+
+# -- Persistent volume for data
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+# -- Resource requests and limits
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# -- Liveness and readiness probes
+probes:
+  liveness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 15
+  readiness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+
+# -- Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# -- Service monitor for Prometheus
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  path: /metrics
+
+# -- Node affinity / tolerations
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Ollama sidecar (optional, for local embeddings)
+ollama:
+  enabled: false
+  image: ollama/ollama:latest
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi

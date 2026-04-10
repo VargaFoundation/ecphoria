@@ -56,7 +56,7 @@ aws-sdk-s3 = { version = "1" }
 aws-config = { version = "1" }
 
 # Consensus
-openraft = { version = "0.9" }
+openraft = { version = "0.9", features = ["serde"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

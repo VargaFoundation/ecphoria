@@ -3,6 +3,7 @@
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
@@ -197,6 +198,93 @@ impl SemanticStore {
         }
         Ok(())
     }
+
+    /// Save the index and metadata to disk for persistence.
+    ///
+    /// Saves the USearch index to `{dir}/index.usearch` and metadata to `{dir}/metadata.json`.
+    pub fn save(&self, dir: &Path) -> crate::Result<()> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
+
+        // Save USearch index
+        let index_path = dir.join("index.usearch");
+        let index_str = index_path.to_string_lossy();
+        {
+            let index = self.index.lock();
+            index
+                .save(&index_str)
+                .map_err(|e| crate::Error::Storage(format!("save index: {e}")))?;
+        }
+
+        // Save metadata (entries + uuid_to_key + next_key + dimension)
+        let meta = SerializedMetadata {
+            entries: self.entries.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+            uuid_to_key: self.uuid_to_key.iter().map(|e| (*e.key(), *e.value())).collect(),
+            next_key: self.next_key.load(Ordering::Relaxed),
+            dimension: self.dimension,
+        };
+        let meta_path = dir.join("metadata.json");
+        let meta_json = serde_json::to_string(&meta)
+            .map_err(|e| crate::Error::Storage(format!("serialize metadata: {e}")))?;
+        std::fs::write(&meta_path, meta_json)
+            .map_err(|e| crate::Error::Storage(format!("write metadata: {e}")))?;
+
+        tracing::info!(entries = self.entries.len(), path = %dir.display(), "semantic store saved");
+        Ok(())
+    }
+
+    /// Load a previously saved semantic store from disk.
+    pub fn load(dir: &Path) -> crate::Result<Self> {
+        let meta_path = dir.join("metadata.json");
+        let meta_json = std::fs::read_to_string(&meta_path)
+            .map_err(|e| crate::Error::Storage(format!("read metadata: {e}")))?;
+        let meta: SerializedMetadata = serde_json::from_str(&meta_json)
+            .map_err(|e| crate::Error::Storage(format!("parse metadata: {e}")))?;
+
+        let index_path = dir.join("index.usearch");
+        let index_str = index_path.to_string_lossy();
+        let options = usearch::ffi::IndexOptions {
+            dimensions: meta.dimension,
+            metric: usearch::ffi::MetricKind::Cos,
+            quantization: usearch::ffi::ScalarKind::F32,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+            multi: false,
+        };
+        let index = usearch::Index::new(&options)
+            .map_err(|e| crate::Error::Storage(format!("create index: {e}")))?;
+        index
+            .load(&index_str)
+            .map_err(|e| crate::Error::Storage(format!("load index: {e}")))?;
+
+        let entries = DashMap::new();
+        for (k, v) in meta.entries {
+            entries.insert(k, v);
+        }
+        let uuid_to_key = DashMap::new();
+        for (k, v) in meta.uuid_to_key {
+            uuid_to_key.insert(k, v);
+        }
+
+        tracing::info!(entries = entries.len(), path = %dir.display(), "semantic store loaded");
+        Ok(Self {
+            index: Mutex::new(index),
+            entries,
+            uuid_to_key,
+            next_key: AtomicU64::new(meta.next_key),
+            dimension: meta.dimension,
+        })
+    }
+}
+
+/// Serialization format for semantic store metadata.
+#[derive(Serialize, Deserialize)]
+struct SerializedMetadata {
+    entries: Vec<(u64, EntryMetadata)>,
+    uuid_to_key: Vec<(Uuid, u64)>,
+    next_key: u64,
+    dimension: usize,
 }
 
 impl Default for SemanticStore {
@@ -376,5 +464,37 @@ mod tests {
 
         let results = store.search(&[1.0, 0.0, 0.0, 0.0], 3).await.unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn save_and_load_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("semantic");
+
+        // Create store, add entries, save
+        {
+            let store = SemanticStore::with_dimension(4).unwrap();
+            store
+                .upsert(&make_entry("cat", vec![1.0, 0.0, 0.0, 0.0]))
+                .await
+                .unwrap();
+            store
+                .upsert(&make_entry("dog", vec![0.9, 0.1, 0.0, 0.0]))
+                .await
+                .unwrap();
+            assert_eq!(store.len(), 2);
+            store.save(&save_path).unwrap();
+        }
+
+        // Load and verify
+        {
+            let store = SemanticStore::load(&save_path).unwrap();
+            assert_eq!(store.len(), 2);
+            assert_eq!(store.dimension(), 4);
+
+            let results = store.search(&[1.0, 0.0, 0.0, 0.0], 1).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].entry.content, "cat");
+        }
     }
 }

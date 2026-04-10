@@ -6,4 +6,4 @@ pub mod replication;
 
 pub use config::ClusterConfig;
 pub use coordinator::ClusterCoordinator;
-pub use error::Error;
+pub use error::{Error, Result};

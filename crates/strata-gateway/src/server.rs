@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusHandle;
+use strata_cluster::coordinator::StrataRaft;
 use strata_core::StrataEngine;
 use tokio::net::TcpListener;
 
@@ -19,6 +20,8 @@ pub struct GatewayConfig {
     pub llm_proxy_enabled: bool,
     pub auth_enabled: bool,
     pub max_pg_connections: usize,
+    /// API keys that are allowed to access the server (when auth_enabled = true).
+    pub api_keys: Vec<String>,
 }
 
 impl Default for GatewayConfig {
@@ -31,6 +34,7 @@ impl Default for GatewayConfig {
             llm_proxy_enabled: false,
             auth_enabled: false,
             max_pg_connections: 256,
+            api_keys: vec![],
         }
     }
 }
@@ -50,11 +54,22 @@ impl GatewayServer {
         engine: Arc<StrataEngine>,
         config: GatewayConfig,
         prometheus: Option<PrometheusHandle>,
+        raft: Option<Arc<StrataRaft>>,
     ) -> Result<Self> {
         let listen_addr = config.listen.clone();
 
-        // Build REST router with engine state
-        let mut app = crate::rest::router_with_engine(engine.clone());
+        // Build REST router with engine state and optional auth
+        let api_key_store = if config.auth_enabled && !config.api_keys.is_empty() {
+            tracing::info!(keys = config.api_keys.len(), "API key authentication enabled");
+            Some(crate::auth::middleware::ApiKeyStore::new(config.api_keys.clone()))
+        } else {
+            if config.auth_enabled {
+                tracing::warn!("auth_enabled=true but no api_keys configured — auth disabled");
+            }
+            None
+        };
+        let mut app =
+            crate::rest::router_with_engine_and_auth(engine.clone(), api_key_store);
 
         if let Some(handle) = prometheus {
             app = app.route(
@@ -64,6 +79,13 @@ impl GatewayServer {
                     async move { h.render() }
                 }),
             );
+        }
+
+        // Mount Raft RPC endpoints if cluster mode is active
+        if let Some(raft_instance) = raft {
+            let raft_router = crate::cluster::raft_routes::raft_router(raft_instance);
+            app = app.merge(raft_router);
+            tracing::info!("Raft RPC endpoints mounted (/raft/*, /cluster/status)");
         }
 
         // Bind TCP listener
@@ -137,7 +159,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             ..Default::default()
         };
-        let gateway = GatewayServer::start(engine, config, None).await.unwrap();
+        let gateway = GatewayServer::start(engine, config, None, None).await.unwrap();
         gateway.shutdown().await.unwrap();
     }
 

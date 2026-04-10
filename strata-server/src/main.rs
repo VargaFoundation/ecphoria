@@ -24,15 +24,26 @@ async fn main() -> anyhow::Result<()> {
 
     let engine = Arc::new(strata_core::StrataEngine::new(server_config.core).await?);
 
+    // Start Raft cluster if enabled
+    let mut coordinator = strata_cluster::ClusterCoordinator::new(server_config.cluster.clone());
+    let raft_handle = if server_config.cluster.enabled {
+        coordinator.start_raft(engine.clone()).await?;
+        coordinator.raft().map(|r| Arc::new(r.clone()))
+    } else {
+        None
+    };
+
     let gateway = strata_gateway::GatewayServer::start(
         engine.clone(),
         server_config.gateway,
         Some(prometheus_handle),
+        raft_handle,
     )
     .await?;
 
     signals::wait_for_shutdown().await;
 
+    coordinator.shutdown().await?;
     gateway.shutdown().await?;
     Arc::try_unwrap(engine)
         .map_err(|_| anyhow::anyhow!("engine still has active references"))?

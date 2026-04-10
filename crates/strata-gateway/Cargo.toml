@@ -9,6 +9,8 @@ description = "Protocol gateway for the Strata context lake"
 
 [dependencies]
 strata-core.workspace = true
+strata-cluster.workspace = true
+openraft.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

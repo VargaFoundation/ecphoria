@@ -1,0 +1,74 @@
+# 3-node Strata Raft cluster with Ollama for embeddings.
+# Usage: docker compose -f deploy/docker-compose.cluster.yml up -d
+
+services:
+  strata-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: strata-1
+    ports:
+      - "8432:8432"
+      - "5432:5432"
+    environment:
+      STRATA_CLUSTER__ENABLED: "true"
+      STRATA_CLUSTER__NODE_ID: "1"
+      STRATA_CLUSTER__LISTEN: "0.0.0.0:9433"
+      STRATA_CLUSTER__PEERS: "strata-2:9433,strata-3:9433"
+      STRATA_EMBEDDING__PROVIDER: ollama
+      STRATA_EMBEDDING__OLLAMA_URL: http://ollama:11434
+    volumes:
+      - strata-1-data:/data
+    depends_on:
+      - ollama
+
+  strata-2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: strata-2
+    ports:
+      - "8433:8432"
+    environment:
+      STRATA_CLUSTER__ENABLED: "true"
+      STRATA_CLUSTER__NODE_ID: "2"
+      STRATA_CLUSTER__LISTEN: "0.0.0.0:9433"
+      STRATA_CLUSTER__PEERS: "strata-1:9433,strata-3:9433"
+      STRATA_EMBEDDING__PROVIDER: ollama
+      STRATA_EMBEDDING__OLLAMA_URL: http://ollama:11434
+    volumes:
+      - strata-2-data:/data
+    depends_on:
+      - ollama
+
+  strata-3:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: strata-3
+    ports:
+      - "8434:8432"
+    environment:
+      STRATA_CLUSTER__ENABLED: "true"
+      STRATA_CLUSTER__NODE_ID: "3"
+      STRATA_CLUSTER__LISTEN: "0.0.0.0:9433"
+      STRATA_CLUSTER__PEERS: "strata-1:9433,strata-2:9433"
+      STRATA_EMBEDDING__PROVIDER: ollama
+      STRATA_EMBEDDING__OLLAMA_URL: http://ollama:11434
+    volumes:
+      - strata-3-data:/data
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  strata-1-data:
+  strata-2-data:
+  strata-3-data:
+  ollama-data:

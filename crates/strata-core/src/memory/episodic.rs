@@ -5,6 +5,7 @@ use duckdb::Connection;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -19,9 +20,25 @@ pub struct Event {
 }
 
 /// Append-only event store backed by DuckDB.
-#[derive(Debug)]
+///
+/// Uses separate write and read connections for concurrency:
+/// - File-backed: 1 write connection + N read connections (round-robin pool)
+/// - In-memory: single shared connection (DuckDB limitation)
 pub struct EpisodicStore {
-    db: Arc<Mutex<Connection>>,
+    /// Connection used for writes (INSERT, DDL). Also used for reads in in-memory mode.
+    write_db: Arc<Mutex<Connection>>,
+    /// Pool of read-only connections (file-backed mode only).
+    read_pool: Vec<Mutex<Connection>>,
+    /// Round-robin counter for read pool.
+    read_next: AtomicUsize,
+}
+
+impl std::fmt::Debug for EpisodicStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpisodicStore")
+            .field("read_pool_size", &self.read_pool.len())
+            .finish()
+    }
 }
 
 impl EpisodicStore {
@@ -30,11 +47,15 @@ impl EpisodicStore {
         Self::open(Path::new(":memory:")).expect("failed to create in-memory episodic store")
     }
 
+    /// Number of reader connections in the pool.
+    const DEFAULT_READ_POOL_SIZE: usize = 4;
+
     /// Open or create an episodic store at the given path.
     ///
     /// Use `:memory:` for an in-memory store (testing) or a file path for persistence.
+    /// For file-backed stores, a pool of read connections is created for concurrent queries.
     pub fn open(path: &Path) -> crate::Result<Self> {
-        let conn = if path.as_os_str() == ":memory:" {
+        let write_conn = if path.as_os_str() == ":memory:" {
             Connection::open_in_memory()
         } else {
             if let Some(parent) = path.parent() {
@@ -46,10 +67,30 @@ impl EpisodicStore {
         }
         .map_err(|e| crate::Error::Storage(format!("failed to open duckdb: {e}")))?;
 
-        Self::init_schema(&conn)?;
+        Self::init_schema(&write_conn)?;
+
+        // Create read connection pool via try_clone (shares the same underlying database)
+        let mut read_pool = Vec::with_capacity(Self::DEFAULT_READ_POOL_SIZE);
+        for _ in 0..Self::DEFAULT_READ_POOL_SIZE {
+            let conn = write_conn
+                .try_clone()
+                .map_err(|e| crate::Error::Storage(format!("failed to clone read conn: {e}")))?;
+            read_pool.push(Mutex::new(conn));
+        }
+
+        tracing::info!(pool_size = read_pool.len(), "episodic read connection pool created");
+
         Ok(Self {
-            db: Arc::new(Mutex::new(conn)),
+            write_db: Arc::new(Mutex::new(write_conn)),
+            read_pool,
+            read_next: AtomicUsize::new(0),
         })
+    }
+
+    /// Acquire a connection for reading from the round-robin pool.
+    fn read_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        let idx = self.read_next.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
+        self.read_pool[idx].lock()
     }
 
     fn init_schema(conn: &Connection) -> crate::Result<()> {
@@ -58,8 +99,8 @@ impl EpisodicStore {
                 id         VARCHAR PRIMARY KEY,
                 source     VARCHAR NOT NULL,
                 event_type VARCHAR NOT NULL,
-                payload    VARCHAR NOT NULL,
-                ts         VARCHAR NOT NULL
+                payload    JSON NOT NULL,
+                ts         TIMESTAMPTZ NOT NULL
             );",
         )
         .map_err(|e| crate::Error::Storage(format!("failed to create table: {e}")))?;
@@ -73,7 +114,7 @@ impl EpisodicStore {
         }
 
         let start = std::time::Instant::now();
-        let db = self.db.lock();
+        let db = self.write_db.lock();
 
         db.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| crate::Error::Ingest(format!("begin transaction: {e}")))?;
@@ -132,12 +173,12 @@ impl EpisodicStore {
         let start_str = start.to_rfc3339();
         let end_str = end.to_rfc3339();
 
-        let db = self.db.lock();
+        let db = self.read_conn();
         let mut stmt = db
             .prepare(
-                "SELECT id, source, event_type, payload, ts
+                "SELECT id, source, event_type, payload::VARCHAR, ts::VARCHAR
                  FROM episodic
-                 WHERE ts >= ? AND ts <= ?
+                 WHERE ts >= ?::TIMESTAMPTZ AND ts <= ?::TIMESTAMPTZ
                  ORDER BY ts ASC",
             )
             .map_err(|e| crate::Error::Query(e.to_string()))?;
@@ -164,10 +205,10 @@ impl EpisodicStore {
 
     /// Query events by source.
     pub async fn query_by_source(&self, source: &str, limit: usize) -> crate::Result<Vec<Event>> {
-        let db = self.db.lock();
+        let db = self.read_conn();
         let mut stmt = db
             .prepare(
-                "SELECT id, source, event_type, payload, ts
+                "SELECT id, source, event_type, payload::VARCHAR, ts::VARCHAR
                  FROM episodic
                  WHERE source = ?
                  ORDER BY ts DESC
@@ -239,7 +280,7 @@ impl EpisodicStore {
         let start = std::time::Instant::now();
         Self::validate_read_only(sql)?;
 
-        let db = self.db.lock();
+        let db = self.read_conn();
         let mut stmt = db
             .prepare(sql)
             .map_err(|e| crate::Error::Query(e.to_string()))?;
@@ -285,7 +326,7 @@ impl EpisodicStore {
 
     /// Return the total number of stored events.
     pub async fn count(&self) -> crate::Result<u64> {
-        let db = self.db.lock();
+        let db = self.read_conn();
         let count: i64 = db
             .query_row("SELECT count(*) FROM episodic", [], |row| row.get(0))
             .map_err(|e| crate::Error::Query(e.to_string()))?;
