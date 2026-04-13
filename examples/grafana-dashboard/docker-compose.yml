@@ -1,0 +1,52 @@
+services:
+  strata:
+    image: ghcr.io/varga-foundation/strata:latest
+    ports:
+      - "8432:8432"
+      - "5432:5432"
+    volumes:
+      - strata-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8432/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: strata
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_UID: strata-ai-agents
+    volumes:
+      - ./dashboards:/var/lib/grafana/dashboards
+      - ./provisioning/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./provisioning/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+    depends_on:
+      strata:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - strata
+
+  seed:
+    image: curlimages/curl:latest
+    depends_on:
+      strata:
+        condition: service_healthy
+    volumes:
+      - ./seed.sh:/seed.sh
+    entrypoint: ["sh", "/seed.sh"]
+    environment:
+      STRATA_URL: http://strata:8432
+
+volumes:
+  strata-data:

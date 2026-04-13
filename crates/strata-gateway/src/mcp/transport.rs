@@ -249,6 +249,7 @@ async fn call_tool(
                     parent_id: None,
                     trace_id: None,
                     tags: vec![],
+                    idempotency_key: None,
                 })
                 .collect();
 

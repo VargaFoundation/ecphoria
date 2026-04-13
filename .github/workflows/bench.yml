@@ -1,0 +1,51 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    name: Criterion benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: Mozilla-Actions/sccache-action@v0.0.6
+
+      - name: Run benchmarks
+        run: cargo bench -p strata-core -- --output-format bencher | tee bench-output.txt
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+
+      - name: Download previous benchmark results
+        uses: actions/cache@v4
+        with:
+          path: ./bench-cache
+          key: bench-${{ runner.os }}-${{ github.base_ref }}
+          restore-keys: |
+            bench-${{ runner.os }}-main
+
+      - name: Compare and comment on PR
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench-output.txt
+          external-data-json-path: ./bench-cache/benchmark-data.json
+          comment-on-alert: true
+          alert-threshold: "130%"
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment-always: true
+          summary-always: true

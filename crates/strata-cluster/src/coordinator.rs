@@ -50,7 +50,10 @@ impl ClusterCoordinator {
                 Some(engine.clone()),
             ) {
                 Ok(s) => {
-                    tracing::info!(node_id = self.config.node_id, "Raft store: persistent (SQLite)");
+                    tracing::info!(
+                        node_id = self.config.node_id,
+                        "Raft store: persistent (SQLite)"
+                    );
                     s
                 }
                 Err(e) => {
@@ -62,9 +65,15 @@ impl ClusterCoordinator {
         let (log_store, state_machine) = Adaptor::new(store);
         let network = NetworkFactory::new();
 
-        let raft = Raft::new(self.config.node_id, config, network, log_store, state_machine)
-            .await
-            .map_err(|e| crate::Error::Raft(format!("failed to create raft: {e}")))?;
+        let raft = Raft::new(
+            self.config.node_id,
+            config,
+            network,
+            log_store,
+            state_machine,
+        )
+        .await
+        .map_err(|e| crate::Error::Raft(format!("failed to create raft: {e}")))?;
 
         tracing::info!(node_id = self.config.node_id, "Raft instance started");
 
@@ -118,13 +127,10 @@ impl ClusterCoordinator {
             .as_ref()
             .ok_or_else(|| crate::Error::Raft("raft not started".into()))?;
 
-        let response = raft
-            .client_write(request)
-            .await
-            .map_err(|e| {
-                // Check if this is a ForwardToLeader error
-                crate::Error::Raft(format!("client_write failed: {e}"))
-            })?;
+        let response = raft.client_write(request).await.map_err(|e| {
+            // Check if this is a ForwardToLeader error
+            crate::Error::Raft(format!("client_write failed: {e}"))
+        })?;
 
         Ok(response.data)
     }

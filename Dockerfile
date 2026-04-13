@@ -1,5 +1,6 @@
 # Stage 1: Chef — dependency caching layer
-FROM rust:1-bookworm AS chef
+FROM rust:1-alpine AS chef
+RUN apk add --no-cache musl-dev cmake g++ make pkgconf openssl-dev openssl-libs-static perl
 RUN cargo install cargo-chef
 WORKDIR /app
 
@@ -10,19 +11,19 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder — build dependencies first (cached), then source
 FROM chef AS builder
-RUN apt-get update && apt-get install -y cmake g++ && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin strata-server
+RUN cargo build --release --bin strata-server && \
+    strip target/release/strata-server
 
-# Stage 4: Runtime — minimal image with shell for K8s init scripts
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
+# Stage 4: Runtime — minimal scratch-like image
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache ca-certificates curl && \
+    adduser -D -u 1000 strata
 COPY --from=builder /app/target/release/strata-server /usr/local/bin/strata-server
 
+USER strata
 EXPOSE 5432 8432 9432 9433
 VOLUME ["/data"]
 

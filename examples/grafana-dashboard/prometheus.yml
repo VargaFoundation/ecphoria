@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: strata
+    static_configs:
+      - targets: ["strata:8432"]
+    metrics_path: /metrics

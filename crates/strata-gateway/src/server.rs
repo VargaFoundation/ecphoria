@@ -22,6 +22,15 @@ pub struct GatewayConfig {
     pub max_pg_connections: usize,
     /// API keys that are allowed to access the server (when auth_enabled = true).
     pub api_keys: Vec<String>,
+    /// HMAC-SHA256 secret for JWT token validation.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+    /// Allowed CORS origins. Empty = permissive (dev only).
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Maximum requests per second per API key (token bucket). 0 = unlimited.
+    #[serde(default)]
+    pub rate_limit_per_key: u32,
 }
 
 impl Default for GatewayConfig {
@@ -35,6 +44,9 @@ impl Default for GatewayConfig {
             auth_enabled: false,
             max_pg_connections: 256,
             api_keys: vec![],
+            jwt_secret: None,
+            cors_origins: vec![],
+            rate_limit_per_key: 0,
         }
     }
 }
@@ -44,6 +56,8 @@ pub struct GatewayServer {
     _engine: Arc<StrataEngine>,
     _config: GatewayConfig,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pg_handle: Option<crate::pg_wire::handler::PgWireHandle>,
+    grpc_handle: Option<crate::grpc::service::GrpcHandle>,
 }
 
 impl GatewayServer {
@@ -59,27 +73,43 @@ impl GatewayServer {
         let listen_addr = config.listen.clone();
 
         // Build REST router with engine state and optional auth
-        let api_key_store = if config.auth_enabled && !config.api_keys.is_empty() {
-            tracing::info!(keys = config.api_keys.len(), "API key authentication enabled");
-            Some(crate::auth::middleware::ApiKeyStore::new(config.api_keys.clone()))
-        } else {
-            if config.auth_enabled {
-                tracing::warn!("auth_enabled=true but no api_keys configured — auth disabled");
+        let auth_state = if config.auth_enabled {
+            let state = crate::auth::middleware::AuthState::new(
+                config.api_keys.clone(),
+                config.jwt_secret.clone(),
+                config.rate_limit_per_key,
+            );
+            if state.is_empty() {
+                tracing::warn!(
+                    "auth_enabled=true but no api_keys or jwt_secret configured — auth disabled"
+                );
+                None
+            } else {
+                tracing::info!(
+                    api_keys = config.api_keys.len(),
+                    jwt = config.jwt_secret.is_some(),
+                    rate_limit = config.rate_limit_per_key,
+                    "Authentication enabled"
+                );
+                Some(state)
             }
+        } else {
             None
         };
 
         // Build cluster state for leader-forwarding middleware
-        let cluster_state = coordinator.as_ref().map(|coord| {
-            crate::cluster::leader_forward::ClusterState {
-                coordinator: coord.clone(),
-            }
-        });
+        let cluster_state =
+            coordinator
+                .as_ref()
+                .map(|coord| crate::cluster::leader_forward::ClusterState {
+                    coordinator: coord.clone(),
+                });
 
         let mut app = crate::rest::router_with_engine_and_auth(
             engine.clone(),
-            api_key_store,
+            auth_state,
             cluster_state,
+            &config,
         );
 
         if let Some(handle) = prometheus {
@@ -129,30 +159,61 @@ impl GatewayServer {
         // Start PG wire protocol server
         let pg_addr = config.pg_listen.clone();
         let max_pg = config.max_pg_connections;
-        if let Err(e) =
-            crate::pg_wire::handler::start_pg_wire(&pg_addr, engine.clone(), max_pg).await
+        let pg_handle = match crate::pg_wire::handler::start_pg_wire(
+            &pg_addr,
+            engine.clone(),
+            max_pg,
+        )
+        .await
         {
-            tracing::warn!(%pg_addr, error = %e, "failed to start PG wire server (non-fatal)");
-        }
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!(%pg_addr, error = %e, "failed to start PG wire server (non-fatal)");
+                None
+            }
+        };
 
         // Start gRPC server
         let grpc_addr = config.grpc_listen.clone();
-        if let Err(e) = crate::grpc::service::start_grpc(&grpc_addr, engine.clone()).await {
-            tracing::warn!(%grpc_addr, error = %e, "failed to start gRPC server (non-fatal)");
-        }
+        let grpc_handle = match crate::grpc::service::start_grpc(&grpc_addr, engine.clone()).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!(%grpc_addr, error = %e, "failed to start gRPC server (non-fatal)");
+                None
+            }
+        };
 
         Ok(Self {
             _engine: engine,
             _config: config,
             shutdown_tx: Some(shutdown_tx),
+            pg_handle,
+            grpc_handle,
         })
     }
 
     /// Gracefully shut down all listeners.
+    ///
+    /// Signals HTTP, PG wire, and gRPC servers to stop accepting new connections,
+    /// then waits up to 10 seconds for in-flight connections to drain.
     pub async fn shutdown(mut self) -> Result<()> {
+        let drain_timeout = std::time::Duration::from_secs(10);
+
+        // Signal HTTP server
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+
+        // Signal gRPC server (uses tonic's graceful shutdown)
+        if let Some(handle) = self.grpc_handle.take() {
+            handle.shutdown();
+        }
+
+        // Drain PG wire connections with timeout
+        if let Some(handle) = self.pg_handle.take() {
+            handle.shutdown(drain_timeout).await;
+        }
+
         tracing::info!("Gateway shut down");
         Ok(())
     }
@@ -174,7 +235,14 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             ..Default::default()
         };
-        let gateway = GatewayServer::start(engine, config, None, None::<Arc<tokio::sync::RwLock<ClusterCoordinator>>>).await.unwrap();
+        let gateway = GatewayServer::start(
+            engine,
+            config,
+            None,
+            None::<Arc<tokio::sync::RwLock<ClusterCoordinator>>>,
+        )
+        .await
+        .unwrap();
         gateway.shutdown().await.unwrap();
     }
 

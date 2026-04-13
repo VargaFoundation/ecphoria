@@ -1,0 +1,43 @@
+{
+  "name": "@strata/client",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript client for the Strata context lake",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "strata",
+    "ai",
+    "agents",
+    "context-lake",
+    "memory",
+    "vector-search"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VargaFoundation/strata",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/VargaFoundation/strata/tree/main/sdk/typescript",
+  "devDependencies": {
+    "typescript": "^5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

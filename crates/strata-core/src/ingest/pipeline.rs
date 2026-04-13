@@ -121,10 +121,7 @@ impl IngestPipeline {
         if let (Some(semantic), Some(embedding)) = (&self.semantic, &self.embedding) {
             // Build embedding texts: extract semantic content from payload,
             // NOT metadata like source/event_type (those go in metadata filters).
-            let texts: Vec<String> = events
-                .iter()
-                .map(Self::extract_embedding_text)
-                .collect();
+            let texts: Vec<String> = events.iter().map(Self::extract_embedding_text).collect();
 
             // Process embeddings in batches to respect API limits
             let mut embedded = 0usize;
@@ -189,6 +186,7 @@ mod tests {
             parent_id: None,
             trace_id: None,
             tags: vec![],
+            idempotency_key: None,
         }
     }
 

@@ -213,8 +213,8 @@ impl StateStore {
     ) -> crate::Result<u64> {
         let value_str =
             serde_json::to_string(&value).map_err(|e| crate::Error::State(e.to_string()))?;
-        let expires_at = (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default())
-            .to_rfc3339();
+        let expires_at =
+            (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default()).to_rfc3339();
 
         let db = self.db.lock();
         db.execute(
@@ -256,7 +256,9 @@ impl StateStore {
 
         // Find expired keys to invalidate cache
         let mut stmt = db
-            .prepare("SELECT agent_id, key FROM state WHERE expires_at IS NOT NULL AND expires_at < ?1")
+            .prepare(
+                "SELECT agent_id, key FROM state WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            )
             .map_err(|e| crate::Error::State(e.to_string()))?;
         let expired: Vec<(String, String)> = stmt
             .query_map(rusqlite::params![now], |row| Ok((row.get(0)?, row.get(1)?)))

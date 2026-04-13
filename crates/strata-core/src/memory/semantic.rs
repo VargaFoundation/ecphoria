@@ -269,8 +269,7 @@ impl SemanticStore {
     ///
     /// Saves the USearch index to `{dir}/index.usearch` and metadata to `{dir}/metadata.json`.
     pub fn save(&self, dir: &Path) -> crate::Result<()> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
+        std::fs::create_dir_all(dir).map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
 
         // Save USearch index
         let index_path = dir.join("index.usearch");
@@ -284,8 +283,16 @@ impl SemanticStore {
 
         // Save metadata (entries + uuid_to_key + next_key + dimension)
         let meta = SerializedMetadata {
-            entries: self.entries.iter().map(|e| (*e.key(), e.value().clone())).collect(),
-            uuid_to_key: self.uuid_to_key.iter().map(|e| (*e.key(), *e.value())).collect(),
+            entries: self
+                .entries
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect(),
+            uuid_to_key: self
+                .uuid_to_key
+                .iter()
+                .map(|e| (*e.key(), *e.value()))
+                .collect(),
             next_key: self.next_key.load(Ordering::Relaxed),
             dimension: self.dimension,
         };

@@ -1,5 +1,7 @@
 //! Integration tests: REST API routing via axum's test utilities.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
@@ -8,9 +10,19 @@ fn app() -> axum::Router {
     strata_gateway::rest::router()
 }
 
+async fn app_with_engine() -> axum::Router {
+    let engine = Arc::new(
+        strata_core::StrataEngine::new(strata_core::CoreConfig::default())
+            .await
+            .unwrap(),
+    );
+    strata_gateway::rest::router_with_engine(engine)
+}
+
 #[tokio::test]
 async fn health_returns_ok() {
-    let response = app()
+    let response = app_with_engine()
+        .await
         .oneshot(
             Request::builder()
                 .uri("/health")
@@ -28,6 +40,24 @@ async fn health_returns_ok() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert!(json["version"].is_string());
+    assert_eq!(json["subsystems"]["episodic"]["status"], "ok");
+    assert_eq!(json["subsystems"]["state"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn ready_returns_ok() {
+    let response = app_with_engine()
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

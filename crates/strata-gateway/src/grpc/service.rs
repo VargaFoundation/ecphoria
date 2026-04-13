@@ -63,6 +63,7 @@ impl Strata for StrataGrpcService {
                     parent_id: None,
                     trace_id: None,
                     tags: vec![],
+                    idempotency_key: None,
                 })
             })
             .collect();
@@ -153,28 +154,46 @@ impl Strata for StrataGrpcService {
     }
 }
 
+/// Handle returned by `start_grpc` to control graceful shutdown.
+pub struct GrpcHandle {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl GrpcHandle {
+    /// Signal the gRPC server to begin graceful shutdown.
+    pub fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
+
 /// Start the gRPC server on the given address.
+///
+/// Returns a handle that can be used to trigger graceful shutdown.
 pub async fn start_grpc(
     addr: &str,
     engine: Arc<StrataEngine>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<GrpcHandle, Box<dyn std::error::Error>> {
     let parsed_addr = addr
         .parse()
         .map_err(|e| format!("invalid gRPC address: {e}"))?;
 
     let service = StrataGrpcService::new(engine);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tracing::info!(%addr, "gRPC server listening");
 
     tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(proto::strata_server::StrataServer::new(service))
-            .serve(parsed_addr)
+            .serve_with_shutdown(parsed_addr, async {
+                let _ = shutdown_rx.await;
+                tracing::info!("gRPC server draining");
+            })
             .await
         {
             tracing::error!(error = %e, "gRPC server error");
         }
     });
 
-    Ok(())
+    Ok(GrpcHandle { shutdown_tx })
 }

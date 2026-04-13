@@ -12,10 +12,13 @@ use tokio::sync::watch;
 
 /// Background data lifecycle manager.
 ///
-/// Periodically enforces retention policies and cleans up expired state.
+/// Periodically enforces retention policies, cleans up expired state,
+/// and runs automatic S3 backups when configured.
 pub struct TieringManager {
     interval: Duration,
     shutdown_rx: watch::Receiver<bool>,
+    /// Tracks when the last S3 backup was run.
+    last_backup: Option<std::time::Instant>,
 }
 
 /// Handle to stop the tiering background task.
@@ -41,6 +44,7 @@ impl TieringManager {
                 interval_secs
             }),
             shutdown_rx,
+            last_backup: None,
         };
         let handle = TieringHandle { shutdown_tx };
         (mgr, handle)
@@ -71,7 +75,7 @@ impl TieringManager {
     }
 
     /// Run a single maintenance pass.
-    async fn run_pass(&self, engine: &crate::StrataEngine) {
+    async fn run_pass(&mut self, engine: &crate::StrataEngine) {
         // 1. Enforce episodic retention
         match engine.enforce_retention().await {
             Ok(deleted) if deleted > 0 => {
@@ -83,10 +87,39 @@ impl TieringManager {
         }
 
         // 2. Clean up expired state entries (TTL)
-        // Access state store through the engine's public API
-        // The engine doesn't expose cleanup_expired directly, so we call it
-        // via the state store. For now, log that we'd do it.
-        // TODO: expose cleanup_expired on engine when state store access is public
+        match engine.cleanup_expired_state().await {
+            Ok(deleted) if deleted > 0 => {
+                tracing::info!(deleted, "retention: cleaned up expired state entries");
+                metrics::counter!("strata_state_expired_total").increment(deleted);
+            }
+            Err(e) => tracing::warn!(error = %e, "state TTL cleanup failed"),
+            _ => {}
+        }
+
+        // 3. Automatic S3 backup (if configured)
+        let backup_cfg = &engine.config().backup;
+        if backup_cfg.auto_enabled {
+            let backup_interval = Duration::from_secs(backup_cfg.interval_hours as u64 * 3600);
+            let should_backup = self
+                .last_backup
+                .is_none_or(|last| last.elapsed() >= backup_interval);
+
+            if should_backup {
+                tracing::info!("starting automatic S3 backup");
+                match engine.backup_to_s3().await {
+                    Ok(()) => {
+                        self.last_backup = Some(std::time::Instant::now());
+                        metrics::counter!("strata_backup_s3_total").increment(1);
+                        tracing::info!("automatic S3 backup completed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "automatic S3 backup failed");
+                        metrics::counter!("strata_backup_s3_errors_total").increment(1);
+                    }
+                }
+            }
+        }
+
         tracing::debug!("tiering pass complete");
     }
 }

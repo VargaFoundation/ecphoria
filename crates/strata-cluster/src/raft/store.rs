@@ -206,8 +206,8 @@ impl MemStore {
                 .map_err(|e| crate::Error::Raft(format!("mkdir: {e}")))?;
         }
 
-        let conn = Connection::open(path)
-            .map_err(|e| crate::Error::Raft(format!("open raft db: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| crate::Error::Raft(format!("open raft db: {e}")))?;
 
         StoreInner::init_schema(&conn);
 
@@ -253,6 +253,7 @@ impl MemStore {
                         parent_id: None,
                         trace_id: None,
                         tags: vec![],
+                        idempotency_key: None,
                     })
                     .collect();
                 match engine.ingest(strata_events).await {
@@ -310,16 +311,14 @@ impl Default for MemStore {
 // ── RaftLogReader ──────────────────────────────────────────────────
 
 impl RaftLogReader<TypeConfig> for MemStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
+    async fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
+    >(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let inner = self.inner.lock();
-        let entries: Vec<_> = inner
-            .log
-            .range(range)
-            .map(|(_, v)| v.clone())
-            .collect();
+        let entries: Vec<_> = inner.log.range(range).map(|(_, v)| v.clone()).collect();
         Ok(entries)
     }
 }
@@ -387,9 +386,7 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
         Ok(())
     }
 
-    async fn read_committed(
-        &mut self,
-    ) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         Ok(self.inner.lock().committed)
     }
 
@@ -408,10 +405,7 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
         self.clone()
     }
 
-    async fn append_to_log<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<(), StorageError<NodeId>>
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
     {
@@ -430,32 +424,21 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
         inner.delete_entries_from(log_id.index);
-        let to_remove: Vec<u64> = inner
-            .log
-            .range(log_id.index..)
-            .map(|(k, _)| *k)
-            .collect();
+        let to_remove: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in to_remove {
             inner.log.remove(&key);
         }
         Ok(())
     }
 
-    async fn purge_logs_upto(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
         inner.last_purged = Some(log_id);
         if let Ok(data) = serde_json::to_vec(&Some(log_id)) {
             inner.persist_meta("last_purged", &data);
         }
         inner.delete_entries_upto(log_id.index);
-        let to_remove: Vec<u64> = inner
-            .log
-            .range(..=log_id.index)
-            .map(|(k, _)| *k)
-            .collect();
+        let to_remove: Vec<u64> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for key in to_remove {
             inner.log.remove(&key);
         }
@@ -464,13 +447,8 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
 
     async fn last_applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, NodeInfo>,
-        ),
-        StorageError<NodeId>,
-    > {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, NodeInfo>), StorageError<NodeId>>
+    {
         let inner = self.inner.lock();
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
@@ -503,8 +481,7 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
                 }
                 openraft::EntryPayload::Membership(ref membership) => {
                     let mut inner = self.inner.lock();
-                    inner.last_membership =
-                        StoredMembership::new(Some(log_id), membership.clone());
+                    inner.last_membership = StoredMembership::new(Some(log_id), membership.clone());
                     if let Ok(data) = serde_json::to_vec(&inner.last_membership) {
                         inner.persist_meta("last_membership", &data);
                     }

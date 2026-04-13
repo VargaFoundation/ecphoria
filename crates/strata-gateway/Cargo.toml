@@ -29,6 +29,8 @@ prost.workspace = true
 pgwire.workspace = true
 
 jsonwebtoken.workspace = true
+duckdb.workspace = true
+parking_lot.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

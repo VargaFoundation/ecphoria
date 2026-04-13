@@ -1,0 +1,19 @@
+apiVersion: 1
+
+datasources:
+  - name: Strata
+    type: postgres
+    uid: strata-pg
+    url: strata:5432
+    database: strata
+    user: postgres
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
+    isDefault: true
+
+  - name: Prometheus
+    type: prometheus
+    uid: strata-prom
+    url: http://prometheus:9090
+    isDefault: false

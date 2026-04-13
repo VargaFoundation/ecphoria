@@ -98,6 +98,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Testing
 tempfile = { version = "3" }
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.dev.package."*"]
 opt-level = 2

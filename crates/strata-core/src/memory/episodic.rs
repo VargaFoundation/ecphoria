@@ -26,11 +26,19 @@ pub struct Event {
     /// Tags for structured filtering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Optional idempotency key for deduplication.
+    /// If set, duplicate inserts with the same key are silently skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl Event {
     /// Create a new event with only the required fields.
-    pub fn new(source: impl Into<String>, event_type: impl Into<String>, payload: serde_json::Value) -> Self {
+    pub fn new(
+        source: impl Into<String>,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             source: source.into(),
@@ -40,6 +48,7 @@ impl Event {
             parent_id: None,
             trace_id: None,
             tags: vec![],
+            idempotency_key: None,
         }
     }
 }
@@ -103,7 +112,10 @@ impl EpisodicStore {
             read_pool.push(Mutex::new(conn));
         }
 
-        tracing::info!(pool_size = read_pool.len(), "episodic read connection pool created");
+        tracing::info!(
+            pool_size = read_pool.len(),
+            "episodic read connection pool created"
+        );
 
         Ok(Self {
             write_db: Arc::new(Mutex::new(write_conn)),
@@ -126,14 +138,15 @@ impl EpisodicStore {
     fn init_schema(conn: &Connection) -> crate::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS episodic (
-                id         VARCHAR PRIMARY KEY,
-                source     VARCHAR NOT NULL,
-                event_type VARCHAR NOT NULL,
-                payload    JSON NOT NULL,
-                ts         TIMESTAMPTZ NOT NULL,
-                parent_id  VARCHAR,
-                trace_id   VARCHAR,
-                tags       VARCHAR
+                id              VARCHAR PRIMARY KEY,
+                source          VARCHAR NOT NULL,
+                event_type      VARCHAR NOT NULL,
+                payload         JSON NOT NULL,
+                ts              TIMESTAMPTZ NOT NULL,
+                parent_id       VARCHAR,
+                trace_id        VARCHAR,
+                tags            VARCHAR,
+                idempotency_key VARCHAR UNIQUE
             );",
         )
         .map_err(|e| crate::Error::Storage(format!("failed to create table: {e}")))?;
@@ -142,7 +155,15 @@ impl EpisodicStore {
         let _ = conn.execute_batch(
             "ALTER TABLE episodic ADD COLUMN IF NOT EXISTS parent_id VARCHAR;
              ALTER TABLE episodic ADD COLUMN IF NOT EXISTS trace_id VARCHAR;
-             ALTER TABLE episodic ADD COLUMN IF NOT EXISTS tags VARCHAR;",
+             ALTER TABLE episodic ADD COLUMN IF NOT EXISTS tags VARCHAR;
+             ALTER TABLE episodic ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR UNIQUE;",
+        );
+
+        // Indexes for frequent query patterns
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_episodic_source ON episodic(source);
+             CREATE INDEX IF NOT EXISTS idx_episodic_ts ON episodic(ts);
+             CREATE INDEX IF NOT EXISTS idx_episodic_trace ON episodic(trace_id);",
         );
 
         Ok(())
@@ -161,13 +182,15 @@ impl EpisodicStore {
             .map_err(|e| crate::Error::Ingest(format!("begin transaction: {e}")))?;
 
         let result = (|| {
+            // Use INSERT OR IGNORE so that duplicate idempotency_keys are silently skipped
             let mut stmt = db
                 .prepare(
-                    "INSERT INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags, idempotency_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
 
+            let mut inserted = 0u64;
             for event in events {
                 let payload_str = serde_json::to_string(&event.payload)
                     .map_err(|e| crate::Error::Ingest(e.to_string()))?;
@@ -178,20 +201,23 @@ impl EpisodicStore {
                 } else {
                     Some(event.tags.join(","))
                 };
-                stmt.execute(duckdb::params![
-                    event.id.to_string(),
-                    event.source,
-                    event.event_type,
-                    payload_str,
-                    ts_str,
-                    parent_str,
-                    event.trace_id,
-                    tags_str,
-                ])
-                .map_err(|e| crate::Error::Ingest(format!("insert error: {e}")))?;
+                let rows = stmt
+                    .execute(duckdb::params![
+                        event.id.to_string(),
+                        event.source,
+                        event.event_type,
+                        payload_str,
+                        ts_str,
+                        parent_str,
+                        event.trace_id,
+                        tags_str,
+                        event.idempotency_key,
+                    ])
+                    .map_err(|e| crate::Error::Ingest(format!("insert error: {e}")))?;
+                inserted += rows as u64;
             }
 
-            Ok(events.len() as u64)
+            Ok(inserted)
         })();
 
         match &result {
@@ -216,7 +242,7 @@ impl EpisodicStore {
 
     /// Parse an Event from a DuckDB row.
     /// Expected columns: id(0), source(1), event_type(2), payload::VARCHAR(3), ts::VARCHAR(4),
-    ///                    parent_id(5), trace_id(6), tags(7)
+    ///                    parent_id(5), trace_id(6), tags(7), idempotency_key(8)
     fn parse_event(row: &duckdb::Row<'_>) -> duckdb::Result<Event> {
         let id_str: String = row.get(0)?;
         let payload_str: String = row.get(3)?;
@@ -224,6 +250,7 @@ impl EpisodicStore {
         let parent_str: Option<String> = row.get(5).ok();
         let trace_id: Option<String> = row.get(6).ok();
         let tags_str: Option<String> = row.get(7).ok();
+        let idempotency_key: Option<String> = row.get(8).ok();
 
         Ok(Event {
             id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil()),
@@ -238,11 +265,12 @@ impl EpisodicStore {
             tags: tags_str
                 .map(|s| s.split(',').map(|t| t.to_string()).collect())
                 .unwrap_or_default(),
+            idempotency_key,
         })
     }
 
     const SELECT_COLS: &'static str =
-        "id, source, event_type, payload::VARCHAR, ts::VARCHAR, parent_id, trace_id, tags";
+        "id, source, event_type, payload::VARCHAR, ts::VARCHAR, parent_id, trace_id, tags, idempotency_key";
 
     /// Query events within a time range.
     pub async fn query_time_range(
@@ -258,7 +286,9 @@ impl EpisodicStore {
             "SELECT {} FROM episodic WHERE ts >= ?::TIMESTAMPTZ AND ts <= ?::TIMESTAMPTZ ORDER BY ts ASC",
             Self::SELECT_COLS
         );
-        let mut stmt = db.prepare(&sql).map_err(|e| crate::Error::Query(e.to_string()))?;
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
 
         let rows = stmt
             .query_map(duckdb::params![start_str, end_str], Self::parse_event)
@@ -274,7 +304,9 @@ impl EpisodicStore {
             "SELECT {} FROM episodic WHERE source = ? ORDER BY ts DESC LIMIT ?",
             Self::SELECT_COLS
         );
-        let mut stmt = db.prepare(&sql).map_err(|e| crate::Error::Query(e.to_string()))?;
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
 
         let rows = stmt
             .query_map(duckdb::params![source, limit as i64], Self::parse_event)
@@ -401,6 +433,7 @@ mod tests {
             parent_id: None,
             trace_id: None,
             tags: vec![],
+            idempotency_key: None,
         }
     }
 
@@ -507,6 +540,44 @@ mod tests {
         let store = EpisodicStore::new();
         let result = store.query_sql("SELECT 1::VARCHAR as v");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_dedup() {
+        let store = EpisodicStore::new();
+        let mut e1 = make_event("app", "click");
+        e1.idempotency_key = Some("dedup-key-1".into());
+        let mut e2 = make_event("app", "click");
+        e2.idempotency_key = Some("dedup-key-1".into()); // same key
+
+        store.append(&[e1]).await.unwrap();
+        let inserted = store.append(&[e2]).await.unwrap();
+        assert_eq!(inserted, 0); // duplicate skipped
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_different_keys() {
+        let store = EpisodicStore::new();
+        let mut e1 = make_event("app", "click");
+        e1.idempotency_key = Some("key-a".into());
+        let mut e2 = make_event("app", "click");
+        e2.idempotency_key = Some("key-b".into()); // different key
+
+        store.append(&[e1]).await.unwrap();
+        let inserted = store.append(&[e2]).await.unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(store.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_none_allows_duplicates() {
+        let store = EpisodicStore::new();
+        let e1 = make_event("app", "click"); // idempotency_key = None
+        let e2 = make_event("app", "click"); // idempotency_key = None
+
+        store.append(&[e1, e2]).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 2);
     }
 
     #[tokio::test]

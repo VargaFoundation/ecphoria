@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "strata-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for the Strata context lake"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,3 +21,5 @@ Documentation = "https://github.com/VargaFoundation/strata/tree/main/sdk/python"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+langchain = ["langchain-core>=0.1"]
+llama-index = ["llama-index-core>=0.10"]

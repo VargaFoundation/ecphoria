@@ -6,7 +6,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use strata_core::StrataEngine;
 
 use super::models::*;
@@ -30,14 +30,71 @@ fn api_ok(body: serde_json::Value) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-// ── Health (stateless) ──────────────────────────────────────────────
+// ── Health (liveness) ───────────────────────────────────────────────
 
-/// Health check endpoint.
-pub async fn health() -> Json<HealthResponse> {
+/// Health check endpoint — probes DuckDB, SQLite, and Raft (if cluster mode).
+///
+/// Returns `ok` if all subsystems are healthy, `degraded` if any are down.
+pub async fn health(
+    State(engine): State<Arc<StrataEngine>>,
+    cluster: Option<Extension<super::routes::ClusterHandle>>,
+) -> Json<HealthResponse> {
+    let episodic_ok = engine.check_episodic().await;
+    let state_ok = engine.check_state().await;
+
+    let raft_status = if let Some(Extension(handle)) = cluster {
+        let coord = handle.0.read().await;
+        let has_leader = coord.leader_id().is_some();
+        Some(SubsystemStatus {
+            status: if has_leader { "ok" } else { "no_leader" }.into(),
+        })
+    } else {
+        None
+    };
+
+    let all_ok = episodic_ok && state_ok && raft_status.as_ref().is_none_or(|r| r.status == "ok");
+
+    let status = if all_ok { "ok" } else { "degraded" };
+
     Json(HealthResponse {
-        status: "ok".into(),
+        status: status.into(),
         version: env!("CARGO_PKG_VERSION").into(),
+        subsystems: SubsystemHealth {
+            episodic: SubsystemStatus {
+                status: if episodic_ok { "ok" } else { "down" }.into(),
+            },
+            state: SubsystemStatus {
+                status: if state_ok { "ok" } else { "down" }.into(),
+            },
+            raft: raft_status,
+        },
     })
+}
+
+// ── Readiness probe ────────────────────────────────────────────────
+
+/// Readiness probe — returns 200 only if all subsystems are operational.
+///
+/// Kubernetes should use this for readiness checks.
+pub async fn ready(
+    State(engine): State<Arc<StrataEngine>>,
+    cluster: Option<Extension<super::routes::ClusterHandle>>,
+) -> StatusCode {
+    let episodic_ok = engine.check_episodic().await;
+    let state_ok = engine.check_state().await;
+
+    let raft_ok = if let Some(Extension(handle)) = cluster {
+        let coord = handle.0.read().await;
+        coord.leader_id().is_some()
+    } else {
+        true
+    };
+
+    if episodic_ok && state_ok && raft_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 // ── Stub handlers (no engine — for testing router shape) ────────────
@@ -97,25 +154,36 @@ pub async fn ingest(
     let events: Vec<strata_core::memory::episodic::Event> = req
         .events
         .into_iter()
-        .map(|payload| strata_core::memory::episodic::Event {
-            id: uuid::Uuid::new_v4(),
-            source: req.source.clone(),
-            event_type: payload
-                .get("event_type")
+        .map(|payload| {
+            let idempotency_key = payload
+                .get("idempotency_key")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            payload,
-            timestamp: chrono::Utc::now(),
-            parent_id: None,
-            trace_id: None,
-            tags: vec![],
+                .map(|s| s.to_string());
+            strata_core::memory::episodic::Event {
+                id: uuid::Uuid::new_v4(),
+                source: req.source.clone(),
+                event_type: payload
+                    .get("event_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                payload,
+                timestamp: chrono::Utc::now(),
+                parent_id: None,
+                trace_id: None,
+                tags: vec![],
+                idempotency_key,
+            }
         })
         .collect();
 
     let result = match engine.ingest(events).await {
         Ok(count) => api_ok(serde_json::json!({ "ingested": count })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INGEST_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INGEST_ERROR",
+            e.to_string(),
+        ),
     };
 
     metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "ingest")
@@ -180,6 +248,7 @@ pub async fn search(
             Ok(results) => {
                 let items: Vec<serde_json::Value> = results
                     .iter()
+                    .filter(|r| req.min_score.is_none_or(|ms| r.score >= ms))
                     .map(|r| {
                         serde_json::json!({
                             "id": r.entry.id.to_string(),
@@ -191,7 +260,11 @@ pub async fn search(
                     .collect();
                 api_ok(serde_json::json!({ "results": items }))
             }
-            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", e.to_string()),
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SEARCH_ERROR",
+                e.to_string(),
+            ),
         }
     } else {
         api_ok(serde_json::json!({ "results": [] }))
@@ -216,8 +289,16 @@ pub async fn state_get(
             "value": entry.value,
             "version": entry.version,
         })),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("state key '{key}' not found for agent '{agent_id}'")),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STATE_ERROR", e.to_string()),
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            format!("state key '{key}' not found for agent '{agent_id}'"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STATE_ERROR",
+            e.to_string(),
+        ),
     }
 }
 
@@ -231,16 +312,18 @@ pub async fn state_set(
 
     match engine.state_set(&agent_id, &key, body).await {
         Ok(version) => api_ok(serde_json::json!({ "version": version })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STATE_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STATE_ERROR",
+            e.to_string(),
+        ),
     }
 }
 
 // ── Admin endpoints ─────────────────────────────────────────────────
 
 /// Enforce data retention policy — delete events older than configured retention period.
-pub async fn enforce_retention(
-    State(engine): State<Arc<StrataEngine>>,
-) -> Response {
+pub async fn enforce_retention(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "retention").increment(1);
 
     match engine.enforce_retention().await {
@@ -248,14 +331,16 @@ pub async fn enforce_retention(
             "deleted": deleted,
             "retention_days": engine.config().memory.episodic.default_retention_days,
         })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "RETENTION_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RETENTION_ERROR",
+            e.to_string(),
+        ),
     }
 }
 
 /// Trigger a backup of all stores to the configured data directory.
-pub async fn backup(
-    State(engine): State<Arc<StrataEngine>>,
-) -> Response {
+pub async fn backup(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "backup").increment(1);
 
     let backup_dir = std::path::PathBuf::from(&engine.config().storage.data_dir).join("backups");
@@ -268,7 +353,41 @@ pub async fn backup(
             "path": target.to_string_lossy(),
             "timestamp": timestamp,
         })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "BACKUP_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BACKUP_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Query audit log entries.
+///
+/// GET /api/v1/admin/audit?since=2026-01-01
+pub async fn audit_query(
+    audit_log: Option<Extension<crate::auth::audit::AuditLog>>,
+    axum::extract::Query(params): axum::extract::Query<super::models::AuditQueryParams>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "audit").increment(1);
+
+    let Some(Extension(log)) = audit_log else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUDIT_DISABLED",
+            "Audit logging is not enabled (auth must be enabled)".into(),
+        );
+    };
+
+    match log.query_since(&params.since) {
+        Ok(entries) => {
+            let count = entries.len();
+            api_ok(serde_json::json!({ "entries": entries, "count": count, "since": params.since }))
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "AUDIT_ERROR",
+            e.to_string(),
+        ),
     }
 }
 
@@ -301,6 +420,7 @@ pub async fn embed_and_search(
     let source = req.filters.as_ref().and_then(|f| f.source.as_deref());
     let event_type = req.filters.as_ref().and_then(|f| f.event_type.as_deref());
 
+    let min_score = req.min_score;
     let result = match engine
         .embed_and_search(&req.text, req.k, source, event_type)
         .await
@@ -308,6 +428,7 @@ pub async fn embed_and_search(
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .iter()
+                .filter(|r| min_score.is_none_or(|ms| r.score >= ms))
                 .map(|r| {
                     serde_json::json!({
                         "id": r.entry.id.to_string(),
@@ -325,7 +446,8 @@ pub async fn embed_and_search(
                 api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "NO_EMBEDDING_PROVIDER",
-                    "No embedding provider configured. Set STRATA_EMBEDDING__PROVIDER=ollama".into(),
+                    "No embedding provider configured. Set STRATA_EMBEDDING__PROVIDER=ollama"
+                        .into(),
                 )
             } else {
                 api_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", msg)
@@ -341,22 +463,26 @@ pub async fn embed_and_search(
 // ── Schema Introspection ────────────────────────────────────────────
 
 /// List all distinct event sources.
-pub async fn schema_sources(
-    State(engine): State<Arc<StrataEngine>>,
-) -> Response {
+pub async fn schema_sources(State(engine): State<Arc<StrataEngine>>) -> Response {
     match engine.list_sources().await {
         Ok(sources) => api_ok(serde_json::json!({ "sources": sources })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "SCHEMA_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SCHEMA_ERROR",
+            e.to_string(),
+        ),
     }
 }
 
 /// List all distinct agent IDs.
-pub async fn schema_agents(
-    State(engine): State<Arc<StrataEngine>>,
-) -> Response {
+pub async fn schema_agents(State(engine): State<Arc<StrataEngine>>) -> Response {
     match engine.list_agents().await {
         Ok(agents) => api_ok(serde_json::json!({ "agents": agents })),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "SCHEMA_ERROR", e.to_string()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SCHEMA_ERROR",
+            e.to_string(),
+        ),
     }
 }
 

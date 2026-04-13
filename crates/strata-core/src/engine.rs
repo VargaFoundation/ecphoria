@@ -9,6 +9,7 @@ use crate::ingest::IngestPipeline;
 use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
+use crate::query::{QueryExecutor, QueryPlanner};
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
@@ -129,24 +130,28 @@ impl StrataEngine {
         self.episodic.query_by_source(source, limit).await
     }
 
-    /// Execute raw SQL against the episodic store.
+    /// Execute SQL against the engine, intercepting strata_search() and strata_state()
+    /// virtual functions via the query planner/executor pipeline.
     ///
-    /// Runs on a blocking thread to avoid starving the tokio runtime,
-    /// since the underlying DuckDB operations hold a parking_lot Mutex.
+    /// Pure SQL SELECT queries run on a blocking thread against DuckDB.
+    /// strata_search('text', k) embeds the text and searches semantic memory.
+    /// strata_state('agent_id', 'key') looks up a state key.
     /// Enforces the configured query timeout.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
-        let episodic = self.episodic.clone();
-        let sql = sql.to_string();
+        let plan = QueryPlanner::plan(sql)?;
         let max_rows = self.config.query.max_rows;
         let timeout = std::time::Duration::from_millis(self.config.query.timeout_ms);
 
-        tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || episodic.query_sql_limited(&sql, max_rows)),
-        )
-        .await
-        .map_err(|_| crate::Error::Query("query timed out".into()))?
-        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("task join error: {e}")))?
+        let executor = QueryExecutor::new(
+            self.episodic.clone(),
+            self.semantic.clone(),
+            self.state.clone(),
+            self.embedding.clone(),
+        );
+
+        tokio::time::timeout(timeout, executor.execute(plan, max_rows))
+            .await
+            .map_err(|_| crate::Error::Query("query timed out".into()))?
     }
 
     /// Count total events.
@@ -191,8 +196,7 @@ impl StrataEngine {
                     }
                 }
                 if let Some(ref et) = event_type_owned {
-                    if let Some(meta_et) =
-                        entry.metadata.get("event_type").and_then(|v| v.as_str())
+                    if let Some(meta_et) = entry.metadata.get("event_type").and_then(|v| v.as_str())
                     {
                         if meta_et != et {
                             return false;
@@ -243,7 +247,9 @@ impl StrataEngine {
     }
 
     /// Subscribe to state change notifications (for WebSocket watchers).
-    pub fn state_subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::memory::state::StateChange> {
+    pub fn state_subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::memory::state::StateChange> {
         self.state.subscribe()
     }
 
@@ -328,6 +334,13 @@ impl StrataEngine {
 
     // ── Retention ─────────────────────────────────────────────────────
 
+    /// Clean up expired state entries (TTL).
+    ///
+    /// Returns the number of entries deleted.
+    pub async fn cleanup_expired_state(&self) -> Result<u64> {
+        self.state.cleanup_expired().await
+    }
+
     /// Delete events older than the configured retention period.
     ///
     /// Returns the number of events deleted.
@@ -360,8 +373,7 @@ impl StrataEngine {
     ///
     /// Creates: episodic.duckdb (EXPORT), vectors/ (USearch index), state.db (SQLite copy).
     pub async fn backup(&self, dir: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
+        std::fs::create_dir_all(dir).map_err(|e| crate::Error::Storage(format!("mkdir: {e}")))?;
 
         // Backup episodic store via DuckDB EXPORT
         let export_dir = dir.join("episodic_export");
@@ -384,6 +396,102 @@ impl StrataEngine {
 
         tracing::info!(path = %dir.display(), "backup complete");
         Ok(())
+    }
+
+    /// Backup all stores to S3 using the configured StorageBackend.
+    ///
+    /// Creates a local backup first, then uploads each file to S3 under the
+    /// configured prefix with a timestamp directory.
+    pub async fn backup_to_s3(&self) -> Result<()> {
+        use crate::storage::StorageBackend;
+
+        let s3_config = &self.config.storage.s3;
+        if s3_config.bucket.is_empty() {
+            return Err(crate::Error::Config(
+                "S3 bucket not configured for backup".into(),
+            ));
+        }
+
+        let s3 = crate::storage::s3::S3Storage::from_config(s3_config).await?;
+
+        // Create a temporary local backup
+        let tmp = std::env::temp_dir().join(format!(
+            "strata-backup-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        ));
+        self.backup(&tmp).await?;
+
+        let prefix = &self.config.backup.s3_prefix;
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+        // Walk the temp directory and upload each file
+        let mut entries = Vec::new();
+        Self::walk_dir(&tmp, &mut entries)?;
+
+        for file_path in &entries {
+            let relative = file_path
+                .strip_prefix(&tmp)
+                .map_err(|e| crate::Error::Storage(format!("path strip: {e}")))?;
+            let s3_key = format!("{prefix}{timestamp}/{}", relative.to_string_lossy());
+            let data = tokio::fs::read(file_path)
+                .await
+                .map_err(|e| crate::Error::Storage(format!("read backup file: {e}")))?;
+            s3.put(&s3_key, bytes::Bytes::from(data)).await?;
+        }
+
+        // Clean up temp directory
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+
+        tracing::info!(
+            prefix = %prefix,
+            timestamp = %timestamp,
+            files = entries.len(),
+            "S3 backup complete"
+        );
+        Ok(())
+    }
+
+    /// Recursively walk a directory, collecting file paths.
+    fn walk_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in
+            std::fs::read_dir(dir).map_err(|e| crate::Error::Storage(format!("readdir: {e}")))?
+        {
+            let entry = entry.map_err(|e| crate::Error::Storage(format!("entry: {e}")))?;
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk_dir(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    // ── Health Checks ────────────────────────────────────────────────
+
+    /// Check if the DuckDB episodic store is accessible.
+    pub async fn check_episodic(&self) -> bool {
+        let episodic = self.episodic.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = episodic.write_conn();
+            db.execute_batch("SELECT 1").is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Check if the SQLite state store is accessible.
+    pub async fn check_state(&self) -> bool {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = state.db_conn();
+            db.execute_batch("SELECT 1").is_ok()
+        })
+        .await
+        .unwrap_or(false)
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────
@@ -433,6 +541,7 @@ mod tests {
             parent_id: None,
             trace_id: None,
             tags: vec![],
+            idempotency_key: None,
         }];
 
         let count = engine.ingest(events).await.unwrap();

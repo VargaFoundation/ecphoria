@@ -58,6 +58,7 @@ fn normalize_github(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
         parent_id: None,
         trace_id: None,
         tags: vec![],
+        idempotency_key: None,
     }])
 }
 
@@ -95,6 +96,7 @@ fn normalize_sentry(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
         parent_id: None,
         trace_id: None,
         tags: vec![],
+        idempotency_key: None,
     }])
 }
 
@@ -129,6 +131,7 @@ fn normalize_slack(payload: &serde_json::Value) -> crate::Result<Vec<Event>> {
         parent_id: None,
         trace_id: None,
         tags: vec![],
+        idempotency_key: None,
     }])
 }
 
@@ -159,6 +162,7 @@ fn normalize_pagerduty(payload: &serde_json::Value) -> crate::Result<Vec<Event>>
         parent_id: None,
         trace_id: None,
         tags: vec![],
+        idempotency_key: None,
     }])
 }
 
@@ -180,6 +184,7 @@ fn normalize_generic(source: &str, payload: &serde_json::Value) -> crate::Result
         parent_id: None,
         trace_id: None,
         tags: vec![],
+        idempotency_key: None,
     }])
 }
 

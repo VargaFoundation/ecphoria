@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use crate::embedding::EmbeddingProvider;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::SemanticStore;
+use crate::memory::state::StateStore;
 
 use super::QueryPlan;
 
@@ -11,11 +13,23 @@ use super::QueryPlan;
 pub struct QueryExecutor {
     episodic: Arc<EpisodicStore>,
     semantic: Arc<SemanticStore>,
+    state: Arc<StateStore>,
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl QueryExecutor {
-    pub fn new(episodic: Arc<EpisodicStore>, semantic: Arc<SemanticStore>) -> Self {
-        Self { episodic, semantic }
+    pub fn new(
+        episodic: Arc<EpisodicStore>,
+        semantic: Arc<SemanticStore>,
+        state: Arc<StateStore>,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
+        Self {
+            episodic,
+            semantic,
+            state,
+            embedding,
+        }
     }
 
     /// Execute a query plan and return results as JSON rows.
@@ -34,34 +48,60 @@ impl QueryExecutor {
             QueryPlan::VectorSearch { query_text, k } => {
                 self.execute_vector_search(&query_text, k).await
             }
+
+            QueryPlan::StateGet { agent_id, key } => self.execute_state_get(&agent_id, &key).await,
         }
     }
 
-    /// Execute a vector search by finding semantic matches and returning them as JSON rows.
+    /// Execute a vector search by embedding query text and searching semantic memory.
     async fn execute_vector_search(
         &self,
-        _query_text: &str,
+        query_text: &str,
         k: usize,
     ) -> crate::Result<Vec<serde_json::Value>> {
-        // For vector search via SQL, we need an embedding provider to convert text → vector.
-        // Since the executor doesn't own the embedding provider, we search by returning
-        // all semantic entries ranked by metadata (a simpler but functional approach).
-        // The proper path is via the REST /api/v1/search endpoint which has embedding access.
+        let provider = self.embedding.as_ref().ok_or_else(|| {
+            crate::Error::Embedding(
+                "no embedding provider configured — strata_search() requires an embedding provider"
+                    .into(),
+            )
+        })?;
 
-        // Return semantic entries as JSON rows (limited to k)
-        // This provides a fallback for SQL-based semantic queries.
-        let results = self.semantic.search_all(k).await?;
+        let vectors = provider.embed(&[query_text.to_string()]).await?;
+        let vector = vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::Embedding("embedding returned empty result".into()))?;
+
+        let results = self.semantic.search(&vector, k).await?;
 
         Ok(results
             .into_iter()
-            .map(|entry| {
+            .map(|r| {
                 serde_json::json!({
-                    "id": entry.id.to_string(),
-                    "content": entry.content,
-                    "metadata": entry.metadata,
+                    "id": r.entry.id.to_string(),
+                    "content": r.entry.content,
+                    "metadata": r.entry.metadata,
+                    "score": r.score,
                 })
             })
             .collect())
+    }
+
+    /// Execute a state key lookup and return the result as a JSON row.
+    async fn execute_state_get(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> crate::Result<Vec<serde_json::Value>> {
+        match self.state.get(agent_id, key).await? {
+            Some(entry) => Ok(vec![serde_json::json!({
+                "agent_id": entry.agent_id,
+                "key": entry.key,
+                "value": entry.value,
+                "version": entry.version,
+            })]),
+            None => Ok(vec![]),
+        }
     }
 }
 
@@ -69,11 +109,18 @@ impl QueryExecutor {
 mod tests {
     use super::*;
 
+    fn make_executor() -> QueryExecutor {
+        QueryExecutor::new(
+            Arc::new(EpisodicStore::new()),
+            Arc::new(SemanticStore::new()),
+            Arc::new(StateStore::new()),
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn execute_sql_query() {
-        let episodic = Arc::new(EpisodicStore::new());
-        let semantic = Arc::new(SemanticStore::new());
-        let executor = QueryExecutor::new(episodic, semantic);
+        let executor = make_executor();
 
         let results = executor
             .execute(QueryPlan::Sql("SELECT 1::VARCHAR as v".into()), 100)
@@ -84,26 +131,19 @@ mod tests {
 
     #[tokio::test]
     async fn execute_dml_rejected() {
-        let episodic = Arc::new(EpisodicStore::new());
-        let semantic = Arc::new(SemanticStore::new());
-        let executor = QueryExecutor::new(episodic, semantic);
+        let executor = make_executor();
 
         let result = executor
-            .execute(
-                QueryPlan::Dml("INSERT INTO foo VALUES (1)".into()),
-                100,
-            )
+            .execute(QueryPlan::Dml("INSERT INTO foo VALUES (1)".into()), 100)
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn execute_vector_search_empty() {
-        let episodic = Arc::new(EpisodicStore::new());
-        let semantic = Arc::new(SemanticStore::new());
-        let executor = QueryExecutor::new(episodic, semantic);
+    async fn execute_vector_search_no_provider() {
+        let executor = make_executor();
 
-        let results = executor
+        let result = executor
             .execute(
                 QueryPlan::VectorSearch {
                     query_text: "test".into(),
@@ -111,8 +151,60 @@ mod tests {
                 },
                 100,
             )
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no embedding provider"));
+    }
+
+    #[tokio::test]
+    async fn execute_state_get_missing() {
+        let executor = make_executor();
+
+        let results = executor
+            .execute(
+                QueryPlan::StateGet {
+                    agent_id: "bot".into(),
+                    key: "mood".into(),
+                },
+                100,
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_state_get_found() {
+        let state = Arc::new(StateStore::new());
+        state
+            .set("bot", "mood", serde_json::json!("happy"))
+            .await
+            .unwrap();
+
+        let executor = QueryExecutor::new(
+            Arc::new(EpisodicStore::new()),
+            Arc::new(SemanticStore::new()),
+            state,
+            None,
+        );
+
+        let results = executor
+            .execute(
+                QueryPlan::StateGet {
+                    agent_id: "bot".into(),
+                    key: "mood".into(),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["agent_id"], "bot");
+        assert_eq!(results[0]["key"], "mood");
+        assert_eq!(results[0]["value"], "happy");
+        assert_eq!(results[0]["version"], 1);
     }
 }

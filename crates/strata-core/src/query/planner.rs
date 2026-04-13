@@ -12,6 +12,8 @@ pub enum QueryPlan {
     Dml(String),
     /// Vector similarity search (detected via strata_search function call).
     VectorSearch { query_text: String, k: usize },
+    /// State key lookup (detected via strata_state function call).
+    StateGet { agent_id: String, key: String },
 }
 
 /// Plans queries by analyzing SQL and routing appropriately.
@@ -41,6 +43,25 @@ impl QueryPlanner {
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .unwrap_or(5);
                 return Ok(QueryPlan::VectorSearch { query_text, k });
+            }
+        }
+
+        if upper.contains("STRATA_STATE(") || upper.contains("STRATA_STATE (") {
+            // Pattern: strata_state('agent_id', 'key')
+            if let Some(args) = extract_function_args(trimmed, "strata_state") {
+                let parts: Vec<&str> = args.splitn(2, ',').collect();
+                let agent_id = parts
+                    .first()
+                    .unwrap_or(&"")
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+                let key = parts
+                    .get(1)
+                    .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .unwrap_or_default();
+                return Ok(QueryPlan::StateGet { agent_id, key });
             }
         }
 
@@ -128,6 +149,18 @@ mod tests {
                 assert_eq!(k, 5); // default
             }
             other => panic!("expected VectorSearch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plan_strata_state() {
+        let plan = QueryPlanner::plan("SELECT * FROM strata_state('bot-1', 'mood')").unwrap();
+        match plan {
+            QueryPlan::StateGet { agent_id, key } => {
+                assert_eq!(agent_id, "bot-1");
+                assert_eq!(key, "mood");
+            }
+            other => panic!("expected StateGet, got {:?}", other),
         }
     }
 

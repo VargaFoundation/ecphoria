@@ -3,13 +3,64 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, AsyncIterator, Optional
+import random
+from typing import (
+    Any,
+    AsyncIterator,
+    Iterable,
+    Optional,
+    Sequence,
+    TypedDict,
+    Union,
+)
 
 import httpx
 
 
+class SearchFilters(TypedDict, total=False):
+    source: str
+    event_type: str
+
+
+class SearchResult(TypedDict, total=False):
+    id: str
+    score: float
+    content: str
+    metadata: dict[str, Any]
+
+
+class StateEntry(TypedDict, total=False):
+    agent_id: str
+    key: str
+    value: Any
+    version: int
+    updated_at: str
+
+
+class HealthResponse(TypedDict, total=False):
+    status: str
+    version: str
+
+
+class ClusterStatusResponse(TypedDict, total=False):
+    node_id: int
+    state: str
+    leader: Optional[int]
+    term: int
+
+
+# Status codes that trigger automatic retry with backoff.
+_RETRYABLE_STATUSES = {429, 503}
+_DEFAULT_MAX_RETRIES = 3
+_DEFAULT_BACKOFF_BASE = 0.5
+_DEFAULT_BACKOFF_MAX = 30.0
+
+
 class StrataClient:
     """Async client for the Strata context lake REST API.
+
+    Features retry logic with exponential backoff on 429 (rate-limited) and
+    503 (service unavailable) responses.
 
     Usage::
 
@@ -19,11 +70,17 @@ class StrataClient:
                 {"event_type": "user.signup", "user_id": "u1"},
             ])
 
+            # Batch ingest (streaming, chunked)
+            count = await client.batch_ingest("my-app", large_event_list, batch_size=500)
+
             # Query with SQL
             rows = await client.query("SELECT * FROM episodic LIMIT 10")
 
             # Semantic search
-            results = await client.search(vector=[0.1, 0.2, ...], k=5)
+            results = await client.find("frustrated customer", k=5)
+
+            # Embed text and search
+            results = await client.embed("billing issue", k=5)
 
             # Agent state
             await client.state_set("bot-1", "mood", "happy")
@@ -35,18 +92,24 @@ class StrataClient:
         url: str = "http://localhost:8432",
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
+        backoff_base: float = _DEFAULT_BACKOFF_BASE,
+        backoff_max: float = _DEFAULT_BACKOFF_MAX,
     ) -> None:
-        self.url = url.rstrip("/")
-        headers = {}
+        self.url: str = url.rstrip("/")
+        self.max_retries: int = max_retries
+        self.backoff_base: float = backoff_base
+        self.backoff_max: float = backoff_max
+        headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        self._client = httpx.AsyncClient(
+        self._client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=self.url,
             headers=headers,
             timeout=timeout,
         )
 
-    async def __aenter__(self) -> "StrataClient":
+    async def __aenter__(self) -> StrataClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -56,11 +119,52 @@ class StrataClient:
         """Close the HTTP client."""
         await self._client.aclose()
 
+    # ── Retry helper ────────────────────────────────────────────────
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+    ) -> httpx.Response:
+        """Execute an HTTP request with retry + exponential backoff on 429/503."""
+        last_resp: Optional[httpx.Response] = None
+
+        for attempt in range(self.max_retries + 1):
+            resp = await self._client.request(method, path, json=json)
+
+            if resp.status_code not in _RETRYABLE_STATUSES:
+                return resp
+
+            last_resp = resp
+
+            if attempt < self.max_retries:
+                # Check for Retry-After header
+                retry_after = resp.headers.get("retry-after")
+                if retry_after is not None:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = self.backoff_base * (2**attempt)
+                else:
+                    delay = self.backoff_base * (2**attempt)
+
+                # Add jitter (±25%)
+                delay = min(delay, self.backoff_max)
+                jitter = delay * 0.25 * (2 * random.random() - 1)
+                await asyncio.sleep(delay + jitter)
+
+        # All retries exhausted — raise on the last response
+        assert last_resp is not None
+        last_resp.raise_for_status()
+        return last_resp  # unreachable, but keeps type checker happy
+
     # ── Health ───────────────────────────────────────────────────────
 
-    async def health(self) -> dict[str, Any]:
+    async def health(self) -> HealthResponse:
         """Check server health."""
-        resp = await self._client.get("/health")
+        resp = await self._request("GET", "/health")
         resp.raise_for_status()
         return resp.json()
 
@@ -71,9 +175,9 @@ class StrataClient:
 
         Returns a list of row dicts.
         """
-        resp = await self._client.post("/api/v1/query", json={"sql": sql})
+        resp = await self._request("POST", "/api/v1/query", json={"sql": sql})
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             raise StrataError(data["error"])
         return data.get("rows", [])
@@ -89,15 +193,46 @@ class StrataClient:
 
         Returns the number of events ingested.
         """
-        resp = await self._client.post(
+        resp = await self._request(
+            "POST",
             "/api/v1/ingest",
             json={"source": source, "events": events},
         )
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             raise StrataError(data["error"])
         return data.get("ingested", 0)
+
+    async def batch_ingest(
+        self,
+        source: str,
+        events: Union[Sequence[dict[str, Any]], Iterable[dict[str, Any]]],
+        *,
+        batch_size: int = 500,
+    ) -> int:
+        """Ingest events in batches for large datasets.
+
+        Splits ``events`` into chunks of ``batch_size`` and sends each chunk
+        as a separate ingest request. Returns the total count of ingested events.
+
+        Usage::
+
+            total = await client.batch_ingest("logs", huge_list, batch_size=1000)
+        """
+        total = 0
+        batch: list[dict[str, Any]] = []
+
+        for event in events:
+            batch.append(event)
+            if len(batch) >= batch_size:
+                total += await self.ingest(source, batch)
+                batch = []
+
+        if batch:
+            total += await self.ingest(source, batch)
+
+        return total
 
     # ── Search ───────────────────────────────────────────────────────
 
@@ -107,13 +242,13 @@ class StrataClient:
         k: int = 5,
         source: Optional[str] = None,
         event_type: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[SearchResult]:
         """Semantic search by pre-computed vector.
 
-        For text-based search, use `find()` instead.
+        For text-based search, use ``find()`` instead.
         """
         body: dict[str, Any] = {"vector": vector, "k": k}
-        filters = {}
+        filters: dict[str, str] = {}
         if source:
             filters["source"] = source
         if event_type:
@@ -121,9 +256,9 @@ class StrataClient:
         if filters:
             body["filters"] = filters
 
-        resp = await self._client.post("/api/v1/search", json=body)
+        resp = await self._request("POST", "/api/v1/search", json=body)
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             raise StrataError(data["error"])
         return data.get("results", [])
@@ -134,7 +269,7 @@ class StrataClient:
         k: int = 5,
         source: Optional[str] = None,
         event_type: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[SearchResult]:
         """Semantic search by natural language text (embed + search in one call).
 
         This is the recommended search method. Strata embeds the text
@@ -145,7 +280,7 @@ class StrataClient:
             results = await client.find("frustrated customer billing issue", k=5)
         """
         body: dict[str, Any] = {"text": text, "k": k}
-        filters = {}
+        filters: dict[str, str] = {}
         if source:
             filters["source"] = source
         if event_type:
@@ -153,12 +288,30 @@ class StrataClient:
         if filters:
             body["filters"] = filters
 
-        resp = await self._client.post("/api/v1/embed-and-search", json=body)
+        resp = await self._request("POST", "/api/v1/embed-and-search", json=body)
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             raise StrataError(data["error"])
         return data.get("results", [])
+
+    async def embed(
+        self,
+        text: str,
+        k: int = 5,
+        source: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> list[SearchResult]:
+        """Embed text and search — convenience alias for ``find()``.
+
+        Calls ``/api/v1/embed-and-search`` with just a text string.
+        Strata handles embedding via the configured provider (Ollama/OpenAI).
+
+        Usage::
+
+            results = await client.embed("what went wrong in production?", k=10)
+        """
+        return await self.find(text, k=k, source=source, event_type=event_type)
 
     # ── Query Builder ────────────────────────────────────────────────
 
@@ -179,7 +332,7 @@ class StrataClient:
             # Get all 'user.signup' events
             signups = await client.events(event_type="user.signup")
         """
-        conditions = []
+        conditions: list[str] = []
         if source:
             conditions.append(f"source = '{source}'")
         if event_type:
@@ -191,71 +344,72 @@ class StrataClient:
 
     async def sources(self) -> list[str]:
         """List all event sources."""
-        resp = await self._client.get("/api/v1/schema/sources")
+        resp = await self._request("GET", "/api/v1/schema/sources")
         resp.raise_for_status()
-        return resp.json().get("sources", [])
+        data: dict[str, Any] = resp.json()
+        return data.get("sources", [])
 
     async def agents(self) -> list[str]:
         """List all agent IDs."""
-        resp = await self._client.get("/api/v1/schema/agents")
+        resp = await self._request("GET", "/api/v1/schema/agents")
         resp.raise_for_status()
-        return resp.json().get("agents", [])
+        data: dict[str, Any] = resp.json()
+        return data.get("agents", [])
 
     # ── State ────────────────────────────────────────────────────────
 
     async def state_get(
         self, agent_id: str, key: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> Optional[StateEntry]:
         """Get agent state. Returns None if not found."""
-        resp = await self._client.get(f"/api/v1/state/{agent_id}/{key}")
+        resp = await self._request("GET", f"/api/v1/state/{agent_id}/{key}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             return None
-        return data
+        return data  # type: ignore[return-value]
 
     async def state_set(
         self, agent_id: str, key: str, value: Any
     ) -> int:
         """Set agent state. Returns the new version number."""
-        resp = await self._client.put(
+        resp = await self._request(
+            "PUT",
             f"/api/v1/state/{agent_id}/{key}",
             json=value,
         )
         resp.raise_for_status()
-        data = resp.json()
+        data: dict[str, Any] = resp.json()
         if "error" in data:
             raise StrataError(data["error"])
         return data.get("version", 0)
 
     async def state_delete(self, agent_id: str, key: str) -> None:
         """Delete agent state."""
-        resp = await self._client.request(
-            "DELETE", f"/api/v1/state/{agent_id}/{key}"
-        )
+        resp = await self._request("DELETE", f"/api/v1/state/{agent_id}/{key}")
         resp.raise_for_status()
 
     # ── Admin ────────────────────────────────────────────────────────
 
     async def backup(self) -> dict[str, Any]:
         """Trigger a backup of all stores."""
-        resp = await self._client.post("/api/v1/admin/backup")
+        resp = await self._request("POST", "/api/v1/admin/backup")
         resp.raise_for_status()
         return resp.json()
 
     async def enforce_retention(self) -> dict[str, Any]:
         """Enforce data retention policy."""
-        resp = await self._client.post("/api/v1/admin/retention")
+        resp = await self._request("POST", "/api/v1/admin/retention")
         resp.raise_for_status()
         return resp.json()
 
     # ── Cluster ──────────────────────────────────────────────────────
 
-    async def cluster_status(self) -> dict[str, Any]:
+    async def cluster_status(self) -> ClusterStatusResponse:
         """Get Raft cluster status."""
-        resp = await self._client.get("/cluster/status")
+        resp = await self._request("GET", "/cluster/status")
         resp.raise_for_status()
         return resp.json()
 
@@ -288,6 +442,10 @@ class StrataClient:
 
 class StrataError(Exception):
     """Error returned by the Strata API."""
+
+    code: str
+    message: str
+    request_id: Optional[str]
 
     def __init__(self, error: Any) -> None:
         if isinstance(error, dict):

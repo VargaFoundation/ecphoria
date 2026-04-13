@@ -19,9 +19,7 @@ pub struct RaftState {
 /// POST /raft/append — AppendEntries RPC
 pub async fn append_entries(
     State(state): State<RaftState>,
-    Json(rpc): Json<
-        openraft::raft::AppendEntriesRequest<strata_cluster::raft::types::TypeConfig>,
-    >,
+    Json(rpc): Json<openraft::raft::AppendEntriesRequest<strata_cluster::raft::types::TypeConfig>>,
 ) -> Result<
     Json<openraft::raft::AppendEntriesResponse<strata_cluster::raft::types::NodeId>>,
     StatusCode,
@@ -38,10 +36,7 @@ pub async fn append_entries(
 pub async fn vote(
     State(state): State<RaftState>,
     Json(rpc): Json<openraft::raft::VoteRequest<strata_cluster::raft::types::NodeId>>,
-) -> Result<
-    Json<openraft::raft::VoteResponse<strata_cluster::raft::types::NodeId>>,
-    StatusCode,
-> {
+) -> Result<Json<openraft::raft::VoteResponse<strata_cluster::raft::types::NodeId>>, StatusCode> {
     state
         .raft
         .vote(rpc)
@@ -68,10 +63,64 @@ pub async fn install_snapshot(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// GET /cluster/status — Cluster health and Raft metrics
-pub async fn cluster_status(
+/// Request body for POST /cluster/add-learner.
+#[derive(serde::Deserialize)]
+pub struct AddLearnerRequest {
+    pub node_id: strata_cluster::raft::types::NodeId,
+    pub addr: String,
+}
+
+/// POST /cluster/add-learner — Add a learner node to the Raft cluster.
+pub async fn add_learner(
     State(state): State<RaftState>,
-) -> Json<serde_json::Value> {
+    Json(req): Json<AddLearnerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let node_info = strata_cluster::raft::types::NodeInfo { addr: req.addr };
+    state
+        .raft
+        .add_learner(req.node_id, node_info, true)
+        .await
+        .map(|resp| {
+            Json(serde_json::json!({
+                "log_id": resp.log_id().index,
+                "membership": format!("{:?}", resp.membership()),
+            }))
+        })
+        .map_err(|e| {
+            tracing::warn!(error = %e, "add_learner failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Request body for POST /cluster/change-membership.
+#[derive(serde::Deserialize)]
+pub struct ChangeMembershipRequest {
+    pub members: std::collections::BTreeSet<strata_cluster::raft::types::NodeId>,
+}
+
+/// POST /cluster/change-membership — Promote learners to voters or update membership.
+pub async fn change_membership(
+    State(state): State<RaftState>,
+    Json(req): Json<ChangeMembershipRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    state
+        .raft
+        .change_membership(req.members, false)
+        .await
+        .map(|resp| {
+            Json(serde_json::json!({
+                "log_id": resp.log_id().index,
+                "membership": format!("{:?}", resp.membership()),
+            }))
+        })
+        .map_err(|e| {
+            tracing::warn!(error = %e, "change_membership failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// GET /cluster/status — Cluster health and Raft metrics
+pub async fn cluster_status(State(state): State<RaftState>) -> Json<serde_json::Value> {
     let metrics = state.raft.metrics().borrow().clone();
     Json(serde_json::json!({
         "node_id": metrics.id,
@@ -93,6 +142,11 @@ pub fn raft_router(raft: Arc<StrataRaft>) -> axum::Router {
         .route("/raft/vote", axum::routing::post(vote))
         .route("/raft/snapshot", axum::routing::post(install_snapshot))
         .route("/cluster/status", axum::routing::get(cluster_status))
+        .route("/cluster/add-learner", axum::routing::post(add_learner))
+        .route(
+            "/cluster/change-membership",
+            axum::routing::post(change_membership),
+        )
         .with_state(state)
 }
 

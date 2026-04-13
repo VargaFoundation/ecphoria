@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub subsystems: SubsystemHealth,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubsystemHealth {
+    pub episodic: SubsystemStatus,
+    pub state: SubsystemStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raft: Option<SubsystemStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubsystemStatus {
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadyResponse {
+    pub ready: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +54,9 @@ pub struct SearchRequest {
     /// Optional metadata filters for search refinement.
     #[serde(default)]
     pub filters: Option<SearchFilters>,
+    /// Minimum similarity score threshold (0.0–1.0). Results below this are excluded.
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +79,24 @@ pub struct EmbedAndSearchRequest {
     /// Optional metadata filters.
     #[serde(default)]
     pub filters: Option<SearchFilters>,
+    /// Minimum similarity score threshold (0.0–1.0). Results below this are excluded.
+    #[serde(default)]
+    pub min_score: Option<f32>,
+}
+
+/// Query parameters for the audit log endpoint.
+#[derive(Debug, Deserialize)]
+pub struct AuditQueryParams {
+    /// ISO-8601 date/datetime to filter from (e.g. "2026-01-01").
+    #[serde(default = "default_audit_since")]
+    pub since: String,
+}
+
+fn default_audit_since() -> String {
+    // Default: last 24 hours
+    (chrono::Utc::now() - chrono::Duration::hours(24))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -68,10 +108,45 @@ mod tests {
         let resp = HealthResponse {
             status: "ok".into(),
             version: "0.1.0".into(),
+            subsystems: SubsystemHealth {
+                episodic: SubsystemStatus {
+                    status: "ok".into(),
+                },
+                state: SubsystemStatus {
+                    status: "ok".into(),
+                },
+                raft: None,
+            },
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["version"], "0.1.0");
+        assert_eq!(json["subsystems"]["episodic"]["status"], "ok");
+        assert_eq!(json["subsystems"]["state"]["status"], "ok");
+        assert!(json["subsystems"]["raft"].is_null());
+    }
+
+    #[test]
+    fn health_response_with_raft() {
+        let resp = HealthResponse {
+            status: "degraded".into(),
+            version: "0.1.0".into(),
+            subsystems: SubsystemHealth {
+                episodic: SubsystemStatus {
+                    status: "ok".into(),
+                },
+                state: SubsystemStatus {
+                    status: "down".into(),
+                },
+                raft: Some(SubsystemStatus {
+                    status: "ok".into(),
+                }),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["subsystems"]["state"]["status"], "down");
+        assert_eq!(json["subsystems"]["raft"]["status"], "ok");
     }
 
     #[test]

@@ -290,50 +290,93 @@ impl PgWireServerHandlers for PgWireFactory {
     }
 }
 
+/// Handle returned by `start_pg_wire` to control graceful shutdown.
+pub struct PgWireHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl PgWireHandle {
+    /// Signal the PG wire server to stop accepting connections,
+    /// then wait up to `drain_timeout` for in-flight connections to finish.
+    pub async fn shutdown(self, drain_timeout: std::time::Duration) {
+        let _ = self.shutdown_tx.send(true);
+        // Give in-flight connections time to complete
+        tokio::time::sleep(drain_timeout).await;
+    }
+}
+
 /// Start the PG wire server on the given address.
 ///
 /// `max_connections` limits concurrent PG wire connections via a semaphore.
+/// Returns a handle that can be used to trigger graceful shutdown.
 pub async fn start_pg_wire(
     addr: &str,
     engine: Arc<StrataEngine>,
     max_connections: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<PgWireHandle, Box<dyn std::error::Error>> {
     let factory = Arc::new(PgWireFactory::new(engine));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     tracing::info!(addr, max_connections, "PG wire server listening");
 
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_conns = active_connections.clone();
+
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((socket, peer_addr)) => {
-                    let permit = match semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            tracing::warn!(
-                                %peer_addr,
-                                "PG wire connection rejected: max connections reached"
-                            );
-                            drop(socket);
-                            continue;
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((socket, peer_addr)) => {
+                            let permit = match semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        %peer_addr,
+                                        "PG wire connection rejected: max connections reached"
+                                    );
+                                    drop(socket);
+                                    continue;
+                                }
+                            };
+                            let factory_ref = factory.clone();
+                            let conns = active_conns.clone();
+                            conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tokio::spawn(async move {
+                                let _ = pgwire::tokio::process_socket(socket, None, factory_ref).await;
+                                conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                drop(permit);
+                            });
                         }
-                    };
-                    let factory_ref = factory.clone();
-                    tokio::spawn(async move {
-                        let _ = pgwire::tokio::process_socket(socket, None, factory_ref).await;
-                        drop(permit);
-                    });
+                        Err(e) => {
+                            tracing::error!("PG wire accept error: {e}");
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("PG wire accept error: {e}");
-                    break;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        let remaining = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            remaining_connections = remaining,
+                            "PG wire server draining — no longer accepting connections"
+                        );
+                        if remaining > 0 {
+                            tracing::warn!(
+                                dropped = remaining,
+                                "PG wire server shutting down with active connections"
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
     });
 
-    Ok(())
+    Ok(PgWireHandle { shutdown_tx })
 }
 
 /// Infer a PostgreSQL type from a JSON value.

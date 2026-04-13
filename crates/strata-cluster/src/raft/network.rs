@@ -45,8 +45,7 @@ impl NetworkClient {
             .await
             .map_err(|e| openraft::error::NetworkError::new(&e))?;
 
-        serde_json::from_slice(&bytes)
-            .map_err(|e| openraft::error::NetworkError::new(&e))
+        serde_json::from_slice(&bytes).map_err(|e| openraft::error::NetworkError::new(&e))
     }
 }
 

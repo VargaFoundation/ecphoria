@@ -7,6 +7,7 @@ pub struct CoreConfig {
     pub memory: MemoryConfig,
     pub embedding: EmbeddingConfig,
     pub query: QueryConfig,
+    pub backup: BackupConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +132,27 @@ impl Default for QueryConfig {
         Self {
             max_rows: 10_000,
             timeout_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Enable automatic S3 backups in the background tiering task.
+    pub auto_enabled: bool,
+    /// Interval between automatic backups (in hours).
+    pub interval_hours: u32,
+    /// S3 key prefix for backup objects (e.g. "backups/").
+    pub s3_prefix: String,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            auto_enabled: false,
+            interval_hours: 24,
+            s3_prefix: "backups/".into(),
         }
     }
 }

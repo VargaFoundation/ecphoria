@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "strata": {
+      "url": "http://localhost:8432/mcp"
+    }
+  }
+}
