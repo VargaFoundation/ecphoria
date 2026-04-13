@@ -99,6 +99,18 @@ impl SemanticStore {
         self.entries.is_empty()
     }
 
+    /// Return up to `limit` entries (for SQL-based listing, no vector query needed).
+    pub async fn search_all(&self, limit: usize) -> crate::Result<Vec<EntryMetadata>> {
+        let mut results = Vec::with_capacity(limit.min(self.entries.len()));
+        for entry in self.entries.iter() {
+            if results.len() >= limit {
+                break;
+            }
+            results.push(entry.value().clone());
+        }
+        Ok(results)
+    }
+
     /// The vector dimension.
     pub fn dimension(&self) -> usize {
         self.dimension

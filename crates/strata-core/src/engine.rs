@@ -12,13 +12,22 @@ use crate::memory::state::StateStore;
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
-#[derive(Debug)]
 pub struct StrataEngine {
     config: CoreConfig,
     episodic: Arc<EpisodicStore>,
     semantic: Arc<SemanticStore>,
     state: Arc<StateStore>,
     ingest: IngestPipeline,
+    /// Shared embedding provider for embed-and-search operations.
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
+}
+
+impl std::fmt::Debug for StrataEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrataEngine")
+            .field("has_embedding", &self.embedding.is_some())
+            .finish()
+    }
 }
 
 impl StrataEngine {
@@ -79,7 +88,8 @@ impl StrataEngine {
             }
         };
 
-        // Initialize ingest pipeline
+        // Initialize ingest pipeline (keep a reference to embedding for embed-and-search)
+        let embedding_ref = embedding.clone();
         let ingest = match embedding {
             Some(emb) => IngestPipeline::with_embedding(
                 episodic.clone(),
@@ -95,6 +105,7 @@ impl StrataEngine {
         Ok(Self {
             config,
             episodic,
+            embedding: embedding_ref,
             semantic,
             state,
             ingest,
@@ -231,9 +242,88 @@ impl StrataEngine {
         self.state.delete(agent_id, key).await
     }
 
+    /// Subscribe to state change notifications (for WebSocket watchers).
+    pub fn state_subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::memory::state::StateChange> {
+        self.state.subscribe()
+    }
+
     /// List state keys for an agent.
     pub async fn state_list_keys(&self, agent_id: &str) -> Result<Vec<String>> {
         self.state.list_keys(agent_id).await
+    }
+
+    // ── Embed & Search ────────────────────────────────────────────────
+
+    /// Embed a text string using the configured embedding provider.
+    pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let provider = self
+            .embedding
+            .as_ref()
+            .ok_or_else(|| crate::Error::Embedding("no embedding provider configured".into()))?;
+        let results = provider.embed(&[text.to_string()]).await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::Embedding("embedding returned empty result".into()))
+    }
+
+    /// Embed text and search semantic memory in a single call.
+    ///
+    /// This is the primary DX-friendly search method: text in, results out.
+    pub async fn embed_and_search(
+        &self,
+        text: &str,
+        k: usize,
+        source: Option<&str>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let vector = self.embed_text(text).await?;
+        if source.is_some() || event_type.is_some() {
+            self.semantic_search_filtered(&vector, k, source, event_type)
+                .await
+        } else {
+            self.semantic_search(&vector, k).await
+        }
+    }
+
+    // ── Schema Introspection ────────────────────────────────────────
+
+    /// List all distinct event sources in the episodic store.
+    pub async fn list_sources(&self) -> Result<Vec<String>> {
+        let episodic = self.episodic.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = episodic.write_conn();
+            let mut stmt = db
+                .prepare("SELECT DISTINCT source FROM episodic ORDER BY source")
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            let sources: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| crate::Error::Query(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(sources)
+        })
+        .await
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("join: {e}")))?
+    }
+
+    /// List all distinct agent IDs in the state store.
+    pub async fn list_agents(&self) -> Result<Vec<String>> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = state.db_conn();
+            let mut stmt = db
+                .prepare("SELECT DISTINCT agent_id FROM state ORDER BY agent_id")
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            let agents: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| crate::Error::Query(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(agents)
+        })
+        .await
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("join: {e}")))?
     }
 
     // ── Retention ─────────────────────────────────────────────────────

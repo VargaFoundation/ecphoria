@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "strata-client"
+version = "0.1.0"
+description = "Python client for the Strata context lake"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.25",
+    "websockets>=12.0",
+]
+keywords = ["ai", "agents", "context-lake", "memory", "vector-search"]
+
+[project.urls]
+Homepage = "https://github.com/VargaFoundation/strata"
+Documentation = "https://github.com/VargaFoundation/strata/tree/main/sdk/python"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]

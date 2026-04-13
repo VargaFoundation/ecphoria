@@ -7,6 +7,8 @@ pub struct ClusterConfig {
     pub node_id: u64,
     pub listen: String,
     pub peers: Vec<String>,
+    /// Directory for persistent Raft log storage. Use ":memory:" for in-memory (testing).
+    pub data_dir: String,
 }
 
 impl Default for ClusterConfig {
@@ -16,6 +18,7 @@ impl Default for ClusterConfig {
             node_id: 1,
             listen: "0.0.0.0:9433".into(),
             peers: vec![],
+            data_dir: "./data/raft".into(),
         }
     }
 }
@@ -62,6 +65,7 @@ mod tests {
             node_id: 5,
             listen: "localhost:9433".into(),
             peers: vec!["peer1:9433".into()],
+            data_dir: "/tmp/raft".into(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.node_id, 5);

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -268,5 +269,126 @@ pub async fn backup(
             "timestamp": timestamp,
         })),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "BACKUP_ERROR", e.to_string()),
+    }
+}
+
+// ── WebSocket state watcher ─────────────────────────────────────────
+
+/// WebSocket endpoint for real-time state change notifications.
+///
+/// GET /api/v1/state/{agent_id}/watch → upgrades to WebSocket.
+/// Sends JSON messages for each state change matching the agent_id.
+pub async fn state_watch(
+    State(engine): State<Arc<StrataEngine>>,
+    Path(agent_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_state_ws(socket, engine, agent_id))
+}
+
+// ── Embed & Search (DX killer feature) ──────────────────────────────
+
+/// Embed text and search semantic memory in a single call.
+///
+/// POST /api/v1/embed-and-search { "text": "billing issue", "k": 5 }
+pub async fn embed_and_search(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<EmbedAndSearchRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "embed_and_search").increment(1);
+    let start = std::time::Instant::now();
+
+    let source = req.filters.as_ref().and_then(|f| f.source.as_deref());
+    let event_type = req.filters.as_ref().and_then(|f| f.event_type.as_deref());
+
+    let result = match engine
+        .embed_and_search(&req.text, req.k, source, event_type)
+        .await
+    {
+        Ok(results) => {
+            let items: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.entry.id.to_string(),
+                        "content": r.entry.content,
+                        "metadata": r.entry.metadata,
+                        "score": r.score,
+                    })
+                })
+                .collect();
+            api_ok(serde_json::json!({ "results": items, "count": items.len() }))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no embedding provider") {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "NO_EMBEDDING_PROVIDER",
+                    "No embedding provider configured. Set STRATA_EMBEDDING__PROVIDER=ollama".into(),
+                )
+            } else {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", msg)
+            }
+        }
+    };
+
+    metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "embed_and_search")
+        .record(start.elapsed().as_secs_f64());
+    result
+}
+
+// ── Schema Introspection ────────────────────────────────────────────
+
+/// List all distinct event sources.
+pub async fn schema_sources(
+    State(engine): State<Arc<StrataEngine>>,
+) -> Response {
+    match engine.list_sources().await {
+        Ok(sources) => api_ok(serde_json::json!({ "sources": sources })),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "SCHEMA_ERROR", e.to_string()),
+    }
+}
+
+/// List all distinct agent IDs.
+pub async fn schema_agents(
+    State(engine): State<Arc<StrataEngine>>,
+) -> Response {
+    match engine.list_agents().await {
+        Ok(agents) => api_ok(serde_json::json!({ "agents": agents })),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "SCHEMA_ERROR", e.to_string()),
+    }
+}
+
+async fn handle_state_ws(mut socket: WebSocket, engine: Arc<StrataEngine>, agent_id: String) {
+    let mut rx = engine.state_subscribe();
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(change) => {
+                        // Only send changes for the requested agent
+                        if change.agent_id == agent_id {
+                            let msg = serde_json::to_string(&change).unwrap_or_default();
+                            if socket.send(Message::Text(msg.into())).await.is_err() {
+                                break; // Client disconnected
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, agent_id = %agent_id, "state watcher lagged");
+                    }
+                    Err(_) => break, // Channel closed
+                }
+            }
+            // Check for client close
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {} // Ignore other messages
+                }
+            }
+        }
     }
 }

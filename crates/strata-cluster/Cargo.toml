@@ -30,7 +30,9 @@ uuid.workspace = true
 chrono.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true
+tempfile.workspace = true

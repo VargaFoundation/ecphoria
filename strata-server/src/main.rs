@@ -26,6 +26,11 @@ async fn main() -> anyhow::Result<()> {
 
     let engine = Arc::new(strata_core::StrataEngine::new(server_config.core).await?);
 
+    // Start background tiering manager (retention + TTL cleanup)
+    let (tiering_mgr, tiering_handle) =
+        strata_core::storage::tiering::TieringManager::new(3600);
+    tokio::spawn(tiering_mgr.run(engine.clone()));
+
     // Start Raft cluster if enabled
     let coordinator = Arc::new(RwLock::new(
         strata_cluster::ClusterCoordinator::new(server_config.cluster.clone()),
@@ -53,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     signals::wait_for_shutdown().await;
 
+    tiering_handle.shutdown();
     coordinator.write().await.shutdown().await?;
     gateway.shutdown().await?;
     Arc::try_unwrap(engine)

@@ -47,6 +47,18 @@ fn default_k() -> usize {
     5
 }
 
+/// Embed text and search in one call.
+#[derive(Debug, Deserialize)]
+pub struct EmbedAndSearchRequest {
+    /// Natural language query text (will be embedded automatically).
+    pub text: String,
+    #[serde(default = "default_k")]
+    pub k: usize,
+    /// Optional metadata filters.
+    #[serde(default)]
+    pub filters: Option<SearchFilters>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

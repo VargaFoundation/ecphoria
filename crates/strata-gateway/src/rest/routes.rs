@@ -57,8 +57,12 @@ pub fn router_with_engine_and_auth(
             "/state/{agent_id}/{key}",
             axum::routing::get(handlers::state_get).put(handlers::state_set),
         )
+        .route("/embed-and-search", axum::routing::post(handlers::embed_and_search))
+        .route("/schema/sources", axum::routing::get(handlers::schema_sources))
+        .route("/schema/agents", axum::routing::get(handlers::schema_agents))
         .route("/admin/retention", axum::routing::post(handlers::enforce_retention))
         .route("/admin/backup", axum::routing::post(handlers::backup))
+        .route("/state/{agent_id}/watch", axum::routing::get(handlers::state_watch))
         .with_state(engine.clone());
 
     // Apply auth middleware if configured

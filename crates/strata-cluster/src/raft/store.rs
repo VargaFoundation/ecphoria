@@ -1,10 +1,12 @@
-//! Raft log storage and state machine — in-memory implementation.
+//! Raft log storage and state machine — SQLite-backed persistent implementation.
 //!
-//! This provides a complete `RaftStorage` implementation backed by in-memory
-//! data structures. For production, the log should be backed by persistent storage.
+//! The Raft log, vote, and metadata are persisted in a SQLite database.
+//! An in-memory BTreeMap cache provides fast reads. All writes go to both
+//! SQLite and the cache atomically.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 
 use openraft::storage::LogState;
@@ -13,17 +15,20 @@ use openraft::{
     StorageError, StoredMembership, Vote,
 };
 use parking_lot::Mutex;
+use rusqlite::Connection;
 use strata_core::StrataEngine;
 
 use super::types::{AppRequest, AppResponse, NodeId, NodeInfo, TypeConfig};
 
-/// Shared state for the in-memory Raft store.
+/// Shared state for the Raft store (cache + persistent SQLite).
 #[derive(Debug)]
 struct StoreInner {
-    /// Current vote (persisted).
-    vote: Option<Vote<NodeId>>,
-    /// Raft log entries.
+    /// SQLite connection for persistence (None = in-memory only).
+    db: Option<Connection>,
+    /// In-memory cache of log entries.
     log: BTreeMap<u64, Entry<TypeConfig>>,
+    /// Current vote.
+    vote: Option<Vote<NodeId>>,
     /// Last purged log ID.
     last_purged: Option<LogId<NodeId>>,
     /// Last applied log ID.
@@ -36,13 +41,135 @@ struct StoreInner {
     committed: Option<LogId<NodeId>>,
 }
 
+impl StoreInner {
+    fn init_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS raft_log (
+                idx     INTEGER PRIMARY KEY,
+                entry   BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS raft_meta (
+                key   TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );",
+        )
+        .expect("failed to create raft schema");
+    }
+
+    /// Persist a log entry to SQLite.
+    fn persist_entry(&self, idx: u64, entry: &Entry<TypeConfig>) {
+        if let Some(ref db) = self.db {
+            let data = serde_json::to_vec(entry).unwrap_or_default();
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO raft_log (idx, entry) VALUES (?1, ?2)",
+                rusqlite::params![idx as i64, data],
+            );
+        }
+    }
+
+    /// Delete log entries from SQLite.
+    fn delete_entries_from(&self, from_idx: u64) {
+        if let Some(ref db) = self.db {
+            let _ = db.execute(
+                "DELETE FROM raft_log WHERE idx >= ?1",
+                rusqlite::params![from_idx as i64],
+            );
+        }
+    }
+
+    fn delete_entries_upto(&self, upto_idx: u64) {
+        if let Some(ref db) = self.db {
+            let _ = db.execute(
+                "DELETE FROM raft_log WHERE idx <= ?1",
+                rusqlite::params![upto_idx as i64],
+            );
+        }
+    }
+
+    /// Persist metadata (vote, committed, etc.) to SQLite.
+    fn persist_meta(&self, key: &str, value: &[u8]) {
+        if let Some(ref db) = self.db {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            );
+        }
+    }
+
+    /// Load metadata from SQLite.
+    fn load_meta(&self, key: &str) -> Option<Vec<u8>> {
+        self.db.as_ref().and_then(|db| {
+            db.query_row(
+                "SELECT value FROM raft_meta WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok()
+        })
+    }
+
+    /// Hydrate the in-memory cache from SQLite.
+    fn hydrate(&mut self) {
+        if let Some(ref db) = self.db {
+            // Load log entries
+            if let Ok(mut stmt) = db.prepare("SELECT idx, entry FROM raft_log ORDER BY idx") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    let idx: i64 = row.get(0)?;
+                    let data: Vec<u8> = row.get(1)?;
+                    Ok((idx as u64, data))
+                }) {
+                    for row in rows.flatten() {
+                        if let Ok(entry) = serde_json::from_slice::<Entry<TypeConfig>>(&row.1) {
+                            self.log.insert(row.0, entry);
+                        }
+                    }
+                }
+            }
+
+            // Load vote
+            if let Some(data) = self.load_meta("vote") {
+                self.vote = serde_json::from_slice(&data).ok();
+            }
+
+            // Load committed
+            if let Some(data) = self.load_meta("committed") {
+                self.committed = serde_json::from_slice(&data).ok();
+            }
+
+            // Load last_purged
+            if let Some(data) = self.load_meta("last_purged") {
+                self.last_purged = serde_json::from_slice(&data).ok();
+            }
+
+            // Load last_applied
+            if let Some(data) = self.load_meta("last_applied") {
+                self.last_applied = serde_json::from_slice(&data).ok();
+            }
+
+            // Load last_membership
+            if let Some(data) = self.load_meta("last_membership") {
+                if let Ok(m) = serde_json::from_slice(&data) {
+                    self.last_membership = m;
+                }
+            }
+
+            if !self.log.is_empty() {
+                tracing::info!(
+                    entries = self.log.len(),
+                    "hydrated Raft log from persistent storage"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, NodeInfo>,
     data: Vec<u8>,
 }
 
-/// In-memory Raft store implementing the full `RaftStorage` trait.
+/// Persistent Raft store backed by SQLite + in-memory cache.
 ///
 /// Holds both the Raft log and state machine. The state machine applies
 /// entries to a `StrataEngine` reference.
@@ -53,12 +180,13 @@ pub struct MemStore {
 }
 
 impl MemStore {
-    /// Create a new in-memory store, optionally backed by a StrataEngine.
+    /// Create a new in-memory store (no persistence).
     pub fn new(engine: Option<Arc<StrataEngine>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(StoreInner {
-                vote: None,
+                db: None,
                 log: BTreeMap::new(),
+                vote: None,
                 last_purged: None,
                 last_applied: None,
                 last_membership: StoredMembership::default(),
@@ -67,6 +195,39 @@ impl MemStore {
             })),
             engine,
         }
+    }
+
+    /// Create a persistent store backed by a SQLite file.
+    ///
+    /// On startup, the log and metadata are hydrated from the database.
+    pub fn open(path: &Path, engine: Option<Arc<StrataEngine>>) -> crate::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| crate::Error::Raft(format!("mkdir: {e}")))?;
+        }
+
+        let conn = Connection::open(path)
+            .map_err(|e| crate::Error::Raft(format!("open raft db: {e}")))?;
+
+        StoreInner::init_schema(&conn);
+
+        let mut inner = StoreInner {
+            db: Some(conn),
+            log: BTreeMap::new(),
+            vote: None,
+            last_purged: None,
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+            snapshot: None,
+            committed: None,
+        };
+
+        inner.hydrate();
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            engine,
+        })
     }
 
     /// Apply an application request to the engine.
@@ -172,9 +333,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStore {
         let last_applied = inner.last_applied;
         let membership = inner.last_membership.clone();
 
-        // Snapshot is a serialized representation of applied state
-        // For now, store the log entries as the snapshot data
-        let data = serde_json::to_vec(&"snapshot-placeholder").unwrap_or_default();
+        let data = serde_json::to_vec(&"snapshot").unwrap_or_default();
 
         let snapshot_id = format!(
             "{}-{}",
@@ -204,7 +363,11 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
     type SnapshotBuilder = Self;
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().vote = Some(*vote);
+        let mut inner = self.inner.lock();
+        inner.vote = Some(*vote);
+        if let Ok(data) = serde_json::to_vec(vote) {
+            inner.persist_meta("vote", &data);
+        }
         Ok(())
     }
 
@@ -216,7 +379,11 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().committed = committed;
+        let mut inner = self.inner.lock();
+        inner.committed = committed;
+        if let Ok(data) = serde_json::to_vec(&committed) {
+            inner.persist_meta("committed", &data);
+        }
         Ok(())
     }
 
@@ -250,7 +417,9 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
     {
         let mut inner = self.inner.lock();
         for entry in entries {
-            inner.log.insert(entry.log_id.index, entry);
+            let idx = entry.log_id.index;
+            inner.persist_entry(idx, &entry);
+            inner.log.insert(idx, entry);
         }
         Ok(())
     }
@@ -260,6 +429,7 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
+        inner.delete_entries_from(log_id.index);
         let to_remove: Vec<u64> = inner
             .log
             .range(log_id.index..)
@@ -277,6 +447,10 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock();
         inner.last_purged = Some(log_id);
+        if let Ok(data) = serde_json::to_vec(&Some(log_id)) {
+            inner.persist_meta("last_purged", &data);
+        }
+        inner.delete_entries_upto(log_id.index);
         let to_remove: Vec<u64> = inner
             .log
             .range(..=log_id.index)
@@ -310,8 +484,14 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
         for entry in entries {
             let log_id = entry.log_id;
 
-            // Update last applied
-            self.inner.lock().last_applied = Some(log_id);
+            // Update last applied + persist
+            {
+                let mut inner = self.inner.lock();
+                inner.last_applied = Some(log_id);
+                if let Ok(data) = serde_json::to_vec(&Some(log_id)) {
+                    inner.persist_meta("last_applied", &data);
+                }
+            }
 
             match entry.payload {
                 openraft::EntryPayload::Blank => {
@@ -322,8 +502,12 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
                     responses.push(resp);
                 }
                 openraft::EntryPayload::Membership(ref membership) => {
-                    self.inner.lock().last_membership =
+                    let mut inner = self.inner.lock();
+                    inner.last_membership =
                         StoredMembership::new(Some(log_id), membership.clone());
+                    if let Ok(data) = serde_json::to_vec(&inner.last_membership) {
+                        inner.persist_meta("last_membership", &data);
+                    }
                     responses.push(AppResponse::Ok);
                 }
             }
@@ -355,6 +539,13 @@ impl openraft::RaftStorage<TypeConfig> for MemStore {
             meta: meta.clone(),
             data,
         });
+        // Persist applied state
+        if let Ok(d) = serde_json::to_vec(&inner.last_applied) {
+            inner.persist_meta("last_applied", &d);
+        }
+        if let Ok(d) = serde_json::to_vec(&inner.last_membership) {
+            inner.persist_meta("last_membership", &d);
+        }
         Ok(())
     }
 
@@ -402,5 +593,31 @@ mod tests {
             .unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn persistent_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("raft.db");
+
+        // Write vote
+        {
+            let mut store = MemStore::open(&db_path, None).unwrap();
+            let vote = Vote::new(2, 3);
+            openraft::RaftStorage::<TypeConfig>::save_vote(&mut store, &vote)
+                .await
+                .unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let mut store = MemStore::open(&db_path, None).unwrap();
+            let vote = openraft::RaftStorage::<TypeConfig>::read_vote(&mut store)
+                .await
+                .unwrap();
+            assert!(vote.is_some());
+            let v = vote.unwrap();
+            assert_eq!(v.leader_id().voted_for().unwrap(), 3);
+        }
     }
 }

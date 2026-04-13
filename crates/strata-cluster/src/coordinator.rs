@@ -39,7 +39,26 @@ impl ClusterCoordinator {
         };
 
         let config = Arc::new(raft_config);
-        let store = MemStore::new(Some(engine));
+
+        let store = if self.config.data_dir == ":memory:" {
+            tracing::info!("Raft store: in-memory");
+            MemStore::new(Some(engine))
+        } else {
+            let data_dir = std::path::Path::new(&self.config.data_dir);
+            match MemStore::open(
+                &data_dir.join(format!("node-{}.db", self.config.node_id)),
+                Some(engine.clone()),
+            ) {
+                Ok(s) => {
+                    tracing::info!(node_id = self.config.node_id, "Raft store: persistent (SQLite)");
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "falling back to in-memory Raft store");
+                    MemStore::new(Some(engine))
+                }
+            }
+        };
         let (log_store, state_machine) = Adaptor::new(store);
         let network = NetworkFactory::new();
 
@@ -160,7 +179,11 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut coord = ClusterCoordinator::new(ClusterConfig::default());
+        let config = ClusterConfig {
+            data_dir: ":memory:".into(),
+            ..Default::default()
+        };
+        let mut coord = ClusterCoordinator::new(config);
         coord.start_raft(engine).await.unwrap();
         assert!(coord.raft().is_some());
 

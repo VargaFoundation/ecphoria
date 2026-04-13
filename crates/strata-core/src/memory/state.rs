@@ -1,10 +1,11 @@
-//! State memory store — transactional key-value with MVCC.
+//! State memory store — transactional key-value with MVCC and change notifications.
 
 use dashmap::DashMap;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use parking_lot::Mutex;
 
@@ -17,15 +18,35 @@ pub struct StateEntry {
     pub version: u64,
 }
 
+/// Notification sent when a state key changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateChange {
+    pub agent_id: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub version: u64,
+    pub deleted: bool,
+}
+
 /// Key-value store with MVCC, watchers, and TTL support.
 ///
 /// Architecture:
 /// - SQLite for durable persistence (MVCC via version column)
 /// - DashMap as a hot read cache for frequently accessed keys
-#[derive(Debug)]
+/// - Broadcast channel for change notifications (watchers)
 pub struct StateStore {
     db: Arc<Mutex<Connection>>,
     cache: DashMap<(String, String), StateEntry>,
+    /// Broadcast channel for state change notifications.
+    change_tx: broadcast::Sender<StateChange>,
+}
+
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateStore")
+            .field("cache_size", &self.cache.len())
+            .finish()
+    }
 }
 
 impl StateStore {
@@ -58,15 +79,37 @@ impl StateStore {
         // Migration: add expires_at column if it doesn't exist (for existing DBs)
         let _ = conn.execute_batch("ALTER TABLE state ADD COLUMN expires_at TEXT");
 
+        let (change_tx, _) = broadcast::channel(1024);
+
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             cache: DashMap::new(),
+            change_tx,
         })
     }
 
     /// Create an in-memory state store (for testing).
     pub fn new() -> Self {
         Self::open(Path::new(":memory:")).expect("failed to create in-memory state store")
+    }
+
+    /// Acquire the database connection (for schema introspection queries).
+    pub fn db_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.db.lock()
+    }
+
+    /// Subscribe to state change notifications.
+    ///
+    /// Returns a broadcast receiver that receives `StateChange` events
+    /// for all agent state modifications (set, delete, TTL expiry).
+    pub fn subscribe(&self) -> broadcast::Receiver<StateChange> {
+        self.change_tx.subscribe()
+    }
+
+    /// Notify watchers of a state change.
+    fn notify(&self, change: StateChange) {
+        // Ignore send errors (no subscribers)
+        let _ = self.change_tx.send(change);
     }
 
     /// Get the current value for a key.
@@ -139,15 +182,23 @@ impl StateStore {
             )
             .map_err(|e| crate::Error::State(e.to_string()))?;
 
-        // Update cache
+        // Update cache + notify watchers
         let entry = StateEntry {
             agent_id: agent_id.to_string(),
             key: key.to_string(),
-            value,
+            value: value.clone(),
             version,
         };
         self.cache
             .insert((agent_id.to_string(), key.to_string()), entry);
+
+        self.notify(StateChange {
+            agent_id: agent_id.to_string(),
+            key: key.to_string(),
+            value,
+            version,
+            deleted: false,
+        });
 
         Ok(version)
     }
@@ -241,6 +292,15 @@ impl StateStore {
         .map_err(|e| crate::Error::State(e.to_string()))?;
 
         self.cache.remove(&(agent_id.to_string(), key.to_string()));
+
+        self.notify(StateChange {
+            agent_id: agent_id.to_string(),
+            key: key.to_string(),
+            value: serde_json::Value::Null,
+            version: 0,
+            deleted: true,
+        });
+
         Ok(())
     }
 
