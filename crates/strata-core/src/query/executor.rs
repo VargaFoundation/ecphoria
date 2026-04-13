@@ -33,13 +33,31 @@ impl QueryExecutor {
     }
 
     /// Execute a query plan and return results as JSON rows.
+    ///
+    /// For SQL queries containing `strata_search()` or `strata_state()` in
+    /// non-top-level positions (JOINs, subqueries, CTEs), the executor
+    /// automatically rewrites the query using CTE injection.
     pub async fn execute(
         &self,
         plan: QueryPlan,
         max_rows: usize,
     ) -> crate::Result<Vec<serde_json::Value>> {
         match plan {
-            QueryPlan::Sql(sql) => self.episodic.query_sql_limited(&sql, max_rows),
+            QueryPlan::Sql(sql) => {
+                // Try hybrid query rewriting for SQL containing strata functions
+                if let Ok(Some(rewritten)) = super::functions::rewrite_hybrid_query(
+                    &sql,
+                    &self.semantic,
+                    &self.state,
+                    &self.embedding,
+                )
+                .await
+                {
+                    self.episodic.query_sql_limited(&rewritten, max_rows)
+                } else {
+                    self.episodic.query_sql_limited(&sql, max_rows)
+                }
+            }
 
             QueryPlan::Dml(_sql) => Err(crate::Error::Query(
                 "DML statements are not allowed via query_sql (use ingest/state API)".into(),
