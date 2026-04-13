@@ -7,18 +7,18 @@
 ## 1. RÉSUMÉ EXÉCUTIF
 
 ### Nom de travail (à finaliser — voir section 10)
-**GroundDB** (recommandation principale — voir section 10 pour alternatives)
+**Strata** (recommandation principale — voir section 10 pour alternatives)
 
 ### Tagline
 "The open-source context lake. Deploy in 30 seconds. Scale to millions."
 
 ### One-liner pitch
-GroundDB est un context lake open source qui unifie mémoire épisodique, sémantique et d'état pour les agents IA dans un seul binaire Rust — déployable en Docker comme MinIO, scalable sur Kubernetes, compatible PostgreSQL et MCP-natif.
+Strata est un context lake open source qui unifie mémoire épisodique, sémantique et d'état pour les agents IA dans un seul binaire Rust — déployable en Docker comme MinIO, scalable sur Kubernetes, compatible PostgreSQL et MCP-natif.
 
 ### Elevator pitch (60 secondes)
 Les agents IA en production aujourd'hui opèrent sur des données fragmentées. L'agent de fraude voit un snapshot vieux de 5 minutes. L'agent de support ne sait pas que l'agent d'analyse a déjà détecté un problème. Chaque agent a sa propre mémoire dans son propre silo.
 
-GroundDB résout ça. C'est un context lake — une couche de contexte partagé temps réel pour tous vos agents. Trois types de mémoire (ce qui s'est passé, ce que ça signifie, où on en est) unifiés dans un seul moteur. Les agents lisent et écrivent dans la même réalité. Le tout en open source, déployable en `docker run`, compatible avec les outils existants via le protocole PostgreSQL, et nativement intégré au Model Context Protocol.
+Strata résout ça. C'est un context lake — une couche de contexte partagé temps réel pour tous vos agents. Trois types de mémoire (ce qui s'est passé, ce que ça signifie, où on en est) unifiés dans un seul moteur. Les agents lisent et écrivent dans la même réalité. Le tout en open source, déployable en `docker run`, compatible avec les outils existants via le protocole PostgreSQL, et nativement intégré au Model Context Protocol.
 
 Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous les autres — en open source, on-premise, RGPD-natif.
 
@@ -54,13 +54,13 @@ Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous l
 - **Produit** : Memory-as-a-service pour agents IA. API simple (3 lignes de code). Extraction automatique de mémoires. Scopes user/session/agent.
 - **Forces** : Écosystème le plus large, intégration AWS Agent SDK, DX excellente, traction massive
 - **Faiblesses** : Cloud-first (données sur serveurs Mem0), graph features derrière paywall $249/mo, score LongMemEval moyen (49%), pas de requêtes SQL, pas de feature store, pas de contexte opérationnel temps réel
-- **Notre différenciation** : GroundDB n'est PAS un memory framework — c'est une infrastructure data. Mem0 stocke des "souvenirs" d'interactions. GroundDB stocke l'état opérationnel complet d'un système. Mem0 est le cerveau conversationnel. GroundDB est la source de vérité partagée.
+- **Notre différenciation** : Strata n'est PAS un memory framework — c'est une infrastructure data. Mem0 stocke des "souvenirs" d'interactions. Strata stocke l'état opérationnel complet d'un système. Mem0 est le cerveau conversationnel. Strata est la source de vérité partagée.
 
 #### Zep (Graphiti)
 - **Produit** : Temporal knowledge graph pour agents. Graphiti engine open source.
 - **Forces** : Meilleur score temporel (LongMemEval 63.8%), graph-based, production-ready
 - **Faiblesses** : Nécessite Neo4j/FalkorDB, self-hosting complexe, cloud pricing élevé, pas de feature store temps réel
-- **Notre différenciation** : GroundDB unifie tout dans un seul moteur — pas besoin de gérer Neo4j + vector DB + feature store séparément
+- **Notre différenciation** : Strata unifie tout dans un seul moteur — pas besoin de gérer Neo4j + vector DB + feature store séparément
 
 #### Letta (ex-MemGPT)
 - **Fondé** : 2024, $10M seed (Felicis Ventures)
@@ -68,13 +68,13 @@ Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous l
 - **Produit** : Agent runtime avec mémoire tiered (core/recall/archival). Le LLM gère lui-même sa mémoire.
 - **Forces** : Architecture OS-like innovante, contrôle explicite de la mémoire, local-LLM friendly
 - **Faiblesses** : Lock-in dans le framework Letta, mémoire couplée au runtime agent, pas de SQL, pas de contexte partagé multi-agent
-- **Notre différenciation** : GroundDB est agnostique du framework agent. N'importe quel agent peut y lire/écrire. Pas de runtime propriétaire.
+- **Notre différenciation** : Strata est agnostique du framework agent. N'importe quel agent peut y lire/écrire. Pas de runtime propriétaire.
 
 #### Cognee
 - **Produit** : Knowledge graph + vector search, 30+ connecteurs data, multimodal
 - **Forces** : Tourne entièrement en local (SQLite + LanceDB + Kuzu), pipeline d'extraction structurée
 - **Faiblesses** : Orienté RAG/extraction, pas de contexte opérationnel temps réel
-- **Notre différenciation** : GroundDB est une base de données, pas un pipeline d'extraction
+- **Notre différenciation** : Strata est une base de données, pas un pipeline d'extraction
 
 #### Supermemory
 - **Produit** : Memory API avec MCP integrations, orienté coding agents
@@ -87,24 +87,24 @@ Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous l
 #### Vector DBs (Chroma, Milvus, Qdrant, Weaviate, pgvector)
 - Résolvent le problème du stockage/recherche vectorielle UNIQUEMENT
 - Pas de mémoire épisodique, pas d'état, pas de transactions cross-type, pas de MCP
-- GroundDB les remplace en incluant le vectoriel + tout le reste
+- Strata les remplace en incluant le vectoriel + tout le reste
 
 #### Feature stores (Feast, Tecton, Featureform)
 - Orientés ML classique, pas agents IA
 - Batch-first pour la plupart
-- GroundDB inclut un feature store temps réel comme sous-ensemble de la State Memory
+- Strata inclut un feature store temps réel comme sous-ensemble de la State Memory
 
 #### Stream processing (Kafka, Flink, NATS)
 - Transport de messages, pas stockage de contexte
-- GroundDB consomme depuis ces systèmes, ne les remplace pas
+- Strata consomme depuis ces systèmes, ne les remplace pas
 
 #### Bases temps réel (Redis, DragonflyDB)
 - Cache/state, pas de persistance analytique ni vectorielle
-- GroundDB offre la persistance + analytique + vectoriel dans un seul système
+- Strata offre la persistance + analytique + vectoriel dans un seul système
 
 ### 2.4 Matrice comparative synthétique
 
-| Critère | GroundDB | Tacnode | Mem0 | Zep | Letta | pgvector |
+| Critère | Strata | Tacnode | Mem0 | Zep | Letta | pgvector |
 |---------|----------|---------|------|-----|-------|----------|
 | Open source | Apache 2.0 | Non | Partiel | Partiel | Oui | Oui |
 | Self-hosted | Oui (Docker/K8s) | Non (AWS) | Oui (limité) | Oui (complexe) | Oui | Oui |
@@ -187,11 +187,11 @@ Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous l
 - Primitives exposées :
 
 **Resources** (lecture passive de données) :
-- `ground://episodic/{source}` — événements par source
-- `ground://semantic/{collection}` — collections vectorielles
-- `ground://state/{agent_id}` — état d'un agent
-- `ground://schema` — schéma complet du context lake
-- `ground://stats` — métriques (volume, latence, santé)
+- `strata://episodic/{source}` — événements par source
+- `strata://semantic/{collection}` — collections vectorielles
+- `strata://state/{agent_id}` — état d'un agent
+- `strata://schema` — schéma complet du context lake
+- `strata://stats` — métriques (volume, latence, santé)
 
 **Tools** (actions exécutables) :
 - `query(sql)` — requête SQL libre
@@ -215,10 +215,10 @@ Tacnode fait ça pour les grands comptes US sur AWS. Nous le faisons pour tous l
 // claude_desktop_config.json / cursor / vscode
 {
   "mcpServers": {
-    "grounddb": {
+    "strata": {
       "url": "http://localhost:8432/mcp",
       "transport": "streamable-http",
-      "auth": { "type": "bearer", "token": "${GROUND_API_KEY}" }
+      "auth": { "type": "bearer", "token": "${STRATA_API_KEY}" }
     }
   }
 }
@@ -315,14 +315,14 @@ SELECT * FROM user_risk_features WHERE user_id = 'usr_42';
 
 #### 3.6.1 CLI
 ```bash
-ground status                    # santé du cluster
-ground sources list              # sources d'ingestion
-ground agents list               # agents enregistrés
-ground query "SELECT count(*) FROM episodic"
-ground ingest --source myapp --file events.json
-ground export --entity usr_42 --format json   # export RGPD
-ground backup --target s3://bucket/backup
-ground restore --from s3://bucket/backup/2026-04-08
+strata status                    # santé du cluster
+strata sources list              # sources d'ingestion
+strata agents list               # agents enregistrés
+strata query "SELECT count(*) FROM episodic"
+strata ingest --source myapp --file events.json
+strata export --entity usr_42 --format json   # export RGPD
+strata backup --target s3://bucket/backup
+strata restore --from s3://bucket/backup/2026-04-08
 ```
 
 #### 3.6.2 Web UI (optionnel)
@@ -399,7 +399,7 @@ ground restore --from s3://bucket/backup/2026-04-08
 #### Mode Compose (Docker Compose)
 ```
 ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│ GroundDB │ │  MinIO   │ │  Ollama  │ │ Ground   │
+│ Strata │ │  MinIO   │ │  Ollama  │ │ Strata   │
 │ (engine) │ │ (storage)│ │ (embed)  │ │ UI       │
 └──────────┘ └──────────┘ └──────────┘ └──────────┘
 ```
@@ -411,7 +411,7 @@ ground restore --from s3://bucket/backup/2026-04-08
 ┌─────────────────────────────────────────┐
 │          Kubernetes Cluster             │
 │  ┌──────────┐ ┌──────────┐ ┌────────┐ │
-│  │ Ground-1 │ │ Ground-2 │ │Ground-3│ │
+│  │ Strata-1 │ │ Strata-2 │ │Strata-3│ │
 │  │ (leader) │ │(follower)│ │(follow)│ │
 │  └────┬─────┘ └────┬─────┘ └───┬────┘ │
 │       └─────────────┼───────────┘      │
@@ -433,7 +433,7 @@ ground restore --from s3://bucket/backup/2026-04-08
 ### 4.3 Structure du projet (pour Claude Code)
 
 ```
-grounddb/
+strata/
 ├── Cargo.toml                    # Workspace Rust
 ├── Cargo.lock
 ├── README.md
@@ -443,7 +443,7 @@ grounddb/
 ├── Makefile
 │
 ├── crates/
-│   ├── ground-core/              # Moteur principal
+│   ├── strata-core/              # Moteur principal
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── memory/
@@ -475,7 +475,7 @@ grounddb/
 │   │   │   └── materialized.rs   # Incremental materialized views
 │   │   └── Cargo.toml
 │   │
-│   ├── ground-gateway/           # Couche protocole
+│   ├── strata-gateway/           # Couche protocole
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── pg_wire.rs        # PostgreSQL wire protocol
@@ -486,7 +486,7 @@ grounddb/
 │   │   │   └── auth.rs           # Auth middleware
 │   │   └── Cargo.toml
 │   │
-│   ├── ground-cluster/           # Mode distribué
+│   ├── strata-cluster/           # Mode distribué
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── raft.rs           # Consensus Raft
@@ -494,19 +494,19 @@ grounddb/
 │   │   │   └── coordinator.rs    # Coordination des nœuds
 │   │   └── Cargo.toml
 │   │
-│   └── ground-cli/               # CLI admin
+│   └── strata-cli/               # CLI admin
 │       ├── src/
 │       │   └── main.rs
 │       └── Cargo.toml
 │
-├── ground-server/                # Binaire principal
+├── strata-server/                # Binaire principal
 │   ├── src/
 │   │   └── main.rs               # Point d'entrée, config, startup
 │   └── Cargo.toml
 │
 ├── sdk/
 │   ├── python/                   # SDK Python (PyO3 ou HTTP client)
-│   │   ├── grounddb/
+│   │   ├── strata/
 │   │   │   ├── __init__.py
 │   │   │   ├── client.py
 │   │   │   ├── memory.py
@@ -523,7 +523,7 @@ grounddb/
 │   │   └── tests/
 │   │
 │   └── go/                       # SDK Go
-│       ├── grounddb.go
+│       ├── strata.go
 │       └── go.mod
 │
 ├── deploy/
@@ -531,7 +531,7 @@ grounddb/
 │   │   ├── Dockerfile
 │   │   └── docker-compose.yml
 │   ├── helm/
-│   │   └── grounddb/
+│   │   └── strata/
 │   │       ├── Chart.yaml
 │   │       ├── values.yaml
 │   │       └── templates/
@@ -551,7 +551,7 @@ grounddb/
 │
 ├── grafana/
 │   └── dashboards/
-│       └── grounddb-overview.json
+│       └── strata-overview.json
 │
 ├── tests/
 │   ├── integration/
@@ -572,9 +572,9 @@ grounddb/
 
 ```python
 # SDK Python — Agent support
-from grounddb import GroundDB
+from strata import Strata
 
-db = GroundDB("localhost:8432")
+db = Strata("localhost:8432")
 
 # 1. Ingestion de l'événement de contact
 db.ingest({
@@ -622,9 +622,9 @@ context = db.query("""
 
 ```python
 # Pipeline de détection de fraude
-from grounddb import GroundDB
+from strata import Strata
 
-db = GroundDB("grounddb.internal:8432")
+db = Strata("strata.internal:8432")
 
 # Materialized view (créée une fois)
 db.query("""
@@ -685,11 +685,11 @@ def evaluate_transaction(txn):
 # L'utilisateur dans Claude Code / Claude Desktop :
 > "Qu'est-ce qui s'est passé sur le service checkout dans la dernière heure ?"
 
-# Claude interroge GroundDB via MCP automatiquement :
+# Claude interroge Strata via MCP automatiquement :
 # 1. tools/call → query("SELECT * FROM episodic WHERE ...")
 # 2. tools/call → get_state("sre-agent", "checkout-service")
 
-# Réponse de Claude (avec contexte de GroundDB) :
+# Réponse de Claude (avec contexte de Strata) :
 "Voici ce qui s'est passé sur checkout dans la dernière heure :
 
 1. 14h32 — Deploy v2.3.1 (source: gitlab)
@@ -709,9 +709,9 @@ dans v2.3.1 avant de retenter le deploy."
 
 ```typescript
 // SDK TypeScript — Chatbot interne avec RAG
-import { GroundDB } from '@grounddb/sdk';
+import { Strata } from '@strata/sdk';
 
-const db = new GroundDB('http://grounddb:8432');
+const db = new Strata('http://strata:8432');
 
 // Ingestion continue depuis Confluence (webhook)
 app.post('/webhooks/confluence', async (req, res) => {
@@ -727,12 +727,12 @@ app.post('/webhooks/confluence', async (req, res) => {
       author: page.version.by.displayName,
     }
   });
-  // GroundDB chunk + embed automatiquement
+  // Strata chunk + embed automatiquement
   res.sendStatus(200);
 });
 
-// Chatbot : utilise le proxy LLM de GroundDB
-const response = await fetch('http://grounddb:8432/v1/chat/completions', {
+// Chatbot : utilise le proxy LLM de Strata
+const response = await fetch('http://strata:8432/v1/chat/completions', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -748,7 +748,7 @@ const response = await fetch('http://grounddb:8432/v1/chat/completions', {
     }
   })
 });
-// → GroundDB trouve les chunks Confluence pertinents,
+// → Strata trouve les chunks Confluence pertinents,
 //   les injecte dans le prompt, forward à Claude
 ```
 
@@ -763,18 +763,18 @@ const response = await fetch('http://grounddb:8432/v1/chat/completions', {
      │                │                │
      ▼                ▼                ▼
 ┌──────────────────────────────────────────┐
-│              GroundDB                     │
+│              Strata                     │
 │  Episodic ◄──── Semantic ◄──── State     │
 │  (events)       (meaning)      (status)  │
 └──────────────────────────────────────────┘
 ```
 
-Chaque agent lit et écrit dans GroundDB. L'agent d'analyse voit les événements ingérés. L'agent d'action voit les conclusions de l'analyse. Tout est cohérent.
+Chaque agent lit et écrit dans Strata. L'agent d'analyse voit les événements ingérés. L'agent d'action voit les conclusions de l'analyse. Tout est cohérent.
 
-### 5.6 Home Assistant + GroundDB (domotique intelligente)
+### 5.6 Home Assistant + Strata (domotique intelligente)
 
 ```yaml
-# GroundDB ingère les événements Home Assistant
+# Strata ingère les événements Home Assistant
 # via webhook ou via MCP bridge
 
 # L'agent IA peut alors :
@@ -783,7 +783,7 @@ Chaque agent lit et écrit dans GroundDB. L'agent d'analyse voit les événement
 # - Maintenir l'état de la maison (state)
 
 # Exemple : "Pourquoi il fait froid dans le salon ?"
-# GroundDB contexte :
+# Strata contexte :
 # - episodic: chauffage éteint il y a 2h (source: home-assistant)
 # - episodic: fenêtre ouverte il y a 45min (source: capteur)
 # - semantic: "le salon est orienté nord, mal isolé"
@@ -798,26 +798,26 @@ Chaque agent lit et écrit dans GroundDB. L'agent d'analyse voit les événement
 
 ```bash
 # Minimal — stockage local, embedding OpenAI
-docker run -d --name grounddb \
+docker run -d --name strata \
   -p 5432:5432 -p 8432:8432 \
-  -v grounddb-data:/data \
-  -e GROUND_LLM_PROVIDER=openai \
+  -v strata-data:/data \
+  -e STRATA_LLM_PROVIDER=openai \
   -e OPENAI_API_KEY=sk-... \
-  grounddb/grounddb:latest
+  strata/strata:latest
 
 # 100% local — embedding Ollama, zéro cloud
-docker run -d --name grounddb \
+docker run -d --name strata \
   -p 5432:5432 -p 8432:8432 \
-  -v grounddb-data:/data \
-  -e GROUND_EMBEDDING_PROVIDER=ollama \
-  -e GROUND_EMBEDDING_MODEL=nomic-embed-text \
+  -v strata-data:/data \
+  -e STRATA_EMBEDDING_PROVIDER=ollama \
+  -e STRATA_EMBEDDING_MODEL=nomic-embed-text \
   -e OLLAMA_URL=http://host.docker.internal:11434 \
-  grounddb/grounddb:latest
+  strata/strata:latest
 
 # Test immédiat
-psql -h localhost -U ground -d ground \
+psql -h localhost -U strata -d strata \
   -c "SELECT version();"
-# → GroundDB v0.1.0 (context lake engine)
+# → Strata v0.1.0 (context lake engine)
 ```
 
 ### 6.2 Docker Compose (stack complète)
@@ -825,24 +825,24 @@ psql -h localhost -U ground -d ground \
 ```yaml
 version: '3.8'
 services:
-  grounddb:
-    image: grounddb/grounddb:latest
+  strata:
+    image: strata/strata:latest
     ports: ["5432:5432", "8432:8432"]
     environment:
-      GROUND_STORAGE: minio
-      GROUND_S3_ENDPOINT: http://minio:9000
-      GROUND_S3_BUCKET: ground
-      GROUND_S3_ACCESS_KEY: minioadmin
-      GROUND_S3_SECRET_KEY: minioadmin
-      GROUND_EMBEDDING_PROVIDER: ollama
-      GROUND_EMBEDDING_MODEL: nomic-embed-text
+      STRATA_STORAGE: minio
+      STRATA_S3_ENDPOINT: http://minio:9000
+      STRATA_S3_BUCKET: strata
+      STRATA_S3_ACCESS_KEY: minioadmin
+      STRATA_S3_SECRET_KEY: minioadmin
+      STRATA_EMBEDDING_PROVIDER: ollama
+      STRATA_EMBEDDING_MODEL: nomic-embed-text
       OLLAMA_URL: http://ollama:11434
-      GROUND_MCP_ENABLED: "true"
-      GROUND_LLM_PROXY_ENABLED: "true"
-      GROUND_LLM_PROVIDER: anthropic
+      STRATA_MCP_ENABLED: "true"
+      STRATA_LLM_PROXY_ENABLED: "true"
+      STRATA_LLM_PROVIDER: anthropic
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     depends_on: [minio, ollama]
-    volumes: [grounddb-data:/data]
+    volumes: [strata-data:/data]
 
   minio:
     image: minio/minio
@@ -862,14 +862,14 @@ services:
           devices:
             - capabilities: [gpu]  # optionnel
 
-  grounddb-ui:
-    image: grounddb/grounddb-ui:latest
+  strata-ui:
+    image: strata/strata-ui:latest
     ports: ["3000:3000"]
     environment:
-      GROUND_URL: http://grounddb:8432
+      STRATA_URL: http://strata:8432
 
 volumes:
-  grounddb-data:
+  strata-data:
   minio-data:
   ollama-data:
 ```
@@ -877,9 +877,9 @@ volumes:
 ### 6.3 Kubernetes (Helm)
 
 ```bash
-helm repo add grounddb https://charts.grounddb.dev
-helm install ground grounddb/grounddb \
-  --namespace ground --create-namespace \
+helm repo add strata https://charts.strata.dev
+helm install strata strata/strata \
+  --namespace strata --create-namespace \
   --values production-values.yaml
 ```
 
@@ -894,7 +894,7 @@ storage:
   type: s3
   s3:
     endpoint: http://minio.minio:9000
-    bucket: ground-prod
+    bucket: strata-prod
   tiering:
     hot: 7d      # mémoire + SSD
     warm: 30d    # SSD only
@@ -911,14 +911,14 @@ mcp:
   auth: oauth2
   ingress:
     enabled: true
-    host: ground-mcp.internal.example.com
+    host: strata-mcp.internal.example.com
 
 llmProxy:
   enabled: true
   provider: anthropic
   ingress:
     enabled: true
-    host: ground-llm.internal.example.com
+    host: strata-llm.internal.example.com
 
 monitoring:
   prometheus: true
@@ -927,32 +927,32 @@ monitoring:
 ingress:
   enabled: true
   className: nginx
-  host: ground.internal.example.com
+  host: strata.internal.example.com
   tls:
     enabled: true
-    secretName: ground-tls
+    secretName: strata-tls
 
 backup:
   enabled: true
   schedule: "0 2 * * *"
-  target: s3://ground-backups/
+  target: s3://strata-backups/
   retention: 30d
 ```
 
 ### 6.4 Kubernetes Operator (CRD)
 
 ```yaml
-apiVersion: grounddb.dev/v1alpha1
-kind: GroundCluster
+apiVersion: strata.dev/v1alpha1
+kind: StrataCluster
 metadata:
   name: production
-  namespace: ground
+  namespace: strata
 spec:
   replicas: 3
   version: "0.5.0"
   storage:
     type: s3
-    bucket: ground-prod
+    bucket: strata-prod
     tiering: { hot: 7d, warm: 30d }
   embedding:
     provider: ollama
@@ -977,12 +977,12 @@ spec:
 
 ```sql
 -- Right to access (Article 15)
-SELECT * FROM ground_export('entity_id', 'usr_42');
+SELECT * FROM strata_export('entity_id', 'usr_42');
 -- → Exporte TOUTES les données liées à usr_42 
 --   dans les 3 mémoires en JSON
 
 -- Right to erasure (Article 17)
-CALL ground_erase('entity_id', 'usr_42');
+CALL strata_erase('entity_id', 'usr_42');
 -- → Supprime dans episodic, semantic ET state
 -- → Supprime les vecteurs associés
 -- → Log l'opération dans l'audit trail
@@ -993,7 +993,7 @@ ALTER SOURCE 'analytics' SET RETENTION '30 days';
 -- → Les données sont automatiquement purgées
 
 -- Audit trail
-SELECT * FROM ground_audit_log
+SELECT * FROM strata_audit_log
 WHERE entity_id = 'usr_42'
 ORDER BY ts DESC;
 -- → Qui a accédé à quoi, quand, via quel agent
@@ -1072,7 +1072,7 @@ ORDER BY ts DESC;
 
 **Message clé** :
 > Vos agents IA sont aveugles. Ils opèrent sur des données périmées, fragmentées, incohérentes.
-> GroundDB leur donne la vue. Une source de vérité partagée, temps réel, on-premise.
+> Strata leur donne la vue. Une source de vérité partagée, temps réel, on-premise.
 > Déployez en 30 secondes. Gardez vos données chez vous.
 
 ### 9.2 Personas cibles
@@ -1108,12 +1108,12 @@ ORDER BY ts DESC;
 2. "Context Lake vs Data Lake vs Vector DB — what's the difference?" (éducation)
 3. "Deploy a shared context layer for your AI agents in 30 seconds" (tutorial)
 4. "How we built a PostgreSQL-compatible context lake in Rust" (build in public)
-5. "MCP + GroundDB: Give Claude access to your company's brain" (integration guide)
+5. "MCP + Strata: Give Claude access to your company's brain" (integration guide)
 6. "GDPR-ready AI infrastructure: why on-premise matters" (positioning EU)
-7. "From Mem0 to GroundDB: when your agents need more than memory" (comparison)
+7. "From Mem0 to Strata: when your agents need more than memory" (comparison)
 8. "Real-time fraud detection with a context lake" (use case deep dive)
-9. "Self-hosted RAG in 5 minutes: GroundDB + Ollama + your docs" (tutorial)
-10. "The architecture behind GroundDB: Rust, DuckDB, and zero-copy vectors" (deep tech)
+9. "Self-hosted RAG in 5 minutes: Strata + Ollama + your docs" (tutorial)
+10. "The architecture behind Strata: Rust, DuckDB, and zero-copy vectors" (deep tech)
 
 #### Réseaux sociaux
 - **Twitter/X** : Build in public, partage de métriques, réponses aux threads sur agent memory
@@ -1130,14 +1130,14 @@ ORDER BY ts DESC;
 ### 9.4 Launch strategy (ProductHunt + HackerNews)
 
 **ProductHunt** :
-- Titre : "GroundDB — Open source context lake for AI agents"
+- Titre : "Strata — Open source context lake for AI agents"
 - Tagline : "Deploy in 30 seconds. Your agents share the same brain."
 - Jour : Mardi ou mercredi (meilleur traffic)
 - Assets : vidéo demo 60s, GIF d'un `docker run` → requête SQL → résultat
 - Hunters : solliciter un hunter connu dans l'IA
 
 **HackerNews (Show HN)** :
-- Titre : "Show HN: GroundDB – an open-source context lake for AI agents (Rust, PG-compatible)"
+- Titre : "Show HN: Strata – an open-source context lake for AI agents (Rust, PG-compatible)"
 - Body : problème → solution → demo → GitHub link
 - Timing : publication entre 8h et 10h EST (14h-16h Paris)
 
@@ -1175,13 +1175,13 @@ SEO ("context lake") ──→    SDK integration   ──→    Annual contract
 - Évoque : fondation, ancrage, mémoire, contexte, vérité
 - Domaine .dev ou .io disponible (ou .com)
 - Pas de conflit avec un produit existant majeur
-- Fonctionne comme commande CLI (`ground query ...`)
+- Fonctionne comme commande CLI (`strata query ...`)
 
 ### 10.2 Propositions classées
 
 | Rang | Nom | CLI | Domaines suggérés | Concept | Notes |
 |------|-----|-----|-------------------|---------|-------|
-| 1 | **GroundDB** | `ground` | grounddb.dev, grounddb.io | "Ground truth" — la vérité terrain. Les agents sont "grounded" dans la réalité. | Fort, clair, pas de conflit. Évoque l'ancrage, la fondation. |
+| 1 | **Strata** | `strata` | strata.dev, stratadb.dev | Couches géologiques — les strates de mémoire. | Élu. Élégant, évoque la profondeur et les couches de données. |
 | 2 | **Bedrock** | `bedrock` | getbedrock.dev, bedrock.run | La couche fondamentale. | ⚠️ Conflit potentiel avec AWS Bedrock. À éviter pour cette raison. |
 | 3 | **Strata** | `strata` | strata.dev, stratadb.dev | Couches géologiques — les strates de mémoire. | Élégant, évoque la profondeur. Vérifier les conflits. |
 | 4 | **Mnemonic** | `mnemo` | mnemonic.dev, mnemo.dev | Art de la mémoire (grec). | Culturel, peut être difficile à épeler. |
@@ -1199,11 +1199,11 @@ SEO ("context lake") ──→    SDK integration   ──→    Annual contract
 
 ### 10.3 Recommandation
 
-**GroundDB** est le choix le plus solide :
+**Strata** est le choix le plus solide :
 - "Ground truth" est un concept universellement compris en IA/ML
 - "Grounding" est le terme Bessemer/Forrester pour connecter l'IA à la réalité
-- `ground` en CLI est naturel : `ground query`, `ground ingest`, `ground status`
-- grounddb.dev est probablement disponible (nouveau TLD, niche)
+- `ground` en CLI est naturel : `strata query`, `strata ingest`, `strata status`
+- strata.dev est probablement disponible (nouveau TLD, niche)
 - Pas de conflit majeur identifié
 - Fonctionne aussi comme verbe : "Ground your agents in reality"
 
@@ -1213,11 +1213,11 @@ SEO ("context lake") ──→    SDK integration   ──→    Annual contract
 ### 10.4 Domaines à réserver (en priorité)
 
 ```
-grounddb.dev       ← principal
-grounddb.io        ← alternatif
-grounddb.com       ← si disponible
-getgrounddb.com    ← fallback
-ground-db.dev      ← protection
+strata.dev       ← principal
+strata.io        ← alternatif
+strata.com       ← si disponible
+getstrata.com    ← fallback
+strata-db.dev      ← protection
 ```
 
 Et si choix alternatif :
@@ -1271,22 +1271,22 @@ mnemos.dev / mnemos.io
   <img src="logo.svg" width="120" />
 </p>
 
-<h1 align="center">GroundDB</h1>
+<h1 align="center">Strata</h1>
 <p align="center">
   <strong>The open-source context lake for AI agents.</strong><br>
   Deploy in 30 seconds. Scale to millions. Keep your data on your servers.
 </p>
 
 <p align="center">
-  <a href="https://grounddb.dev/docs">Docs</a> •
-  <a href="https://grounddb.dev/docs/quickstart">Quickstart</a> •
-  <a href="https://discord.gg/grounddb">Discord</a> •
-  <a href="https://grounddb.dev/blog">Blog</a>
+  <a href="https://strata.dev/docs">Docs</a> •
+  <a href="https://strata.dev/docs/quickstart">Quickstart</a> •
+  <a href="https://discord.gg/strata">Discord</a> •
+  <a href="https://strata.dev/blog">Blog</a>
 </p>
 
 ---
 
-GroundDB is a **context lake** — a unified data layer that gives your AI agents
+Strata is a **context lake** — a unified data layer that gives your AI agents
 a shared, real-time understanding of reality. It combines three types of memory
 in a single engine:
 
@@ -1297,25 +1297,25 @@ in a single engine:
 All three are queried in a single ACID transaction, so every agent sees the same
 coherent snapshot of reality. No stale data. No conflicting views.
 
-## Why GroundDB?
+## Why Strata?
 
-| Problem | Without GroundDB | With GroundDB |
+| Problem | Without Strata | With Strata |
 |---------|------------------|---------------|
 | Agent A and B see different data | ✗ Conflicting decisions | ✓ Same snapshot, same reality |
 | Context is 5 minutes old | ✗ Fraud slips through | ✓ Sub-10ms freshness |
 | Need SQL + vectors + state | ✗ 3 separate databases | ✓ One engine, one query |
-| GDPR compliance | ✗ Data scattered everywhere | ✓ One `CALL ground_erase()` |
+| GDPR compliance | ✗ Data scattered everywhere | ✓ One `CALL strata_erase()` |
 | Connecting to Claude/GPT | ✗ Custom integration code | ✓ Built-in MCP server |
 
 ## Quick Start
 
 ```bash
-docker run -d -p 5432:5432 -p 8432:8432 grounddb/grounddb:latest
+docker run -d -p 5432:5432 -p 8432:8432 strata/strata:latest
 ```
 
 ```sql
 -- Connect with any PostgreSQL client
-psql -h localhost -U ground -d ground
+psql -h localhost -U strata -d strata
 
 -- Ingest an event
 INSERT INTO episodic (source, event_type, payload)
@@ -1330,13 +1330,13 @@ SELECT * FROM state WHERE agent_id = 'support-bot';
 
 ## MCP Integration
 
-GroundDB includes a built-in MCP server. Add it to Claude Desktop, Cursor,
+Strata includes a built-in MCP server. Add it to Claude Desktop, Cursor,
 or any MCP-compatible agent:
 
 ```json
 {
   "mcpServers": {
-    "grounddb": {
+    "strata": {
       "url": "http://localhost:8432/mcp"
     }
   }
@@ -1359,9 +1359,9 @@ or any MCP-compatible agent:
 
 | Mode | Command | Best for |
 |------|---------|----------|
-| Docker | `docker run grounddb/grounddb` | Dev, small prod |
+| Docker | `docker run strata/strata` | Dev, small prod |
 | Compose | `docker compose up` | Teams, medium prod |
-| Kubernetes | `helm install grounddb` | Enterprise, HA |
+| Kubernetes | `helm install strata` | Enterprise, HA |
 
 ## License
 
@@ -1374,7 +1374,7 @@ Apache 2.0 — Use it however you want.
 
 1. **Le problème** : Les agents IA sont aveugles. Ils opèrent sur des données fragmentées et périmées.
 2. **La taille du marché** : $100B+ investis dans l'IA en 2025. L'infra data pour agents est le prochain goulot d'étranglement (Bessemer, Forrester).
-3. **La solution** : GroundDB — context lake open source. 3 mémoires unifiées, PostgreSQL-compatible, MCP-natif.
+3. **La solution** : Strata — context lake open source. 3 mémoires unifiées, PostgreSQL-compatible, MCP-natif.
 4. **Le produit** : Demo live — `docker run` → ingestion → requête → résultat en 30 secondes.
 5. **Le marché** : Context lakes validés par Forrester (feb 2026). Tacnode est cloud-only/US. Zéro solution open source.
 6. **Le business model** : Open core (Community gratuit → Pro €49/nœud → Enterprise devis).
