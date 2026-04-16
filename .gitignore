@@ -31,6 +31,9 @@ coverage/
 
 # Runtime data
 /data/
+**/data/*.duckdb
+**/data/*.db-shm
+**/data/*.db-wal
 
 # Docker
 docker-compose.override.yml
