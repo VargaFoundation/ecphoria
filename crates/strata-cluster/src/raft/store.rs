@@ -247,13 +247,26 @@ impl MemStore {
         match req {
             // Events are already fully formed (ids + timestamps fixed by the leader), so apply
             // is deterministic across nodes.
-            AppRequest::Ingest { events } => match engine.ingest(events.clone()).await {
-                Ok(n) => AppResponse::Ingested(n),
-                Err(e) => {
-                    tracing::error!(error = %e, "raft apply: ingest failed");
-                    AppResponse::Ingested(0)
+            AppRequest::Ingest { events, tenant } => {
+                let result = match tenant {
+                    Some(t) => {
+                        engine
+                            .ingest_for_tenant(
+                                events.clone(),
+                                &strata_core::config::TenantContext::new(t.clone()),
+                            )
+                            .await
+                    }
+                    None => engine.ingest(events.clone()).await,
+                };
+                match result {
+                    Ok(n) => AppResponse::Ingested(n),
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft apply: ingest failed");
+                        AppResponse::Ingested(0)
+                    }
                 }
-            },
+            }
             AppRequest::StateSet {
                 agent_id,
                 key,
@@ -597,6 +610,7 @@ mod tests {
         let ev = strata_core::memory::episodic::Event::new("src", "e", serde_json::json!({"x": 1}));
         let req = AppRequest::Ingest {
             events: vec![ev.clone()],
+            tenant: None,
         };
 
         // ...applied on two independent nodes...

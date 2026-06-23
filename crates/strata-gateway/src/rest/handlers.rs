@@ -166,6 +166,9 @@ const MAX_INGEST_EVENTS: usize = 10_000;
 pub async fn ingest(
     State(engine): State<Arc<StrataEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
     Json(req): Json<IngestRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "ingest").increment(1);
@@ -213,6 +216,33 @@ pub async fn ingest(
     let tenant_id = auth
         .as_ref()
         .and_then(|Extension(ctx)| ctx.tenant_id.clone());
+
+    // Cluster mode: replicate the write through the Raft log (leader-forwarding has already
+    // routed it to the leader). Apply happens deterministically on every node via consensus.
+    if let Some(Extension(coord)) = cluster {
+        let coord = coord.read().await;
+        if coord.is_leader() {
+            let ar = strata_cluster::raft::types::AppRequest::Ingest {
+                events,
+                tenant: tenant_id,
+            };
+            let result = match coord.client_write(ar).await {
+                Ok(strata_cluster::raft::types::AppResponse::Ingested(n)) => {
+                    api_ok(serde_json::json!({ "ingested": n }))
+                }
+                Ok(_) => api_ok(serde_json::json!({ "ingested": 0 })),
+                Err(e) => api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INGEST_ERROR",
+                    e.to_string(),
+                ),
+            };
+            metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "ingest")
+                .record(start.elapsed().as_secs_f64());
+            return result;
+        }
+    }
+
     let ingest_result = if let Some(tid) = tenant_id {
         let tenant = strata_core::config::TenantContext::new(tid);
         engine.ingest_for_tenant(events, &tenant).await

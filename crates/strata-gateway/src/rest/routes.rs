@@ -157,6 +157,8 @@ pub fn router_with_engine_and_auth(
 
     // Apply leader-forwarding middleware if cluster mode is active
     if let Some(cluster_state) = cluster_state {
+        // Expose the coordinator to write handlers so they replicate through the Raft log.
+        api_routes = api_routes.layer(axum::Extension(cluster_state.coordinator.clone()));
         api_routes = api_routes.route_layer(axum::middleware::from_fn_with_state(
             cluster_state,
             crate::cluster::leader_forward::require_leader_for_writes,

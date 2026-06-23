@@ -17,8 +17,12 @@ pub type NodeId = u64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppRequest {
     /// Ingest fully-formed events (ids + timestamps assigned on the leader), so every node
-    /// applies an identical, deterministic result.
-    Ingest { events: Vec<Event> },
+    /// applies an identical, deterministic result. `tenant` scopes the ingest (None = default).
+    Ingest {
+        events: Vec<Event>,
+        #[serde(default)]
+        tenant: Option<String>,
+    },
     /// Set agent state.
     StateSet {
         agent_id: String,
@@ -109,11 +113,12 @@ mod tests {
                 "click",
                 serde_json::json!({"key": "val"}),
             )],
+            tenant: None,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: AppRequest = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            AppRequest::Ingest { events } => {
+            AppRequest::Ingest { events, .. } => {
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].source, "test");
             }

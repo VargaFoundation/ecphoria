@@ -272,7 +272,10 @@ mod tests {
         // Ingest through consensus.
         let ev = strata_core::memory::episodic::Event::new("src", "e", serde_json::json!({"x": 1}));
         let resp = coord
-            .client_write(AppRequest::Ingest { events: vec![ev] })
+            .client_write(AppRequest::Ingest {
+                events: vec![ev],
+                tenant: None,
+            })
             .await
             .unwrap();
         assert!(matches!(resp, AppResponse::Ingested(1)));
