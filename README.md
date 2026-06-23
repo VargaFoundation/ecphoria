@@ -33,8 +33,11 @@ the smarts run in your own single Rust binary, on your own infrastructure.
   completion provider is configured; otherwise stores the text deterministically.
 - **Mem0-compatible API + MCP-native** — drop-in `memories` REST endpoints and memory tools
   for Claude / Cursor / any MCP client.
-- **Benchmarkable** — `cargo run -p strata-core --example locomo_eval` runs a LoCoMo-style
-  recall@k + latency eval. No magic numbers behind the marketing.
+- **Benchmarkable** — `cargo run -p strata-core --example locomo_eval` runs a LoCoMo-style eval
+  reporting **recall@{1,3,5}, MRR, and ingest/query p50/p95**. Runs offline (pure-Rust BM25) out
+  of the box; point it at a real export with a provider for hybrid numbers:
+  `LOCOMO_PATH=your-locomo.json STRATA_EMBEDDING__PROVIDER=ollama cargo run -p strata-core --example locomo_eval`.
+  We don't publish leaderboard numbers we can't reproduce — run it on your data and see.
 
 ### Built on a unified three-store substrate
 

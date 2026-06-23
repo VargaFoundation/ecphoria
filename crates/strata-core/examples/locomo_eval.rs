@@ -112,18 +112,25 @@ async fn run() {
     let engine = StrataEngine::new(config).await.expect("engine");
 
     let dataset = load_dataset();
-    const K: usize = 5;
+    // Retrieve a deeper top-K so we can report recall@{1,3,5} + MRR from a single search.
+    const K: usize = 10;
     let mut total = 0usize;
-    let mut hits = 0usize;
-    let mut latencies_ms: Vec<f64> = Vec::new();
+    let mut stored = 0usize;
+    // 1-indexed rank of the first answer-bearing memory in the results (None = not in top-K).
+    let mut ranks: Vec<Option<usize>> = Vec::new();
+    let mut ingest_ms: Vec<f64> = Vec::new();
+    let mut query_ms: Vec<f64> = Vec::new();
 
     for convo in &dataset {
         let scope = MemoryScope::user(&convo.user);
         for turn in &convo.turns {
-            engine
+            let start = std::time::Instant::now();
+            let added = engine
                 .memory_remember(turn, &scope)
                 .await
                 .expect("remember");
+            ingest_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            stored += added.len();
         }
         for qa in &convo.qa {
             let start = std::time::Instant::now();
@@ -131,41 +138,74 @@ async fn run() {
                 .memory_search(&qa.question, &scope, K)
                 .await
                 .expect("search");
-            latencies_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            query_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
             let needle = qa.expected.to_lowercase();
-            let recalled = results
+            let rank = results
                 .iter()
-                .any(|h| h.memory.content.to_lowercase().contains(&needle));
-            total += 1;
-            if recalled {
-                hits += 1;
-            } else {
+                .position(|h| h.memory.content.to_lowercase().contains(&needle))
+                .map(|i| i + 1);
+            if rank.is_none() {
                 println!("  MISS: q={:?} expected={:?}", qa.question, qa.expected);
             }
+            ranks.push(rank);
+            total += 1;
         }
     }
 
-    latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |p: f64| {
-        if latencies_ms.is_empty() {
-            0.0
-        } else {
-            latencies_ms[((p * latencies_ms.len() as f64) as usize).min(latencies_ms.len() - 1)]
-        }
+    let denom = total.max(1) as f64;
+    let recall_at = |n: usize| {
+        ranks
+            .iter()
+            .filter(|r| matches!(r, Some(rk) if *rk <= n))
+            .count()
     };
+    let pct_of = |v: &mut Vec<f64>, p: f64| {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[((p * v.len() as f64) as usize).min(v.len() - 1)]
+    };
+    // Mean Reciprocal Rank — the standard rank-aware retrieval metric.
+    let mrr = ranks
+        .iter()
+        .map(|r| r.map(|rk| 1.0 / rk as f64).unwrap_or(0.0))
+        .sum::<f64>()
+        / denom;
 
     println!("\n── LoCoMo-style eval ──────────────────────────────");
-    println!("conversations: {}", dataset.len());
-    println!("questions:     {total}");
+    println!("conversations:    {}", dataset.len());
+    println!("memories stored:  {stored}");
+    println!("questions:        {total}");
     println!(
-        "recall@{K}:      {hits}/{total} = {:.1}%",
-        100.0 * hits as f64 / total.max(1) as f64
+        "recall@1:         {}/{total} = {:.1}%",
+        recall_at(1),
+        100.0 * recall_at(1) as f64 / denom
     );
-    println!("latency p50:   {:.2} ms", pct(0.50));
-    println!("latency p95:   {:.2} ms", pct(0.95));
     println!(
-        "mode:          {}",
+        "recall@3:         {}/{total} = {:.1}%",
+        recall_at(3),
+        100.0 * recall_at(3) as f64 / denom
+    );
+    println!(
+        "recall@5:         {}/{total} = {:.1}%",
+        recall_at(5),
+        100.0 * recall_at(5) as f64 / denom
+    );
+    println!("MRR:              {mrr:.3}");
+    println!(
+        "ingest  p50/p95:  {:.2} / {:.2} ms",
+        pct_of(&mut ingest_ms, 0.50),
+        pct_of(&mut ingest_ms, 0.95)
+    );
+    println!(
+        "query   p50/p95:  {:.2} / {:.2} ms",
+        pct_of(&mut query_ms, 0.50),
+        pct_of(&mut query_ms, 0.95)
+    );
+    println!(
+        "mode:             {}",
         if engine.semantic_count() > 0 {
             "hybrid (BM25 + vector)"
         } else {
