@@ -281,15 +281,15 @@ mod tests {
         assert!(matches!(resp, AppResponse::Ingested(1)));
         assert_eq!(engine.event_count().await.unwrap(), 1);
 
-        // Memory upsert through consensus.
-        let mem = strata_core::memory::cognition::Memory::new(
+        // Memory through consensus: the leader runs cognition to materialize the change-set
+        // (memory_plan, no local write), then replicates the rows through the log.
+        let input = strata_core::memory::cognition::MemoryInput::new(
             strata_core::memory::cognition::MemoryScope::user("alice"),
             "likes tea",
         );
+        let (_result, rows) = engine.memory_plan(input).await.unwrap();
         coord
-            .client_write(AppRequest::MemoryUpsert {
-                memories: vec![mem],
-            })
+            .client_write(AppRequest::MemoryUpsert { rows })
             .await
             .unwrap();
         assert_eq!(engine.memory_count().await.unwrap(), 1);

@@ -8,7 +8,8 @@ use crate::embedding::EmbeddingProvider;
 use crate::ingest::IngestPipeline;
 use crate::llm::CompletionProvider;
 use crate::memory::cognition::{
-    Memory, MemoryAdd, MemoryHit, MemoryInput, MemoryOutcome, MemoryScope, MemoryState, MemoryStore,
+    Memory, MemoryAdd, MemoryHit, MemoryInput, MemoryOutcome, MemoryRow, MemoryScope, MemoryState,
+    MemoryStore,
 };
 use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
@@ -601,7 +602,20 @@ impl StrataEngine {
     /// - Else, when an embedding provider is configured, a near-duplicate (cosine ≥
     ///   `dedup_threshold`) in the same scope is merged/updated (`Merged`).
     /// - Otherwise a fresh memory is inserted (`Inserted`).
-    pub async fn memory_add(&self, mut input: MemoryInput) -> Result<MemoryAdd> {
+    pub async fn memory_add(&self, input: MemoryInput) -> Result<MemoryAdd> {
+        let (result, rows) = self.memory_plan(input).await?;
+        self.memory_apply_rows(rows).await?;
+        Ok(result)
+    }
+
+    /// Compute the materialized change-set for adding a memory **without writing anything**.
+    ///
+    /// Runs the same deterministic cognition as [`Self::memory_add`] (subject contradiction →
+    /// semantic merge → insert) but returns the resulting [`MemoryRow`]s instead of applying
+    /// them. This lets the cluster leader run cognition once, propose the rows through Raft, and
+    /// have every node apply an identical result via [`Self::memory_apply_rows`] — avoiding the
+    /// failover-divergence of re-running non-deterministic logic (new uuids/timestamps) per node.
+    pub async fn memory_plan(&self, mut input: MemoryInput) -> Result<(MemoryAdd, Vec<MemoryRow>)> {
         if input.scope.tenant_id.is_empty() {
             input.scope.tenant_id = "default".into();
         }
@@ -618,24 +632,39 @@ impl StrataEngine {
                 .await?;
             if let Some(existing) = actives.first() {
                 if existing.content.trim() == input.content.trim() {
-                    self.memory_store
-                        .touch(existing.id, importance.max(existing.importance))
-                        .await?;
-                    let memory = self
-                        .memory_store
-                        .get(existing.id)
-                        .await?
-                        .unwrap_or_else(|| existing.clone());
-                    return Ok(MemoryAdd {
-                        memory,
-                        outcome: MemoryOutcome::Confirmed,
-                    });
+                    // Confirmed: bump importance + version; preserve the existing embedding when
+                    // we couldn't re-embed (else upsert_raw would NULL the stored vector).
+                    let mut m = existing.clone();
+                    m.importance = importance.max(existing.importance);
+                    m.version += 1;
+                    m.updated_at = chrono::Utc::now();
+                    let emb = match embedding.clone() {
+                        Some(e) => Some(e),
+                        None => self.memory_store.get_embedding(existing.id).await?,
+                    };
+                    return Ok((
+                        MemoryAdd {
+                            memory: m.clone(),
+                            outcome: MemoryOutcome::Confirmed,
+                        },
+                        vec![MemoryRow {
+                            memory: m,
+                            embedding: emb,
+                        }],
+                    ));
                 }
                 // Contradiction: supersede every active memory for this subject, insert new.
                 let now = chrono::Utc::now();
+                let mut rows: Vec<MemoryRow> = Vec::with_capacity(actives.len() + 1);
                 for a in &actives {
-                    self.memory_store.supersede(a.id, now).await?;
-                    let _ = self.memory_index.delete(a.id).await;
+                    let mut old = a.clone();
+                    old.state = MemoryState::Superseded;
+                    old.valid_to = Some(now);
+                    old.updated_at = now;
+                    rows.push(MemoryRow {
+                        memory: old,
+                        embedding: None,
+                    });
                 }
                 let mut mem = Memory::new(input.scope.clone(), input.content.clone());
                 mem.subject = Some(subject);
@@ -644,36 +673,38 @@ impl StrataEngine {
                 mem.valid_from = now;
                 mem.source_event_ids = input.source_event_ids.clone();
                 mem.metadata = input.metadata.clone();
-                self.persist_memory(&mem, embedding.as_deref()).await?;
-                return Ok(MemoryAdd {
-                    memory: mem,
-                    outcome: MemoryOutcome::Superseded,
+                rows.push(MemoryRow {
+                    memory: mem.clone(),
+                    embedding: embedding.clone(),
                 });
+                return Ok((
+                    MemoryAdd {
+                        memory: mem,
+                        outcome: MemoryOutcome::Superseded,
+                    },
+                    rows,
+                ));
             }
         } else if let Some(emb) = embedding.as_deref() {
             // 2. Semantic dedup/merge (subjectless facts, only when embeddings are available).
             let hits = self.memory_index_search(emb, &input.scope, 1).await?;
             if let Some(top) = hits.first() {
                 if top.score >= cog.dedup_threshold {
-                    let new_importance = importance.max(top.memory.importance);
-                    self.memory_store
-                        .merge_into(
-                            top.memory.id,
-                            &input.content,
-                            new_importance,
-                            embedding.as_deref(),
-                        )
-                        .await?;
-                    let memory = self
-                        .memory_store
-                        .get(top.memory.id)
-                        .await?
-                        .unwrap_or_else(|| top.memory.clone());
-                    self.index_memory(&memory, embedding.as_deref()).await;
-                    return Ok(MemoryAdd {
-                        memory,
-                        outcome: MemoryOutcome::Merged,
-                    });
+                    let mut m = top.memory.clone();
+                    m.content = input.content.clone();
+                    m.importance = importance.max(top.memory.importance);
+                    m.version += 1;
+                    m.updated_at = chrono::Utc::now();
+                    return Ok((
+                        MemoryAdd {
+                            memory: m.clone(),
+                            outcome: MemoryOutcome::Merged,
+                        },
+                        vec![MemoryRow {
+                            memory: m,
+                            embedding: embedding.clone(),
+                        }],
+                    ));
                 }
             }
         }
@@ -684,28 +715,42 @@ impl StrataEngine {
         mem.importance = importance;
         mem.source_event_ids = input.source_event_ids.clone();
         mem.metadata = input.metadata.clone();
-        self.persist_memory(&mem, embedding.as_deref()).await?;
-        Ok(MemoryAdd {
-            memory: mem,
-            outcome: MemoryOutcome::Inserted,
-        })
+        Ok((
+            MemoryAdd {
+                memory: mem.clone(),
+                outcome: MemoryOutcome::Inserted,
+            },
+            vec![MemoryRow {
+                memory: mem,
+                embedding,
+            }],
+        ))
     }
 
-    /// Persist a memory to DuckDB and (if embedded) to the vector index.
-    async fn persist_memory(&self, mem: &Memory, embedding: Option<&[f32]>) -> Result<()> {
-        self.memory_store.insert(mem, embedding).await?;
-        self.index_memory(mem, embedding).await;
-        Ok(())
-    }
-
-    /// Upsert a memory's vector into the (scoped) memory index, if an embedding exists.
-    async fn index_memory(&self, mem: &Memory, embedding: Option<&[f32]>) {
-        if let Some(emb) = embedding {
-            let _ = self
-                .memory_index
-                .upsert(&mem.to_semantic_entry(emb.to_vec()))
-                .await;
+    /// Apply a materialized memory change-set: persist each row and maintain the vector index
+    /// (active rows are (re)indexed when they carry an embedding; superseded/expired rows are
+    /// removed from the index). Deterministic — used by both [`Self::memory_add`] and Raft apply.
+    pub async fn memory_apply_rows(&self, rows: Vec<MemoryRow>) -> Result<u64> {
+        let n = rows.len() as u64;
+        for row in &rows {
+            self.memory_store
+                .upsert_raw(&row.memory, row.embedding.as_deref())
+                .await?;
+            match row.memory.state {
+                MemoryState::Active => {
+                    if let Some(emb) = &row.embedding {
+                        let _ = self
+                            .memory_index
+                            .upsert(&row.memory.to_semantic_entry(emb.clone()))
+                            .await;
+                    }
+                }
+                _ => {
+                    let _ = self.memory_index.delete(row.memory.id).await;
+                }
+            }
         }
+        Ok(n)
     }
 
     /// Scoped semantic search over the memory vector index.
@@ -865,18 +910,6 @@ impl StrataEngine {
     /// Total memory count (all states).
     pub async fn memory_count(&self) -> Result<u64> {
         self.memory_store.count().await
-    }
-
-    /// Apply a set of fully-materialized memory rows (Raft apply / replication).
-    ///
-    /// The leader runs the non-deterministic cognition (dedup / contradiction / LLM) and
-    /// proposes the resulting rows; every node replays them identically here. Returns the count.
-    pub async fn memory_apply_upsert(&self, memories: Vec<Memory>) -> Result<u64> {
-        let n = memories.len() as u64;
-        for mem in &memories {
-            self.memory_store.upsert_raw(mem, None).await?;
-        }
-        Ok(n)
     }
 
     /// Forget low-value memories via time-decay of importance (configurable half-life /

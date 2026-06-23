@@ -320,8 +320,8 @@ impl MemStore {
                 AppResponse::Ok
             }
             // Materialized memory rows (leader already ran cognition) → deterministic replay.
-            AppRequest::MemoryUpsert { memories } => {
-                match engine.memory_apply_upsert(memories.clone()).await {
+            AppRequest::MemoryUpsert { rows } => {
+                match engine.memory_apply_rows(rows.clone()).await {
                     Ok(n) => AppResponse::MemoryCount(n),
                     Err(e) => {
                         tracing::error!(error = %e, "raft apply: memory upsert failed");
@@ -654,7 +654,10 @@ mod tests {
         );
         let resp = store
             .apply_request(&AppRequest::MemoryUpsert {
-                memories: vec![mem],
+                rows: vec![strata_core::memory::cognition::MemoryRow {
+                    memory: mem,
+                    embedding: None,
+                }],
             })
             .await;
         assert!(matches!(resp, AppResponse::MemoryCount(1)));

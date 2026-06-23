@@ -48,10 +48,11 @@ pub enum AppRequest {
     /// Delete a semantic entry.
     SemanticDelete { id: uuid::Uuid },
     /// Replace materialized memory rows (the leader runs the non-deterministic cognition —
-    /// dedup / contradiction / LLM extraction — and proposes the resulting rows so every node
-    /// applies an identical result). Supersession is captured as upserts of the affected rows.
+    /// dedup / contradiction / LLM extraction — and proposes the resulting rows + embeddings so
+    /// every node applies an identical result). Supersession is captured as upserts of the
+    /// affected rows.
     MemoryUpsert {
-        memories: Vec<strata_core::memory::cognition::Memory>,
+        rows: Vec<strata_core::memory::cognition::MemoryRow>,
     },
     /// Delete a memory by id (deterministic).
     MemoryDelete { id: uuid::Uuid },
@@ -140,14 +141,18 @@ mod tests {
             "likes tea",
         );
         let req = AppRequest::MemoryUpsert {
-            memories: vec![mem],
+            rows: vec![strata_core::memory::cognition::MemoryRow {
+                memory: mem,
+                embedding: Some(vec![0.1, 0.2]),
+            }],
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: AppRequest = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            AppRequest::MemoryUpsert { memories } => {
-                assert_eq!(memories.len(), 1);
-                assert_eq!(memories[0].content, "likes tea");
+            AppRequest::MemoryUpsert { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].memory.content, "likes tea");
+                assert_eq!(rows[0].embedding.as_deref(), Some(&[0.1, 0.2][..]));
             }
             _ => panic!("wrong variant"),
         }

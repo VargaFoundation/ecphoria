@@ -339,6 +339,16 @@ pub fn scope_matches_metadata(scope: &MemoryScope, metadata: &serde_json::Value)
     true
 }
 
+/// A fully-materialized memory row plus its embedding — the unit replicated through Raft so a
+/// follower can persist the row AND (re)index its vector without re-running cognition. The leader
+/// computes these via [`crate::StrataEngine::memory_plan`]; every node applies them identically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRow {
+    pub memory: Memory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+}
+
 /// Bi-temporal memory store backed by DuckDB.
 ///
 /// Mirrors [`super::episodic::EpisodicStore`]: one write connection + a round-robin pool of
@@ -459,7 +469,11 @@ impl MemoryStore {
         let metadata_str: Option<String> = row.get(16).ok().flatten();
 
         let parse_ts = |s: &str| {
+            // DuckDB renders TIMESTAMPTZ::VARCHAR as "YYYY-MM-DD HH:MM:SS.ffffff+00" (space
+            // separator, short offset) — not RFC3339 — so try both forms before giving up.
             DateTime::parse_from_rfc3339(s)
+                .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z"))
+                .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%#z"))
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now())
         };
@@ -898,6 +912,23 @@ impl MemoryStore {
             .filter_map(|r| r.ok())
             .filter(|(_, e)| !e.is_empty())
             .collect())
+    }
+
+    /// Load just the persisted embedding for a memory id (None if absent/null). Used to preserve
+    /// an existing vector when re-materializing a memory that wasn't re-embedded.
+    pub async fn get_embedding(&self, id: Uuid) -> crate::Result<Option<Vec<f32>>> {
+        let db = self.read_conn();
+        let mut stmt = db
+            .prepare("SELECT embedding::VARCHAR FROM memories WHERE id = ?")
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        match stmt.query_row([id.to_string()], |r| r.get::<_, Option<String>>(0)) {
+            Ok(Some(s)) => Ok(serde_json::from_str::<Vec<f32>>(&s)
+                .ok()
+                .filter(|e| !e.is_empty())),
+            Ok(None) => Ok(None),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(crate::Error::Query(e.to_string())),
+        }
     }
 }
 

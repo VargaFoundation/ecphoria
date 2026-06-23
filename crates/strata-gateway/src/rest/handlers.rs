@@ -847,6 +847,9 @@ fn scope_from(
 pub async fn memory_add(
     State(engine): State<Arc<StrataEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
     Json(req): Json<MemoryAddRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_add").increment(1);
@@ -874,6 +877,27 @@ pub async fn memory_add(
         source_event_ids: vec![],
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
     };
+
+    // Cluster mode: run cognition on the leader to materialize the change-set, then replicate it
+    // through the Raft log (never apply directly off-leader). Followers replay identical rows.
+    if let Some(Extension(coord)) = cluster {
+        let (result, rows) = match engine.memory_plan(input).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "MEMORY_ERROR",
+                    e.to_string(),
+                )
+            }
+        };
+        let coord = coord.read().await;
+        let ar = strata_cluster::raft::types::AppRequest::MemoryUpsert { rows };
+        return match coord.client_write(ar).await {
+            Ok(_) => api_ok(serde_json::to_value(result).unwrap_or_default()),
+            Err(e) => cluster_write_error(e),
+        };
+    }
 
     match engine.memory_add(input).await {
         Ok(added) => api_ok(serde_json::to_value(added).unwrap_or_default()),
