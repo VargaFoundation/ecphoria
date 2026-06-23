@@ -13,11 +13,11 @@ LLM proxy) into calls on `strata_core::StrataEngine`. Also handles authenticatio
 | REST API | **Working** | axum router with health/query/ingest/search/state/webhook/session/retention endpoints, 16MB body limit, 10K event batch limit, Prometheus metrics per endpoint, X-Request-Id correlation |
 | HTTP Server | **Working** | Binds port, graceful shutdown, 30s timeout (TimeoutLayer), CORS (restrictive when auth enabled), tracing |
 | PG Wire | **Working** | pgwire SimpleQuery + ExtendedQuery, full type mapping (20+ DuckDB types -> PG OIDs), connection limit (Semaphore, default 256) |
-| MCP Server | **Working** | JSON-RPC at /mcp: initialize, tools/list (9 tools with inputSchema), tools/call, resources/list, prompts/list |
-| MCP tools | **Working** | query, ingest, get_state, set_state, search, embed, start_session, end_session, recall_session |
-| gRPC | **Working** | tonic service for Query/Ingest/Search/State/Health RPCs, 16MB max message size |
-| LLM proxy | **Working** | /v1/chat/completions with auto-RAG (semantic + episodic), semantic response cache with vector similarity, multi-provider (OpenAI/Ollama/Anthropic with API translation) |
-| Auth | **Working** | API key, JWT HS256, OIDC RS256 (JWKS), RBAC (admin/writer/reader/agent), per-key rate limiting, tenant_id scoping, audit logging |
+| MCP Server | **Working** | JSON-RPC over HTTP **POST** at /mcp (not full Streamable HTTP — Claude Code native; Claude Desktop via `mcp-remote`). initialize, tools/list (15 tools), tools/call, resources/list, prompts/list. Authenticated when `auth_enabled`. See docs/connect-claude.md |
+| MCP tools | **Working** | query, ingest, get_state, set_state, search, embed, start/end/recall_session + **memory tools**: add_memory, search_memory, get_memories, memory_history, delete_memory, remember |
+| gRPC | **Working** | tonic Query/Ingest/Search/State/Health RPCs, 16MB max message. **Authenticated** (Bearer JWT in metadata) + **tenant-scoped** when auth_enabled |
+| LLM proxy | **Working** | /v1/chat/completions with auto-RAG (semantic + episodic + **tenant-scoped user memories**), semantic response cache, multi-provider (OpenAI/Ollama/Anthropic), **single-turn tool-use** passthrough. No streaming yet |
+| Auth | **Working** | API key, JWT HS256, OIDC RS256 (JWKS), RBAC, per-key rate limiting, **durable (file-backed) audit log**, and **tenant isolation enforced on all read paths** (SQL/memories/semantic/state/schema/sessions) across REST + MCP + proxy + gRPC |
 | OIDC | **Working** | RS256 JWKS validation, configurable issuer/audience/role_claim, auto-refresh with TTL cache |
 | Cluster routes | **Working** | /raft/append, /raft/vote, /raft/snapshot (inter-node RPC), /cluster/status |
 | Leader forwarding | **Working** | Middleware returns 307 redirect for writes on follower nodes, serves reads locally |
@@ -58,7 +58,7 @@ LLM proxy) into calls on `strata_core::StrataEngine`. Also handles authenticatio
 
 ## Testing
 
-- `cargo test -p strata-gateway` (88 tests)
+- `cargo test -p strata-gateway` (96 tests, incl. gRPC tenant isolation + proxy tool-use translation)
 - Integration tests in `tests/integration/` (12 tests covering sessions, schema, MCP, batch limits, retention)
 - Gateway lifecycle tests verify start/shutdown with port 0
 - Auth middleware tests verify API key, JWT, RBAC, rate limiting
