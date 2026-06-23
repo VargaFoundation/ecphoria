@@ -203,7 +203,10 @@ impl StrataEngine {
         mut events: Vec<Event>,
         tenant: &crate::config::TenantContext,
     ) -> Result<u64> {
-        // Tag each event's payload with the tenant_id
+        // Tag each event's payload with the tenant so the episodic store sets the tenant_id
+        // column per-row AT INSERT TIME (atomic, race-free, deterministic for Raft apply),
+        // and so the embedding metadata carries the tenant. No post-insert UPDATE — that was
+        // a cross-tenant leak under concurrency and a non-determinism hazard in cluster apply.
         for event in &mut events {
             if let serde_json::Value::Object(ref mut map) = event.payload {
                 map.insert(
@@ -212,23 +215,7 @@ impl StrataEngine {
                 );
             }
         }
-        // After ingest, update the tenant_id column
-        let count = self.ingest.ingest(events).await?;
-
-        // Batch update tenant_id for events that don't have one
-        let tenant_id = tenant.tenant_id.clone();
-        let episodic = self.episodic.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = episodic.write_conn();
-            let _ = db.execute(
-                "UPDATE episodic SET tenant_id = ? WHERE tenant_id = 'default' OR tenant_id IS NULL",
-                duckdb::params![tenant_id],
-            );
-        })
-        .await
-        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("join: {e}")))?;
-
-        Ok(count)
+        self.ingest.ingest(events).await
     }
 
     /// Query events by source.
@@ -1407,10 +1394,10 @@ impl StrataEngine {
 
 /// Separator that namespaces an `agent_id` by tenant for state isolation. A control char
 /// (unit separator) that is extremely unlikely to occur in a real agent id.
-const TENANT_AGENT_SEP: char = '\u{1f}';
+pub(crate) const TENANT_AGENT_SEP: char = '\u{1f}';
 
 /// Namespace an agent id by tenant so agent state is isolated per tenant.
-fn scoped_agent(tenant: &str, agent_id: &str) -> String {
+pub(crate) fn scoped_agent(tenant: &str, agent_id: &str) -> String {
     format!("{tenant}{TENANT_AGENT_SEP}{agent_id}")
 }
 
@@ -1783,5 +1770,71 @@ mod tests {
             dst.state_get("bot", "mood").await.unwrap().unwrap().value,
             serde_json::json!("happy")
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_tenant_ingest_does_not_cross_tag() {
+        let engine = Arc::new(StrataEngine::new(inmem_config()).await.unwrap());
+        let (e1, e2) = (engine.clone(), engine.clone());
+        let h1 = tokio::spawn(async move {
+            for i in 0..50 {
+                e1.ingest_for_tenant(
+                    vec![Event::new("a", "e", serde_json::json!({ "n": i }))],
+                    &crate::config::TenantContext::new("tenant-a"),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let h2 = tokio::spawn(async move {
+            for i in 0..50 {
+                e2.ingest_for_tenant(
+                    vec![Event::new("b", "e", serde_json::json!({ "n": i }))],
+                    &crate::config::TenantContext::new("tenant-b"),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // Each tenant sees EXACTLY its own 50 events — no cross-tagging under concurrency.
+        let a = engine
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "tenant-a")
+            .await
+            .unwrap();
+        assert_eq!(a[0]["c"], "50");
+        let b = engine
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "tenant-b")
+            .await
+            .unwrap();
+        assert_eq!(b[0]["c"], "50");
+    }
+
+    #[tokio::test]
+    async fn strata_state_sql_function_is_tenant_scoped() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .state_set_for_tenant("tenant-a", "bot", "secret", serde_json::json!("a-value"))
+            .await
+            .unwrap();
+
+        // tenant-b querying the same agent/key via strata_state() sees nothing.
+        let rows = engine
+            .query_sql_for_tenant("SELECT * FROM strata_state('bot', 'secret')", "tenant-b")
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "strata_state() leaked tenant-a state to tenant-b!"
+        );
+
+        // tenant-a sees its own.
+        let rows = engine
+            .query_sql_for_tenant("SELECT * FROM strata_state('bot', 'secret')", "tenant-a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

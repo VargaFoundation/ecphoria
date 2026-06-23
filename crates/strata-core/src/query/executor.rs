@@ -103,7 +103,22 @@ impl QueryExecutor {
             .next()
             .ok_or_else(|| crate::Error::Embedding("embedding returned empty result".into()))?;
 
-        let results = self.semantic.search(&vector, k).await?;
+        // Tenant-scoped queries only ever see their own event embeddings.
+        let results = match &self.tenant {
+            Some(t) => {
+                let t = t.clone();
+                self.semantic
+                    .search_filtered(&vector, k, move |e| {
+                        e.metadata
+                            .get("tenant_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("default")
+                            == t
+                    })
+                    .await?
+            }
+            None => self.semantic.search(&vector, k).await?,
+        };
 
         Ok(results
             .into_iter()
@@ -124,9 +139,15 @@ impl QueryExecutor {
         agent_id: &str,
         key: &str,
     ) -> crate::Result<Vec<serde_json::Value>> {
-        match self.state.get(agent_id, key).await? {
+        // Tenant-scoped queries namespace the agent so they can't read another tenant's state.
+        let scoped = match &self.tenant {
+            Some(t) => crate::engine::scoped_agent(t, agent_id),
+            None => agent_id.to_string(),
+        };
+        match self.state.get(&scoped, key).await? {
             Some(entry) => Ok(vec![serde_json::json!({
-                "agent_id": entry.agent_id,
+                // Return the caller's un-prefixed agent_id, not the internal namespaced one.
+                "agent_id": agent_id,
                 "key": entry.key,
                 "value": entry.value,
                 "version": entry.version,

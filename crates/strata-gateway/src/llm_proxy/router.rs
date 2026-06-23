@@ -74,8 +74,13 @@ pub struct Usage {
 /// Handle /v1/chat/completions — OpenAI-compatible endpoint with auto-RAG.
 pub async fn chat_completions(
     State(engine): State<Arc<StrataEngine>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthContext>>,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Json<serde_json::Value> {
+    // Tenant for memory-RAG scoping (so the proxy can't leak one tenant's memories to another).
+    let req_tenant = auth
+        .as_ref()
+        .and_then(|axum::Extension(c)| c.tenant_id.clone());
     // 1. Extract last user message for context search
     let user_query = req
         .messages
@@ -146,10 +151,13 @@ pub async fn chat_completions(
     // scoped by the standard OpenAI `user` field. This feeds the cognition layer into RAG.
     if let Some(user) = req.user.as_deref().filter(|u| !u.is_empty()) {
         if !user_query.is_empty() {
-            if let Ok(hits) = engine
-                .memory_search(&user_query, &MemoryScope::user(user), 5)
-                .await
-            {
+            let scope = MemoryScope {
+                tenant_id: req_tenant.clone().unwrap_or_else(|| "default".to_string()),
+                user_id: Some(user.to_string()),
+                agent_id: None,
+                session_id: None,
+            };
+            if let Ok(hits) = engine.memory_search(&user_query, &scope, 5).await {
                 let memory_lines: Vec<String> = hits
                     .iter()
                     .map(|h| {

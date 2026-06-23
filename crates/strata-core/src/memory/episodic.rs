@@ -206,11 +206,14 @@ impl EpisodicStore {
             .map_err(|e| crate::Error::Ingest(format!("begin transaction: {e}")))?;
 
         let result = (|| {
-            // Use INSERT OR IGNORE so that duplicate idempotency_keys are silently skipped
+            // Use INSERT OR IGNORE so that duplicate idempotency_keys are silently skipped.
+            // tenant_id is set per-row here (from the payload's `_tenant_id`, injected by
+            // ingest_for_tenant) so tenant tagging is atomic and race-free — never via a
+            // post-insert UPDATE that could mis-tag concurrent batches.
             let mut stmt = db
                 .prepare(
-                    "INSERT OR IGNORE INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags, idempotency_key)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags, idempotency_key, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
 
@@ -225,6 +228,11 @@ impl EpisodicStore {
                 } else {
                     Some(event.tags.join(","))
                 };
+                let tenant = event
+                    .payload
+                    .get("_tenant_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
                 let rows = stmt
                     .execute(duckdb::params![
                         event.id.to_string(),
@@ -236,6 +244,7 @@ impl EpisodicStore {
                         event.trace_id,
                         tags_str,
                         event.idempotency_key,
+                        tenant,
                     ])
                     .map_err(|e| crate::Error::Ingest(format!("insert error: {e}")))?;
                 inserted += rows as u64;
