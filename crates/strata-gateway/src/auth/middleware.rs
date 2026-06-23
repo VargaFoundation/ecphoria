@@ -139,6 +139,20 @@ impl AuthState {
     pub fn audit_log(&self) -> Option<&AuditLog> {
         self.audit_log.as_ref()
     }
+
+    /// Make the audit log durable (file-backed) at `path`. Empty or `:memory:` keeps it
+    /// in-memory. Enterprise/compliance deployments should set a real path.
+    pub fn with_audit_path(mut self, path: &str) -> Self {
+        if !path.is_empty() && path != ":memory:" {
+            match AuditLog::open(std::path::Path::new(path)) {
+                Ok(log) => self.audit_log = Some(log),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open durable audit log — keeping in-memory")
+                }
+            }
+        }
+        self
+    }
 }
 
 // ── Backwards-compatible ApiKeyStore alias ────────────────────────────

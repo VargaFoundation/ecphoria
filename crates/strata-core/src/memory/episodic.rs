@@ -426,6 +426,85 @@ impl EpisodicStore {
         Ok(results)
     }
 
+    /// Execute a read-only SQL query scoped to a single tenant.
+    ///
+    /// Rewrites every `episodic` table reference (via the SQL AST — never string literals) to a
+    /// per-tenant filtered view, so a tenant can only ever read its own rows. Fails **closed**:
+    /// if the SQL cannot be parsed/scoped, it is rejected rather than run unscoped.
+    pub fn query_sql_for_tenant(
+        &self,
+        sql: &str,
+        tenant: &str,
+        max_rows: usize,
+    ) -> crate::Result<Vec<serde_json::Value>> {
+        let view = Self::tenant_view_name(tenant);
+        // Ensure the per-tenant filtered view exists (idempotent; catalog is shared with readers).
+        {
+            let db = self.write_db.lock();
+            let escaped = tenant.replace('\'', "''");
+            db.execute_batch(&format!(
+                "CREATE OR REPLACE VIEW {view} AS SELECT * FROM episodic WHERE tenant_id = '{escaped}'"
+            ))
+            .map_err(|e| crate::Error::Query(format!("create tenant view: {e}")))?;
+        }
+        let rewritten = Self::scope_sql_to_view(sql, &view)?;
+        self.query_sql_limited(&rewritten, max_rows)
+    }
+
+    /// Deterministic, collision-resistant, SQL-safe view name for a tenant.
+    fn tenant_view_name(tenant: &str) -> String {
+        let mut sani: String = tenant
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        sani.truncate(40);
+        // FNV-1a so distinct tenants never share a view even if they sanitize alike.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in tenant.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("episodic__t_{sani}_{h:016x}")
+    }
+
+    /// Rewrite `episodic` relation references to `view` via the SQL AST (not string matching).
+    fn scope_sql_to_view(sql: &str, view: &str) -> crate::Result<String> {
+        use sqlparser::ast::{Ident, ObjectName};
+        use sqlparser::dialect::DuckDbDialect;
+        use sqlparser::parser::Parser;
+        use std::ops::ControlFlow;
+
+        let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)
+            .map_err(|e| crate::Error::Query(format!("SQL parse error (tenant scope): {e}")))?;
+        if statements.is_empty() {
+            return Err(crate::Error::Query("empty SQL statement".into()));
+        }
+        for stmt in statements.iter_mut() {
+            let _ = sqlparser::ast::visit_relations_mut(stmt, |name: &mut ObjectName| {
+                if name
+                    .0
+                    .last()
+                    .map(|i| i.value.eq_ignore_ascii_case("episodic"))
+                    .unwrap_or(false)
+                {
+                    *name = ObjectName(vec![Ident::new(view)]);
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        Ok(statements
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+
     /// Return the total number of stored events.
     pub async fn count(&self) -> crate::Result<u64> {
         let db = self.read_conn();
@@ -433,6 +512,44 @@ impl EpisodicStore {
             .query_row("SELECT count(*) FROM episodic", [], |row| row.get(0))
             .map_err(|e| crate::Error::Query(e.to_string()))?;
         Ok(count as u64)
+    }
+
+    /// Atomically restore the episodic table from a DuckDB `EXPORT DATABASE` directory.
+    ///
+    /// Imports into a throwaway **staging** database first, then swaps into the live table
+    /// inside a single transaction. A corrupt/missing snapshot therefore fails *before* the
+    /// live data is touched — unlike a bare `DELETE` + `IMPORT`, which loses data if the
+    /// import fails. Used by the Raft snapshot-install path.
+    pub fn restore_from_export(&self, export_dir: &Path, staging_path: &Path) -> crate::Result<()> {
+        let export_str = export_dir.to_string_lossy();
+        let staging_str = staging_path.to_string_lossy();
+
+        // 1. Import the snapshot into a fresh staging DB, off to the side. If the snapshot
+        //    is missing/corrupt this fails here and the live table is never modified.
+        {
+            let staging = Connection::open(staging_path)
+                .map_err(|e| crate::Error::Storage(format!("open staging db: {e}")))?;
+            staging
+                .execute_batch(&format!("IMPORT DATABASE '{export_str}'"))
+                .map_err(|e| crate::Error::Storage(format!("import snapshot: {e}")))?;
+        }
+
+        // 2. Swap into the live table transactionally; roll back on any failure.
+        let db = self.write_db.lock();
+        let swap = format!(
+            "ATTACH '{staging_str}' AS snap (READ_ONLY);
+             BEGIN TRANSACTION;
+             DELETE FROM episodic;
+             INSERT INTO episodic SELECT * FROM snap.episodic;
+             COMMIT;"
+        );
+        if let Err(e) = db.execute_batch(&swap) {
+            let _ = db.execute_batch("ROLLBACK");
+            let _ = db.execute_batch("DETACH snap");
+            return Err(crate::Error::Storage(format!("restore swap failed: {e}")));
+        }
+        let _ = db.execute_batch("DETACH snap");
+        Ok(())
     }
 
     // ── Session Management ──────────────────────────────────────────
@@ -717,6 +834,90 @@ mod tests {
 
         store.append(&[e1, e2]).await.unwrap();
         assert_eq!(store.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn restore_from_export_replaces_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let export_dir = dir.path().join("export");
+
+        // Build a source store with two events and EXPORT it.
+        {
+            let src = EpisodicStore::open(&dir.path().join("src.duckdb")).unwrap();
+            src.append(&[make_event("snap", "e1"), make_event("snap", "e2")])
+                .await
+                .unwrap();
+            let db = src.write_conn();
+            db.execute_batch(&format!(
+                "EXPORT DATABASE '{}'",
+                export_dir.to_string_lossy()
+            ))
+            .unwrap();
+        }
+
+        // Target has unrelated data; restore replaces it with the snapshot's.
+        let tgt = EpisodicStore::new();
+        tgt.append(&[make_event("old", "x")]).await.unwrap();
+        assert_eq!(tgt.count().await.unwrap(), 1);
+
+        tgt.restore_from_export(&export_dir, &dir.path().join("staging.duckdb"))
+            .unwrap();
+        assert_eq!(tgt.count().await.unwrap(), 2);
+        assert_eq!(tgt.query_by_source("snap", 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restore_from_bad_export_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgt = EpisodicStore::new();
+        tgt.append(&[make_event("keep", "x")]).await.unwrap();
+
+        // A missing/corrupt snapshot must fail without destroying live data.
+        let res =
+            tgt.restore_from_export(&dir.path().join("nope"), &dir.path().join("staging.duckdb"));
+        assert!(res.is_err());
+        assert_eq!(tgt.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_sql_for_tenant_isolates_rows() {
+        let store = EpisodicStore::new();
+        store
+            .append(&[make_event("appA", "e"), make_event("appB", "e")])
+            .await
+            .unwrap();
+        {
+            let db = store.write_conn();
+            db.execute(
+                "UPDATE episodic SET tenant_id = 'tenant-a' WHERE source = 'appA'",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE episodic SET tenant_id = 'tenant-b' WHERE source = 'appB'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // tenant-a sees ONLY its row, even with `SELECT *`.
+        let rows = store
+            .query_sql_for_tenant("SELECT source FROM episodic", "tenant-a", 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"], "appA");
+
+        // A string literal 'episodic' must NOT be rewritten (AST-only, not text matching).
+        let lit = store
+            .query_sql_for_tenant("SELECT 'episodic'::VARCHAR AS lit", "tenant-a", 100)
+            .unwrap();
+        assert_eq!(lit[0]["lit"], "episodic");
+
+        // Injection in the tenant id is neutralized (escaped → matches nothing, no error).
+        let inj = store
+            .query_sql_for_tenant("SELECT source FROM episodic", "x' OR '1'='1", 100)
+            .unwrap();
+        assert_eq!(inj.len(), 0);
     }
 
     #[tokio::test]

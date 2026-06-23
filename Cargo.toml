@@ -90,8 +90,8 @@ parking_lot = { version = "0.12" }
 dashmap = { version = "6" }
 rand = { version = "0.9" }
 
-# SQL parsing
-sqlparser = { version = "0.53" }
+# SQL parsing (visitor feature: AST rewriting for tenant scoping)
+sqlparser = { version = "0.53", features = ["visitor"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

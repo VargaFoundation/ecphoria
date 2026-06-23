@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 use reqwest::Client;
+use strata_core::memory::cognition::MemoryScope;
 use strata_core::StrataEngine;
 
 use super::providers::LlmProvider;
@@ -28,6 +29,15 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Standard OpenAI `user` field — used to scope auto-RAG to that user's memories.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// OpenAI-style tool definitions, passed through (translated) to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
+    /// OpenAI-style tool_choice, passed through (translated) to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -132,7 +142,34 @@ pub async fn chat_completions(
         }
     }
 
-    // 2c. Inject combined context into the conversation
+    // 2c. User memories: hybrid (BM25 + vector) search over the user's distilled memories,
+    // scoped by the standard OpenAI `user` field. This feeds the cognition layer into RAG.
+    if let Some(user) = req.user.as_deref().filter(|u| !u.is_empty()) {
+        if !user_query.is_empty() {
+            if let Ok(hits) = engine
+                .memory_search(&user_query, &MemoryScope::user(user), 5)
+                .await
+            {
+                let memory_lines: Vec<String> = hits
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "- {}",
+                            h.memory.content.chars().take(300).collect::<String>()
+                        )
+                    })
+                    .collect();
+                if !memory_lines.is_empty() {
+                    context_sections.push(format!(
+                        "### What we remember about this user\n{}",
+                        memory_lines.join("\n")
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2d. Inject combined context into the conversation
     if !context_sections.is_empty() {
         let context_block = format!(
             "## Context from Strata\nThe following context was automatically retrieved from Strata's memory stores.\n\n{}",
@@ -302,6 +339,13 @@ async fn forward_to_anthropic(
     if let Some(temp) = req.temperature {
         body["temperature"] = serde_json::json!(temp);
     }
+    // Tool-use passthrough (single-turn): translate OpenAI tools → Anthropic.
+    if let Some(ref tools) = req.tools {
+        body["tools"] = openai_tools_to_anthropic(tools);
+        if let Some(ref tc) = req.tool_choice {
+            body["tool_choice"] = openai_tool_choice_to_anthropic(tc);
+        }
+    }
 
     match http
         .post("https://api.anthropic.com/v1/messages")
@@ -314,14 +358,21 @@ async fn forward_to_anthropic(
     {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(anthropic_resp) => {
-                // Translate Anthropic response back to OpenAI format
-                let content = anthropic_resp
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|block| block.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                // Check for API error first.
+                if let Some(err) = anthropic_resp.get("error") {
+                    return error_response(
+                        err.get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Anthropic API error"),
+                    );
+                }
+
+                // Translate Anthropic content blocks → OpenAI text + tool_calls.
+                let (content_text, tool_calls) = anthropic_content_to_openai(
+                    anthropic_resp
+                        .get("content")
+                        .unwrap_or(&serde_json::Value::Null),
+                );
 
                 let usage_in = anthropic_resp
                     .get("usage")
@@ -334,13 +385,23 @@ async fn forward_to_anthropic(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // Check for API error
-                if let Some(err) = anthropic_resp.get("error") {
-                    return error_response(
-                        err.get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("Anthropic API error"),
-                    );
+                let finish_reason = match anthropic_resp
+                    .get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("end_turn")
+                {
+                    "tool_use" => "tool_calls",
+                    "max_tokens" => "length",
+                    "end_turn" | "stop_sequence" => "stop",
+                    other => other,
+                };
+
+                let mut message = serde_json::json!({
+                    "role": "assistant",
+                    "content": content_text,
+                });
+                if !tool_calls.is_empty() {
+                    message["tool_calls"] = serde_json::Value::Array(tool_calls);
                 }
 
                 Json(serde_json::json!({
@@ -350,14 +411,8 @@ async fn forward_to_anthropic(
                     "model": req.model,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content,
-                        },
-                        "finish_reason": anthropic_resp
-                            .get("stop_reason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("stop"),
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }],
                     "usage": {
                         "prompt_tokens": usage_in,
@@ -370,6 +425,82 @@ async fn forward_to_anthropic(
         },
         Err(e) => error_response(&format!("Anthropic request failed: {e}")),
     }
+}
+
+/// Translate OpenAI `tools` (`[{type:function, function:{name,description,parameters}}]`)
+/// into Anthropic `tools` (`[{name,description,input_schema}]`).
+fn openai_tools_to_anthropic(tools: &serde_json::Value) -> serde_json::Value {
+    let out: Vec<serde_json::Value> = tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let f = t.get("function").unwrap_or(t);
+                    let name = f.get("name")?.as_str()?;
+                    let mut obj = serde_json::json!({ "name": name });
+                    if let Some(d) = f.get("description").and_then(|v| v.as_str()) {
+                        obj["description"] = serde_json::json!(d);
+                    }
+                    obj["input_schema"] = f
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                    Some(obj)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(out)
+}
+
+/// Translate OpenAI `tool_choice` into Anthropic's `tool_choice`.
+fn openai_tool_choice_to_anthropic(tc: &serde_json::Value) -> serde_json::Value {
+    match tc {
+        serde_json::Value::String(s) if s == "required" || s == "any" => {
+            serde_json::json!({"type": "any"})
+        }
+        serde_json::Value::Object(_) => tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|name| serde_json::json!({"type": "tool", "name": name}))
+            .unwrap_or_else(|| serde_json::json!({"type": "auto"})),
+        // "auto", "none", or anything else → let the model decide.
+        _ => serde_json::json!({"type": "auto"}),
+    }
+}
+
+/// Translate an Anthropic response `content` array into OpenAI `(text, tool_calls)`.
+fn anthropic_content_to_openai(content: &serde_json::Value) -> (String, Vec<serde_json::Value>) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let input = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    tool_calls.push(serde_json::json!({
+                        "id": block.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                            "arguments": input.to_string(),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    (text, tool_calls)
 }
 
 fn error_response(message: &str) -> Json<serde_json::Value> {
@@ -406,6 +537,58 @@ mod tests {
     fn determine_ollama_provider() {
         assert!(matches!(determine_provider("llama3"), LlmProvider::Ollama));
         assert!(matches!(determine_provider("mistral"), LlmProvider::Ollama));
+    }
+
+    #[test]
+    fn translate_openai_tools_to_anthropic_shape() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }]);
+        let out = openai_tools_to_anthropic(&tools);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "get_weather");
+        assert_eq!(arr[0]["description"], "Get weather");
+        assert!(arr[0]["input_schema"]["properties"]["city"].is_object());
+    }
+
+    #[test]
+    fn translate_tool_choice_variants() {
+        assert_eq!(
+            openai_tool_choice_to_anthropic(&serde_json::json!("auto")),
+            serde_json::json!({"type": "auto"})
+        );
+        assert_eq!(
+            openai_tool_choice_to_anthropic(&serde_json::json!("required")),
+            serde_json::json!({"type": "any"})
+        );
+        assert_eq!(
+            openai_tool_choice_to_anthropic(
+                &serde_json::json!({"type": "function", "function": {"name": "foo"}})
+            ),
+            serde_json::json!({"type": "tool", "name": "foo"})
+        );
+    }
+
+    #[test]
+    fn translate_anthropic_tool_use_response() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+        ]);
+        let (text, calls) = anthropic_content_to_openai(&content);
+        assert_eq!(text, "Let me check.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "toolu_1");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
     }
 
     #[test]

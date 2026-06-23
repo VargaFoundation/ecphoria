@@ -6,6 +6,10 @@ use crate::embedding::ollama::OllamaProvider;
 use crate::embedding::openai::OpenAiProvider;
 use crate::embedding::EmbeddingProvider;
 use crate::ingest::IngestPipeline;
+use crate::llm::CompletionProvider;
+use crate::memory::cognition::{
+    Memory, MemoryAdd, MemoryHit, MemoryInput, MemoryOutcome, MemoryScope, MemoryState, MemoryStore,
+};
 use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
@@ -18,9 +22,15 @@ pub struct StrataEngine {
     episodic: Arc<EpisodicStore>,
     semantic: Arc<SemanticStore>,
     state: Arc<StateStore>,
+    /// Bi-temporal store of distilled memories (cognition layer).
+    memory_store: Arc<MemoryStore>,
+    /// Vector index over memories only (kept separate from event embeddings).
+    memory_index: Arc<SemanticStore>,
     ingest: IngestPipeline,
     /// Shared embedding provider for embed-and-search operations.
     embedding: Option<Arc<dyn EmbeddingProvider>>,
+    /// Optional completion provider for opt-in LLM fact extraction (cognition layer).
+    completion: Option<Arc<dyn CompletionProvider>>,
 }
 
 impl std::fmt::Debug for StrataEngine {
@@ -56,6 +66,30 @@ impl StrataEngine {
             tracing::warn!("falling back to in-memory state store");
             StateStore::new()
         }));
+
+        // Initialize memory-cognition store (bi-temporal facts) + its dedicated vector index
+        let memory_path = Path::new(&config.memory.cognition.db_path);
+        let memory_store = Arc::new(MemoryStore::open(memory_path).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "falling back to in-memory cognition store");
+            MemoryStore::new()
+        }));
+        let memory_index = Arc::new(
+            SemanticStore::with_dimension(config.embedding.dimension)
+                .unwrap_or_else(|_| SemanticStore::new()),
+        );
+        // Rebuild the in-memory vector index from persisted embeddings (no provider call).
+        match memory_store.load_active_with_embeddings().await {
+            Ok(rows) => {
+                let n = rows.len();
+                for (mem, emb) in rows {
+                    let _ = memory_index.upsert(&mem.to_semantic_entry(emb)).await;
+                }
+                if n > 0 {
+                    tracing::info!(memories = n, "rebuilt memory vector index from disk");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to rebuild memory index"),
+        }
 
         // Initialize embedding provider from config
         let embedding: Option<Arc<dyn EmbeddingProvider>> = match config.embedding.provider.as_str()
@@ -95,6 +129,32 @@ impl StrataEngine {
             }
         };
 
+        // Initialize optional completion provider for opt-in LLM fact extraction.
+        let completion: Option<Arc<dyn CompletionProvider>> =
+            match config.memory.cognition.extraction_provider.as_str() {
+                "ollama" => {
+                    tracing::info!(
+                        model = %config.memory.cognition.extraction_model,
+                        "cognition extraction provider: ollama"
+                    );
+                    Some(Arc::new(crate::llm::ollama::OllamaCompletion::new(
+                        config.embedding.ollama_url.clone(),
+                        config.memory.cognition.extraction_model.clone(),
+                    )))
+                }
+                "openai" if !config.embedding.openai_api_key.is_empty() => {
+                    tracing::info!(
+                        model = %config.memory.cognition.extraction_model,
+                        "cognition extraction provider: openai"
+                    );
+                    Some(Arc::new(crate::llm::openai::OpenAiCompletion::new(
+                        config.embedding.openai_api_key.clone(),
+                        config.memory.cognition.extraction_model.clone(),
+                    )))
+                }
+                _ => None,
+            };
+
         // Initialize ingest pipeline (keep a reference to embedding for embed-and-search)
         let embedding_ref = embedding.clone();
         let ingest = match embedding {
@@ -115,7 +175,10 @@ impl StrataEngine {
             embedding: embedding_ref,
             semantic,
             state,
+            memory_store,
+            memory_index,
             ingest,
+            completion,
         })
     }
 
@@ -191,6 +254,30 @@ impl StrataEngine {
             self.state.clone(),
             self.embedding.clone(),
         );
+
+        tokio::time::timeout(timeout, executor.execute(plan, max_rows))
+            .await
+            .map_err(|_| crate::Error::Query("query timed out".into()))?
+    }
+
+    /// Execute SQL scoped to a single tenant — every `episodic` reference is rewritten to a
+    /// per-tenant filtered view, so the caller can only read its own rows (row-level isolation).
+    pub async fn query_sql_for_tenant(
+        &self,
+        sql: &str,
+        tenant: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let plan = QueryPlanner::plan(sql)?;
+        let max_rows = self.config.query.max_rows;
+        let timeout = std::time::Duration::from_millis(self.config.query.timeout_ms);
+
+        let executor = QueryExecutor::new(
+            self.episodic.clone(),
+            self.semantic.clone(),
+            self.state.clone(),
+            self.embedding.clone(),
+        )
+        .with_tenant(tenant);
 
         tokio::time::timeout(timeout, executor.execute(plan, max_rows))
             .await
@@ -372,6 +459,403 @@ impl StrataEngine {
         } else {
             self.semantic_search(&vector, k).await
         }
+    }
+
+    /// Vector search over event embeddings, scoped to a tenant (row-level isolation).
+    pub async fn semantic_search_for_tenant(
+        &self,
+        vector: &[f32],
+        k: usize,
+        tenant: &str,
+        source: Option<&str>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let tenant = tenant.to_string();
+        let source_owned = source.map(|s| s.to_string());
+        let event_type_owned = event_type.map(|s| s.to_string());
+        self.semantic
+            .search_filtered(vector, k, move |entry| {
+                let mtenant = entry
+                    .metadata
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                if mtenant != tenant {
+                    return false;
+                }
+                if let Some(ref src) = source_owned {
+                    if entry.metadata.get("source").and_then(|v| v.as_str()) != Some(src.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(ref et) = event_type_owned {
+                    if entry.metadata.get("event_type").and_then(|v| v.as_str())
+                        != Some(et.as_str())
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await
+    }
+
+    /// Embed text and vector-search event embeddings scoped to a tenant.
+    pub async fn embed_and_search_for_tenant(
+        &self,
+        text: &str,
+        k: usize,
+        tenant: &str,
+        source: Option<&str>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let vector = self.embed_text(text).await?;
+        self.semantic_search_for_tenant(&vector, k, tenant, source, event_type)
+            .await
+    }
+
+    // ── Memory Cognition ──────────────────────────────────────────────
+
+    /// Add a memory through the deterministic cognition pipeline.
+    ///
+    /// Behaviour (deterministic core, no LLM required):
+    /// - If `subject` is set and an active memory with the same `(scope, subject)` exists:
+    ///   identical content → reinforce (`Confirmed`); different content → supersede the old
+    ///   and insert the new (`Superseded`, bi-temporal — the old one keeps its history and
+    ///   stays answerable via [`Self::memory_as_of`]).
+    /// - Else, when an embedding provider is configured, a near-duplicate (cosine ≥
+    ///   `dedup_threshold`) in the same scope is merged/updated (`Merged`).
+    /// - Otherwise a fresh memory is inserted (`Inserted`).
+    pub async fn memory_add(&self, mut input: MemoryInput) -> Result<MemoryAdd> {
+        if input.scope.tenant_id.is_empty() {
+            input.scope.tenant_id = "default".into();
+        }
+        let cog = &self.config.memory.cognition;
+        let importance = input.importance.unwrap_or(cog.default_importance);
+        // Embedding is best-effort: the deterministic paths work without it.
+        let embedding = self.embed_text(&input.content).await.ok();
+
+        // 1. Subject-based contradiction resolution (authoritative, no embedding required).
+        if let Some(subject) = input.subject.clone() {
+            let actives = self
+                .memory_store
+                .find_active_by_subject(&input.scope, &subject)
+                .await?;
+            if let Some(existing) = actives.first() {
+                if existing.content.trim() == input.content.trim() {
+                    self.memory_store
+                        .touch(existing.id, importance.max(existing.importance))
+                        .await?;
+                    let memory = self
+                        .memory_store
+                        .get(existing.id)
+                        .await?
+                        .unwrap_or_else(|| existing.clone());
+                    return Ok(MemoryAdd {
+                        memory,
+                        outcome: MemoryOutcome::Confirmed,
+                    });
+                }
+                // Contradiction: supersede every active memory for this subject, insert new.
+                let now = chrono::Utc::now();
+                for a in &actives {
+                    self.memory_store.supersede(a.id, now).await?;
+                    let _ = self.memory_index.delete(a.id).await;
+                }
+                let mut mem = Memory::new(input.scope.clone(), input.content.clone());
+                mem.subject = Some(subject);
+                mem.importance = importance;
+                mem.supersedes = Some(actives[0].id);
+                mem.valid_from = now;
+                mem.source_event_ids = input.source_event_ids.clone();
+                mem.metadata = input.metadata.clone();
+                self.persist_memory(&mem, embedding.as_deref()).await?;
+                return Ok(MemoryAdd {
+                    memory: mem,
+                    outcome: MemoryOutcome::Superseded,
+                });
+            }
+        } else if let Some(emb) = embedding.as_deref() {
+            // 2. Semantic dedup/merge (subjectless facts, only when embeddings are available).
+            let hits = self.memory_index_search(emb, &input.scope, 1).await?;
+            if let Some(top) = hits.first() {
+                if top.score >= cog.dedup_threshold {
+                    let new_importance = importance.max(top.memory.importance);
+                    self.memory_store
+                        .merge_into(
+                            top.memory.id,
+                            &input.content,
+                            new_importance,
+                            embedding.as_deref(),
+                        )
+                        .await?;
+                    let memory = self
+                        .memory_store
+                        .get(top.memory.id)
+                        .await?
+                        .unwrap_or_else(|| top.memory.clone());
+                    self.index_memory(&memory, embedding.as_deref()).await;
+                    return Ok(MemoryAdd {
+                        memory,
+                        outcome: MemoryOutcome::Merged,
+                    });
+                }
+            }
+        }
+
+        // 3. Insert a fresh memory.
+        let mut mem = Memory::new(input.scope.clone(), input.content.clone());
+        mem.subject = input.subject.clone();
+        mem.importance = importance;
+        mem.source_event_ids = input.source_event_ids.clone();
+        mem.metadata = input.metadata.clone();
+        self.persist_memory(&mem, embedding.as_deref()).await?;
+        Ok(MemoryAdd {
+            memory: mem,
+            outcome: MemoryOutcome::Inserted,
+        })
+    }
+
+    /// Persist a memory to DuckDB and (if embedded) to the vector index.
+    async fn persist_memory(&self, mem: &Memory, embedding: Option<&[f32]>) -> Result<()> {
+        self.memory_store.insert(mem, embedding).await?;
+        self.index_memory(mem, embedding).await;
+        Ok(())
+    }
+
+    /// Upsert a memory's vector into the (scoped) memory index, if an embedding exists.
+    async fn index_memory(&self, mem: &Memory, embedding: Option<&[f32]>) {
+        if let Some(emb) = embedding {
+            let _ = self
+                .memory_index
+                .upsert(&mem.to_semantic_entry(emb.to_vec()))
+                .await;
+        }
+    }
+
+    /// Scoped semantic search over the memory vector index.
+    async fn memory_index_search(
+        &self,
+        vector: &[f32],
+        scope: &MemoryScope,
+        k: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        let scope = scope.clone();
+        let results = self
+            .memory_index
+            .search_filtered(vector, k, move |entry| {
+                crate::memory::cognition::scope_matches_metadata(&scope, &entry.metadata)
+            })
+            .await?;
+        let mut hits = Vec::with_capacity(results.len());
+        for r in results {
+            if let Some(mem) = self.memory_store.get(r.entry.id).await? {
+                if mem.state == MemoryState::Active {
+                    hits.push(MemoryHit {
+                        memory: mem,
+                        score: r.score,
+                    });
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Maximum active memories scanned for lexical (BM25) ranking per scope.
+    const MEMORY_LEXICAL_SCAN_CAP: usize = 512;
+    /// Reciprocal Rank Fusion constant (standard default).
+    const MEMORY_RRF_K: f32 = 60.0;
+
+    /// Hybrid search over a scope's memories: deterministic BM25 lexical ranking fused
+    /// (via Reciprocal Rank Fusion) with vector search when an embedding provider is
+    /// configured. Lexical ranking is always on — so quality beats pure-recency even with
+    /// no provider, and no external/FTS dependency is required. Empty query → recency.
+    pub async fn memory_search(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        k: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        use crate::memory::cognition::{lexical_rank, rrf_fuse};
+
+        if query.trim().is_empty() || k == 0 {
+            let mems = self.memory_store.list_active(scope, k.max(1)).await?;
+            return Ok(mems
+                .into_iter()
+                .map(|memory| MemoryHit { memory, score: 0.0 })
+                .collect());
+        }
+
+        // Candidate universe for lexical ranking + id→memory map.
+        let candidates = self
+            .memory_store
+            .list_active(scope, Self::MEMORY_LEXICAL_SCAN_CAP)
+            .await?;
+        let mut by_id: std::collections::HashMap<uuid::Uuid, Memory> =
+            candidates.iter().cloned().map(|m| (m.id, m)).collect();
+
+        // Lexical (BM25) ranking — always available.
+        let lex_ids: Vec<uuid::Uuid> = lexical_rank(query, &candidates)
+            .into_iter()
+            .map(|(i, _)| candidates[i].id)
+            .collect();
+
+        // Vector ranking — best-effort, only when embeddings are configured.
+        let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
+        if !self.memory_index.is_empty() {
+            if let Ok(vector) = self.embed_text(query).await {
+                if let Ok(hits) = self.memory_index_search(&vector, scope, k * 4).await {
+                    for h in hits {
+                        vec_ids.push(h.memory.id);
+                        by_id.entry(h.memory.id).or_insert(h.memory);
+                    }
+                }
+            }
+        }
+
+        let mut rankings: Vec<Vec<uuid::Uuid>> = Vec::new();
+        if !vec_ids.is_empty() {
+            rankings.push(vec_ids);
+        }
+        if !lex_ids.is_empty() {
+            rankings.push(lex_ids);
+        }
+
+        // Nothing matched lexically or by vector → fall back to importance/recency.
+        if rankings.is_empty() {
+            let mems = self.memory_store.list_active(scope, k).await?;
+            return Ok(mems
+                .into_iter()
+                .map(|memory| MemoryHit { memory, score: 0.0 })
+                .collect());
+        }
+
+        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, k);
+        let mut out = Vec::with_capacity(fused.len());
+        for (id, score) in fused {
+            if let Some(memory) = by_id.remove(&id) {
+                out.push(MemoryHit { memory, score });
+            } else if let Ok(Some(memory)) = self.memory_store.get(id).await {
+                out.push(MemoryHit { memory, score });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get a memory by id.
+    pub async fn memory_get(&self, id: uuid::Uuid) -> Result<Option<Memory>> {
+        self.memory_store.get(id).await
+    }
+
+    /// List active memories in a scope (importance/recency order).
+    pub async fn memory_all(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<Memory>> {
+        self.memory_store.list_active(scope, limit).await
+    }
+
+    /// Full temporal history for a `(scope, subject)` — every version, oldest first.
+    pub async fn memory_history(&self, scope: &MemoryScope, subject: &str) -> Result<Vec<Memory>> {
+        self.memory_store.history(scope, subject).await
+    }
+
+    /// The memory that was valid for a `(scope, subject)` at instant `at` (bi-temporal).
+    pub async fn memory_as_of(
+        &self,
+        scope: &MemoryScope,
+        subject: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Memory>> {
+        self.memory_store.as_of(scope, subject, at).await
+    }
+
+    /// Delete a memory (and its vector).
+    pub async fn memory_delete(&self, id: uuid::Uuid) -> Result<()> {
+        let _ = self.memory_index.delete(id).await;
+        self.memory_store.delete(id).await
+    }
+
+    /// Get a memory by id, scoped to a tenant (None if owned by another tenant).
+    pub async fn memory_get_scoped(&self, id: uuid::Uuid, tenant: &str) -> Result<Option<Memory>> {
+        self.memory_store.get_scoped(id, tenant).await
+    }
+
+    /// Delete a memory by id, scoped to a tenant. Returns true iff a row was deleted.
+    pub async fn memory_delete_scoped(&self, id: uuid::Uuid, tenant: &str) -> Result<bool> {
+        let deleted = self.memory_store.delete_scoped(id, tenant).await?;
+        if deleted {
+            let _ = self.memory_index.delete(id).await;
+        }
+        Ok(deleted)
+    }
+
+    /// Total memory count (all states).
+    pub async fn memory_count(&self) -> Result<u64> {
+        self.memory_store.count().await
+    }
+
+    /// Forget low-value memories via time-decay of importance (configurable half-life /
+    /// threshold). Forgotten memories are expired (kept for history) and dropped from the
+    /// vector index. Returns the number forgotten.
+    pub async fn memory_enforce_decay(&self) -> Result<u64> {
+        let cog = &self.config.memory.cognition;
+        let forgotten = self
+            .memory_store
+            .decay(cog.decay_half_life_days, cog.forget_threshold)
+            .await?;
+        for id in &forgotten {
+            let _ = self.memory_index.delete(*id).await;
+        }
+        if !forgotten.is_empty() {
+            tracing::info!(
+                forgotten = forgotten.len(),
+                "memory decay forgot low-value memories"
+            );
+        }
+        Ok(forgotten.len() as u64)
+    }
+
+    /// System prompt for opt-in LLM fact extraction.
+    const EXTRACT_SYSTEM: &'static str = "You extract atomic, durable facts from the user's text \
+        for an agent memory store. Return ONLY a JSON array of objects with keys \"subject\" (a \
+        short stable key like \"favorite_color\", or null) and \"content\" (the fact as a \
+        standalone sentence). Extract only meaningful, lasting facts; ignore pleasantries. \
+        Example: [{\"subject\":\"favorite_color\",\"content\":\"Their favorite color is blue\"}]";
+
+    /// Remember raw text as one or more memories.
+    ///
+    /// When `cognition.extraction = "llm"` and a completion provider is configured, the text
+    /// is distilled into atomic facts (each routed through [`Self::memory_add`], so dedup and
+    /// contradiction resolution still apply). Otherwise the text is stored as a single memory
+    /// (deterministic fallback — no LLM dependency).
+    pub async fn memory_remember(
+        &self,
+        raw_text: &str,
+        scope: &MemoryScope,
+    ) -> Result<Vec<MemoryAdd>> {
+        let facts = self.extract_facts(raw_text).await;
+        let mut out = Vec::with_capacity(facts.len());
+        for (subject, content) in facts {
+            let mut input = MemoryInput::new(scope.clone(), content);
+            input.subject = subject;
+            out.push(self.memory_add(input).await?);
+        }
+        Ok(out)
+    }
+
+    /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
+    async fn extract_facts(&self, raw_text: &str) -> Vec<(Option<String>, String)> {
+        if self.config.memory.cognition.extraction == "llm" {
+            if let Some(provider) = &self.completion {
+                match provider.complete(Self::EXTRACT_SYSTEM, raw_text).await {
+                    Ok(text) => match parse_extracted_facts(&text) {
+                        Some(facts) if !facts.is_empty() => return facts,
+                        _ => tracing::warn!("LLM extraction returned no parseable facts"),
+                    },
+                    Err(e) => tracing::warn!(error = %e, "LLM extraction failed"),
+                }
+            }
+        }
+        // Deterministic fallback: store the text as a single memory.
+        vec![(None, raw_text.to_string())]
     }
 
     // ── Schema Introspection ────────────────────────────────────────
@@ -708,6 +1192,36 @@ impl StrataEngine {
     }
 }
 
+/// Leniently parse an LLM extraction response into `(subject, content)` facts.
+///
+/// Tolerates surrounding prose / Markdown fences by extracting the outermost `[...]` array.
+fn parse_extracted_facts(text: &str) -> Option<Vec<(Option<String>, String)>> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&text[start..=end]).ok()?;
+    let mut facts = Vec::new();
+    for item in arr {
+        let Some(content) = item
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let subject = item
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        facts.push((subject, content));
+    }
+    Some(facts)
+}
+
 // Compile-time assertion: StrataEngine must be Send + Sync for Arc usage.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -806,5 +1320,208 @@ mod tests {
         let results = engine.semantic_search(&rust_vec, 1).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.content, "Rust programming language");
+    }
+
+    /// Fully in-memory config so cognition tests don't touch `./data`.
+    fn inmem_config() -> CoreConfig {
+        let mut c = CoreConfig::default();
+        c.memory.episodic.db_path = ":memory:".into();
+        c.memory.state.db_path = ":memory:".into();
+        c.memory.cognition.db_path = ":memory:".into();
+        c
+    }
+
+    #[tokio::test]
+    async fn memory_add_insert_and_get() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let added = engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::user("alice"),
+                "likes espresso",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(added.outcome, MemoryOutcome::Inserted);
+        let got = engine.memory_get(added.memory.id).await.unwrap().unwrap();
+        assert_eq!(got.content, "likes espresso");
+        assert_eq!(engine.memory_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_subject_contradiction_supersedes_with_history() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+
+        let first = engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), "favorite color is blue")
+                    .with_subject("favorite_color"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, MemoryOutcome::Inserted);
+
+        let second = engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), "favorite color is green")
+                    .with_subject("favorite_color"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.outcome, MemoryOutcome::Superseded);
+        assert_eq!(second.memory.supersedes, Some(first.memory.id));
+
+        // Only the latest is active.
+        let active = engine.memory_all(&scope, 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].content, "favorite color is green");
+
+        // History keeps both, oldest first.
+        let hist = engine
+            .memory_history(&scope, "favorite_color")
+            .await
+            .unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].content, "favorite color is blue");
+
+        // Bi-temporal: the superseded value is still answerable "as of" its validity window.
+        let before = engine
+            .memory_as_of(&scope, "favorite_color", first.memory.valid_from)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.content, "favorite color is blue");
+    }
+
+    #[tokio::test]
+    async fn memory_identical_is_confirmed_not_duplicated() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("bob");
+        engine
+            .memory_add(MemoryInput::new(scope.clone(), "works at ACME").with_subject("employer"))
+            .await
+            .unwrap();
+        let again = engine
+            .memory_add(MemoryInput::new(scope.clone(), "works at ACME").with_subject("employer"))
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, MemoryOutcome::Confirmed);
+        assert_eq!(engine.memory_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_search_lexical_ranks_relevant_first() {
+        // No embedding provider in the default config → pure deterministic BM25 ranking.
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        for content in [
+            "alice loves hiking in the mountains",
+            "alice works as a software engineer",
+            "the weather is sunny today",
+        ] {
+            engine
+                .memory_add(MemoryInput::new(scope.clone(), content))
+                .await
+                .unwrap();
+        }
+
+        let hits = engine
+            .memory_search("software engineering job", &scope, 3)
+            .await
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].memory.content, "alice works as a software engineer");
+    }
+
+    #[test]
+    fn parse_extracted_facts_handles_fenced_json() {
+        let text = "Sure!\n```json\n[{\"subject\":\"city\",\"content\":\"Lives in Paris\"},\
+                    {\"content\":\"Likes jazz\"}]\n```";
+        let facts = super::parse_extracted_facts(text).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(
+            facts[0],
+            (Some("city".to_string()), "Lives in Paris".to_string())
+        );
+        assert_eq!(facts[1], (None, "Likes jazz".to_string()));
+    }
+
+    #[tokio::test]
+    async fn memory_remember_fallback_stores_raw_text() {
+        // Default config has extraction = "none" → deterministic single-memory fallback.
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        let added = engine
+            .memory_remember("alice prefers tea over coffee", &scope)
+            .await
+            .unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].memory.content, "alice prefers tea over coffee");
+        assert_eq!(engine.memory_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_enforce_decay_keeps_fresh_memories() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        engine
+            .memory_add(MemoryInput::new(scope.clone(), "fresh fact"))
+            .await
+            .unwrap();
+        // Nothing is old enough to forget yet.
+        assert_eq!(engine.memory_enforce_decay().await.unwrap(), 0);
+        assert_eq!(engine.memory_all(&scope, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_search_for_tenant_isolates() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let mut v = vec![0.0f32; 768];
+        v[0] = 1.0; // both entries point the same way → both would match without scoping
+        engine
+            .semantic_upsert(&SemanticEntry {
+                id: uuid::Uuid::new_v4(),
+                content: "tenant A secret".into(),
+                embedding: v.clone(),
+                metadata: serde_json::json!({"tenant_id": "tenant-a"}),
+            })
+            .await
+            .unwrap();
+        engine
+            .semantic_upsert(&SemanticEntry {
+                id: uuid::Uuid::new_v4(),
+                content: "tenant B secret".into(),
+                embedding: v.clone(),
+                metadata: serde_json::json!({"tenant_id": "tenant-b"}),
+            })
+            .await
+            .unwrap();
+
+        let hits = engine
+            .semantic_search_for_tenant(&v, 5, "tenant-a", None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.content, "tenant A secret");
+    }
+
+    #[tokio::test]
+    async fn memory_scope_isolation() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .memory_add(MemoryInput::new(MemoryScope::user("alice"), "secret A"))
+            .await
+            .unwrap();
+        engine
+            .memory_add(MemoryInput::new(MemoryScope::user("bob"), "secret B"))
+            .await
+            .unwrap();
+
+        let alice = engine
+            .memory_all(&MemoryScope::user("alice"), 10)
+            .await
+            .unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].content, "secret A");
     }
 }

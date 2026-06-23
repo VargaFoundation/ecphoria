@@ -119,13 +119,22 @@ pub async fn search_no_engine(Json(_req): Json<SearchRequest>) -> Response {
 /// automatically filtered to that tenant's data.
 pub async fn query(
     State(engine): State<Arc<StrataEngine>>,
-    _auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
     Json(req): Json<QueryRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "query").increment(1);
     let start = std::time::Instant::now();
 
-    let result = match engine.query_sql(&req.sql).await {
+    // Tenant-scoped users only ever see their own rows (row-level isolation).
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(ctx)| ctx.tenant_id.clone());
+    let query_result = match tenant {
+        Some(t) => engine.query_sql_for_tenant(&req.sql, &t).await,
+        None => engine.query_sql(&req.sql).await,
+    };
+
+    let result = match query_result {
         Ok(rows) => {
             let count = rows.len();
             api_ok(serde_json::json!({ "rows": rows, "count": count }))
@@ -260,23 +269,30 @@ pub async fn webhook(
 /// Semantic search against the engine.
 pub async fn search(
     State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
     Json(req): Json<SearchRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "search").increment(1);
     let start = std::time::Instant::now();
 
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+    let src = req.filters.as_ref().and_then(|f| f.source.as_deref());
+    let et = req.filters.as_ref().and_then(|f| f.event_type.as_deref());
+
     let result = if let Some(vector) = req.vector {
-        let search_result = if let Some(ref filters) = req.filters {
-            engine
-                .semantic_search_filtered(
-                    &vector,
-                    req.k,
-                    filters.source.as_deref(),
-                    filters.event_type.as_deref(),
-                )
-                .await
-        } else {
-            engine.semantic_search(&vector, req.k).await
+        let search_result = match &tenant {
+            // Tenant-scoped users only ever see their own event embeddings.
+            Some(t) => {
+                engine
+                    .semantic_search_for_tenant(&vector, req.k, t, src, et)
+                    .await
+            }
+            None if req.filters.is_some() => {
+                engine
+                    .semantic_search_filtered(&vector, req.k, src, et)
+                    .await
+            }
+            None => engine.semantic_search(&vector, req.k).await,
         };
         match search_result {
             Ok(results) => {
@@ -517,6 +533,7 @@ pub async fn state_watch(
 /// POST /api/v1/embed-and-search { "text": "billing issue", "k": 5 }
 pub async fn embed_and_search(
     State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
     Json(req): Json<EmbedAndSearchRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "embed_and_search").increment(1);
@@ -524,12 +541,22 @@ pub async fn embed_and_search(
 
     let source = req.filters.as_ref().and_then(|f| f.source.as_deref());
     let event_type = req.filters.as_ref().and_then(|f| f.event_type.as_deref());
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
 
     let min_score = req.min_score;
-    let result = match engine
-        .embed_and_search(&req.text, req.k, source, event_type)
-        .await
-    {
+    let search = match &tenant {
+        Some(t) => {
+            engine
+                .embed_and_search_for_tenant(&req.text, req.k, t, source, event_type)
+                .await
+        }
+        None => {
+            engine
+                .embed_and_search(&req.text, req.k, source, event_type)
+                .await
+        }
+    };
+    let result = match search {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .iter()
@@ -657,6 +684,276 @@ pub async fn session_recall(
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "SESSION_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+// ── Memory Cognition ────────────────────────────────────────────────
+
+/// Resolve a memory scope, preferring the authenticated tenant for isolation.
+fn scope_from(
+    auth: &Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+) -> strata_core::memory::cognition::MemoryScope {
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(ctx)| ctx.tenant_id.clone())
+        .or_else(|| tenant_id.map(|s| s.to_string()))
+        .unwrap_or_else(|| "default".to_string());
+    strata_core::memory::cognition::MemoryScope {
+        tenant_id: tenant,
+        user_id: user_id.map(|s| s.to_string()),
+        agent_id: agent_id.map(|s| s.to_string()),
+        session_id: session_id.map(|s| s.to_string()),
+    }
+}
+
+/// Add a memory through the cognition pipeline (dedup / contradiction / importance).
+///
+/// POST /api/v1/memories { "content": "...", "subject": "...", "user_id": "..." }
+pub async fn memory_add(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<MemoryAddRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_add").increment(1);
+
+    if req.content.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "content is required".into(),
+        );
+    }
+
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let input = strata_core::memory::cognition::MemoryInput {
+        scope,
+        subject: req.subject,
+        content: req.content,
+        importance: req.importance,
+        source_event_ids: vec![],
+        metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+    };
+
+    match engine.memory_add(input).await {
+        Ok(added) => api_ok(serde_json::to_value(added).unwrap_or_default()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Search memories within a scope (semantic when embeddings exist, else recency).
+///
+/// POST /api/v1/memories/search { "query": "...", "user_id": "...", "k": 5 }
+pub async fn memory_search(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<MemorySearchRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_search").increment(1);
+
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    match engine.memory_search(&req.query, &scope, req.k).await {
+        Ok(hits) => api_ok(serde_json::json!({ "results": hits, "count": hits.len() })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// List active memories in a scope.
+///
+/// GET /api/v1/memories?user_id=alice&limit=50
+pub async fn memory_list(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(params): axum::extract::Query<MemoryListParams>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_list").increment(1);
+
+    let scope = scope_from(
+        &auth,
+        params.tenant_id.as_deref(),
+        params.user_id.as_deref(),
+        params.agent_id.as_deref(),
+        params.session_id.as_deref(),
+    );
+    match engine.memory_all(&scope, params.limit).await {
+        Ok(mems) => api_ok(serde_json::json!({ "memories": mems, "count": mems.len() })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Get a single memory by id (scoped to the caller's tenant).
+pub async fn memory_get(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_get").increment(1);
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                format!("'{id}' is not a valid memory id"),
+            )
+        }
+    };
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+    let got = match tenant {
+        Some(t) => engine.memory_get_scoped(uuid, &t).await,
+        None => engine.memory_get(uuid).await,
+    };
+    match got {
+        Ok(Some(m)) => api_ok(serde_json::to_value(m).unwrap_or_default()),
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            format!("memory '{id}' not found"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Delete a memory by id (scoped to the caller's tenant).
+pub async fn memory_delete(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_delete").increment(1);
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                format!("'{id}' is not a valid memory id"),
+            )
+        }
+    };
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+    let outcome = match tenant {
+        Some(t) => engine.memory_delete_scoped(uuid, &t).await,
+        None => engine.memory_delete(uuid).await.map(|()| true),
+    };
+    match outcome {
+        Ok(true) => api_ok(serde_json::json!({ "id": id, "deleted": true })),
+        Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            format!("memory '{id}' not found"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Get the full temporal history of a memory (every superseded version).
+///
+/// GET /api/v1/memories/{id}/history
+pub async fn memory_history(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_history").increment(1);
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                format!("'{id}' is not a valid memory id"),
+            )
+        }
+    };
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+    let fetched = match tenant {
+        Some(t) => engine.memory_get_scoped(uuid, &t).await,
+        None => engine.memory_get(uuid).await,
+    };
+    let mem = match fetched {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                format!("memory '{id}' not found"),
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MEMORY_ERROR",
+                e.to_string(),
+            )
+        }
+    };
+
+    match mem.subject.clone() {
+        Some(subject) => match engine.memory_history(&mem.scope, &subject).await {
+            Ok(history) => api_ok(serde_json::json!({
+                "subject": subject,
+                "history": history,
+                "count": history.len(),
+            })),
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MEMORY_ERROR",
+                e.to_string(),
+            ),
+        },
+        // No subject → no supersession chain; the memory is its own history.
+        None => api_ok(serde_json::json!({ "history": [mem], "count": 1 })),
+    }
+}
+
+/// Forget low-value memories via time-decay of importance (admin).
+///
+/// POST /api/v1/admin/memory/decay
+pub async fn memory_decay(State(engine): State<Arc<StrataEngine>>) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_decay").increment(1);
+    match engine.memory_enforce_decay().await {
+        Ok(forgotten) => api_ok(serde_json::json!({ "forgotten": forgotten })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
             e.to_string(),
         ),
     }

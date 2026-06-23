@@ -73,21 +73,21 @@ impl SnapshotManager {
         // Unpack the byte vector back into a directory structure
         Self::unpack_directory(data, &snap_dir)?;
 
-        // Restore episodic store from DuckDB export
+        // Restore episodic store from DuckDB export.
+        //
+        // Uses the engine's atomic stage-then-swap restore: the snapshot is imported into a
+        // staging database first and only swapped into the live table inside a transaction,
+        // so a corrupt snapshot can never destroy the node's existing data.
         let export_dir = snap_dir.join("episodic_export");
         if export_dir.exists() {
-            let export_dir_str = export_dir.to_string_lossy().to_string();
             let episodic = engine.episodic_store();
-            tokio::task::spawn_blocking(move || {
-                let db = episodic.write_conn();
-                // Drop existing data and import from snapshot
-                let _ = db.execute_batch("DELETE FROM episodic");
-                db.execute_batch(&format!("IMPORT DATABASE '{export_dir_str}'"))
-                    .map_err(|e| crate::Error::Replication(format!("duckdb import: {e}")))?;
-                Ok::<(), crate::Error>(())
+            let staging = snap_dir.join("episodic_staging.duckdb");
+            let res = tokio::task::spawn_blocking(move || {
+                episodic.restore_from_export(&export_dir, &staging)
             })
             .await
-            .map_err(|e| crate::Error::Replication(format!("join: {e}")))??;
+            .map_err(|e| crate::Error::Replication(format!("join: {e}")))?;
+            res.map_err(|e| crate::Error::Replication(format!("episodic restore: {e}")))?;
         }
 
         // Restore semantic index by loading from the saved USearch files.
