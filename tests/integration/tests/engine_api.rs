@@ -9,7 +9,11 @@ use tower::ServiceExt;
 
 async fn engine_router() -> axum::Router {
     let mut config = CoreConfig::default();
+    // All stores in-memory so tests are isolated and don't persist state (e.g. the sessions
+    // table) into a shared ./data file across runs.
+    config.memory.episodic.db_path = ":memory:".into();
     config.memory.state.db_path = ":memory:".into();
+    config.memory.cognition.db_path = ":memory:".into();
     let engine = Arc::new(StrataEngine::new(config).await.unwrap());
     strata_gateway::rest::router_with_engine(engine)
 }
