@@ -353,13 +353,16 @@ async fn stream_anthropic(http: &Client, req: &ChatCompletionRequest) -> Respons
     // Reader task: parse Anthropic SSE frames and forward translated OpenAI chunks.
     tokio::spawn(async move {
         let mut upstream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Buffer raw BYTES (not a String): a multi-byte UTF-8 char can be split across two network
+        // chunks; decoding each chunk independently would corrupt it. We only decode complete lines.
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = upstream.next().await {
             let Ok(bytes) = chunk else { break };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
+            buf.extend_from_slice(&bytes);
             // Anthropic emits one JSON object per `data:` line, frames separated by newlines.
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
