@@ -68,4 +68,7 @@ All requests carry **materialized** values so apply is deterministic on every no
 - AppRequest/AppResponse serialization roundtrip (MessagePack + JSON)
 - NetworkClient URL construction
 - ClusterCoordinator single-node Raft lifecycle (start → is_leader → shutdown)
-- In-memory Raft network for unit tests (no real TCP)
+- Consensus round-trip: `client_write` → commit → apply lands on the engine (Ingest/State/Memory)
+- Deterministic apply: the same committed entry yields identical state on two independent engines
+- Note: `NetworkClient` is HTTP-only; true multi-node tests require standing up the gateway Raft
+  RPC endpoints on real ports (not yet automated). openraft covers multi-node replication upstream.

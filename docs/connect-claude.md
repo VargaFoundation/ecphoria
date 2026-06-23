@@ -63,39 +63,30 @@ memory — "what did we believe, and when".
 
 ---
 
-## 2. MCP  ⚠️ Claude Code works natively; Claude Desktop needs a bridge
+## 2. MCP  ✅ Streamable HTTP — Claude Code and Claude Desktop both connect natively
 
-Strata exposes an MCP endpoint at `POST /mcp` (JSON-RPC 2.0: `initialize`, `tools/list`,
-`tools/call`, `resources/list`, `prompts/list`). It includes 6 memory tools — `add_memory`,
-`search_memory`, `get_memories`, `memory_history`, `delete_memory`, `remember` — plus query /
-ingest / state / session tools.
+Strata exposes an MCP **Streamable HTTP** endpoint at `/mcp`: `POST` for JSON-RPC 2.0
+(`initialize` — which returns an `Mcp-Session-Id` header — `tools/list`, `tools/call`,
+`resources/list`, `prompts/list`) and `GET` for the server→client SSE stream. It includes 6
+memory tools — `add_memory`, `search_memory`, `get_memories`, `memory_history`, `delete_memory`,
+`remember` — plus query / ingest / state / session tools.
 
 **Claude Code** (HTTP MCP) — add to your MCP config:
 ```json
 { "mcpServers": { "strata": { "url": "http://localhost:8432/mcp" } } }
 ```
 
-**Claude Desktop** — it expects an MCP **Streamable HTTP** server (HTTP GET + SSE +
-`Mcp-Session-Id`). Strata currently implements JSON-RPC over **POST only**, so connect through
-the [`mcp-remote`](https://github.com/geelen/mcp-remote) bridge:
-```json
-{
-  "mcpServers": {
-    "strata": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "http://localhost:8432/mcp"]
-    }
-  }
-}
-```
+**Claude Desktop** — it speaks MCP Streamable HTTP (HTTP GET + SSE + `Mcp-Session-Id`), which
+Strata now serves, so point it at the URL directly. (If your client only supports stdio MCP, the
+[`mcp-remote`](https://github.com/geelen/mcp-remote) bridge —
+`npx -y mcp-remote http://localhost:8432/mcp` — still works.)
 
-> Limitation (honest): the POST-only transport means no server→client notifications. Full
-> Streamable HTTP (GET/SSE + sessions) is on the roadmap; until then, `mcp-remote` is the path
-> for Desktop.
+> Note: Strata is a stateless tool server, so the GET/SSE stream is an idle keep-alive (no
+> server-initiated notifications) — sufficient for the request/response tool calls clients make.
 
 ---
 
-## 3. LLM proxy (auto-RAG)  ⚠️ great for simple chat; not for streaming
+## 3. LLM proxy (auto-RAG)  ✅ great for chat; SSE streaming supported
 
 Point any OpenAI client at Strata and ask for a `claude-*` model. Strata injects relevant
 memories (scoped by the OpenAI `user` field) and forwards to Anthropic. Set `ANTHROPIC_API_KEY`
@@ -111,11 +102,14 @@ resp = client.chat.completions.create(
 )
 ```
 
-What works: format translation (OpenAI ↔ Anthropic), auto-RAG, semantic response cache, and
-**single-turn tool-use** (`tools`/`tool_choice` are translated; `tool_calls` come back).
+What works: format translation (OpenAI ↔ Anthropic), auto-RAG, semantic response cache,
+**single-turn tool-use** (`tools`/`tool_choice` are translated; `tool_calls` come back), and
+**SSE streaming** — `stream: true` returns `text/event-stream`; for Claude, Anthropic's streaming
+events are translated into OpenAI `chat.completion.chunk`s (text deltas + finish_reason),
+terminated by `data: [DONE]` (caching is skipped while streaming).
 
 Limitations (honest):
-- **No streaming** — `stream: true` is ignored; a single JSON response is returned. For streaming
-  Claude, call Anthropic directly and use path 1 for memory.
+- **Streaming tool-use deltas** aren't translated yet — text streams fine; for streamed tool calls
+  use path 1.
 - **Multi-turn tool-result passing** through the proxy is not yet supported — use path 1 for
   agentic loops.
