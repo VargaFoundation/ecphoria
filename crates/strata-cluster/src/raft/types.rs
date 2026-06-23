@@ -34,6 +34,20 @@ pub enum AppRequest {
     },
     /// Delete a semantic entry.
     SemanticDelete { id: uuid::Uuid },
+    /// Add a memory through the cognition pipeline (dedup / contradiction / importance).
+    MemoryAdd {
+        scope: strata_core::memory::cognition::MemoryScope,
+        subject: Option<String>,
+        content: String,
+        importance: Option<f32>,
+    },
+    /// Remember free-form text (LLM extraction when enabled, else stored as one memory).
+    MemoryRemember {
+        scope: strata_core::memory::cognition::MemoryScope,
+        text: String,
+    },
+    /// Delete a memory by id.
+    MemoryDelete { id: uuid::Uuid },
 }
 
 /// Application-level response from applying a Raft log entry.
@@ -47,6 +61,8 @@ pub enum AppResponse {
     Deleted,
     /// Semantic entry upserted/deleted.
     Ok,
+    /// Number of memories affected by a memory operation.
+    MemoryCount(u64),
 }
 
 /// Cluster node info for openraft membership.
@@ -101,6 +117,23 @@ mod tests {
             AppRequest::Ingest { source, events } => {
                 assert_eq!(source, "test");
                 assert_eq!(events.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn memory_request_roundtrip() {
+        let req = AppRequest::MemoryRemember {
+            scope: strata_core::memory::cognition::MemoryScope::user("alice"),
+            text: "likes tea".into(),
+        };
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: AppRequest = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            AppRequest::MemoryRemember { scope, text } => {
+                assert_eq!(scope.user_id.as_deref(), Some("alice"));
+                assert_eq!(text, "likes tea");
             }
             _ => panic!("wrong variant"),
         }

@@ -306,6 +306,39 @@ impl MemStore {
                 let _ = engine.semantic_delete(*id).await;
                 AppResponse::Ok
             }
+            AppRequest::MemoryAdd {
+                scope,
+                subject,
+                content,
+                importance,
+            } => {
+                let mut input = strata_core::memory::cognition::MemoryInput::new(
+                    scope.clone(),
+                    content.clone(),
+                );
+                input.subject = subject.clone();
+                input.importance = *importance;
+                match engine.memory_add(input).await {
+                    Ok(_) => AppResponse::MemoryCount(1),
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft apply: memory_add failed");
+                        AppResponse::MemoryCount(0)
+                    }
+                }
+            }
+            AppRequest::MemoryRemember { scope, text } => {
+                match engine.memory_remember(text, scope).await {
+                    Ok(added) => AppResponse::MemoryCount(added.len() as u64),
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft apply: memory_remember failed");
+                        AppResponse::MemoryCount(0)
+                    }
+                }
+            }
+            AppRequest::MemoryDelete { id } => {
+                let _ = engine.memory_delete(*id).await;
+                AppResponse::MemoryCount(1)
+            }
         }
     }
 }
@@ -585,6 +618,26 @@ mod tests {
     fn create_stores() {
         let store = MemStore::new(None);
         assert!(store.inner.lock().log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_memory_remember_replicates_to_engine() {
+        let mut config = strata_core::CoreConfig::default();
+        config.memory.episodic.db_path = ":memory:".into();
+        config.memory.state.db_path = ":memory:".into();
+        config.memory.cognition.db_path = ":memory:".into();
+        let engine = Arc::new(StrataEngine::new(config).await.unwrap());
+        let store = MemStore::new(Some(engine.clone()));
+
+        // Applying a committed memory log entry materializes the memory on this node's engine.
+        let resp = store
+            .apply_request(&AppRequest::MemoryRemember {
+                scope: strata_core::memory::cognition::MemoryScope::user("alice"),
+                text: "likes tea".into(),
+            })
+            .await;
+        assert!(matches!(resp, AppResponse::MemoryCount(1)));
+        assert_eq!(engine.memory_count().await.unwrap(), 1);
     }
 
     #[tokio::test]
