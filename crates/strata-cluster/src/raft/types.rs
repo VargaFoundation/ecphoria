@@ -23,14 +23,21 @@ pub enum AppRequest {
         #[serde(default)]
         tenant: Option<String>,
     },
-    /// Set agent state.
+    /// Set agent state (tenant-scoped; version is computed deterministically from prior state).
     StateSet {
         agent_id: String,
         key: String,
         value: serde_json::Value,
+        #[serde(default)]
+        tenant: Option<String>,
     },
-    /// Delete agent state.
-    StateDelete { agent_id: String, key: String },
+    /// Delete agent state (tenant-scoped).
+    StateDelete {
+        agent_id: String,
+        key: String,
+        #[serde(default)]
+        tenant: Option<String>,
+    },
     /// Upsert a semantic entry (pre-embedded).
     SemanticUpsert {
         id: uuid::Uuid,

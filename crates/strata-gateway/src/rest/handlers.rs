@@ -30,6 +30,25 @@ fn api_ok(body: serde_json::Value) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Map a cluster (Raft) write error to an HTTP response. A leadership change is **retryable**
+/// (503) — leader-forwarding will route the retry to the new leader; anything else is a 500.
+fn cluster_write_error(e: strata_cluster::Error) -> Response {
+    let msg = e.to_string();
+    if msg.contains("ForwardToLeader") || msg.to_lowercase().contains("not leader") {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NOT_LEADER",
+            format!("not the current leader — retry; {msg}"),
+        )
+    } else {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CLUSTER_WRITE_ERROR",
+            msg,
+        )
+    }
+}
+
 // ── Health (liveness) ───────────────────────────────────────────────
 
 /// Health check endpoint — probes DuckDB, SQLite, and Raft (if cluster mode).
@@ -217,30 +236,25 @@ pub async fn ingest(
         .as_ref()
         .and_then(|Extension(ctx)| ctx.tenant_id.clone());
 
-    // Cluster mode: replicate the write through the Raft log (leader-forwarding has already
-    // routed it to the leader). Apply happens deterministically on every node via consensus.
+    // Cluster mode: ALWAYS replicate through the Raft log — never apply directly on a node
+    // that isn't the leader (that would write un-replicated state and diverge the cluster).
+    // `client_write` requires leadership; a NotLeader result is surfaced as a retryable 503.
     if let Some(Extension(coord)) = cluster {
         let coord = coord.read().await;
-        if coord.is_leader() {
-            let ar = strata_cluster::raft::types::AppRequest::Ingest {
-                events,
-                tenant: tenant_id,
-            };
-            let result = match coord.client_write(ar).await {
-                Ok(strata_cluster::raft::types::AppResponse::Ingested(n)) => {
-                    api_ok(serde_json::json!({ "ingested": n }))
-                }
-                Ok(_) => api_ok(serde_json::json!({ "ingested": 0 })),
-                Err(e) => api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INGEST_ERROR",
-                    e.to_string(),
-                ),
-            };
-            metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "ingest")
-                .record(start.elapsed().as_secs_f64());
-            return result;
-        }
+        let ar = strata_cluster::raft::types::AppRequest::Ingest {
+            events,
+            tenant: tenant_id,
+        };
+        let result = match coord.client_write(ar).await {
+            Ok(strata_cluster::raft::types::AppResponse::Ingested(n)) => {
+                api_ok(serde_json::json!({ "ingested": n }))
+            }
+            Ok(_) => api_ok(serde_json::json!({ "ingested": 0 })),
+            Err(e) => cluster_write_error(e),
+        };
+        metrics::histogram!("strata_rest_request_duration_seconds", "endpoint" => "ingest")
+            .record(start.elapsed().as_secs_f64());
+        return result;
     }
 
     let ingest_result = if let Some(tid) = tenant_id {
@@ -402,12 +416,34 @@ pub async fn state_get(
 pub async fn state_set(
     State(engine): State<Arc<StrataEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
     Path((agent_id, key)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "state_set").increment(1);
 
     let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+
+    // Cluster mode: replicate through the Raft log (never apply directly off-leader).
+    if let Some(Extension(coord)) = cluster {
+        let coord = coord.read().await;
+        let ar = strata_cluster::raft::types::AppRequest::StateSet {
+            agent_id,
+            key,
+            value: body,
+            tenant,
+        };
+        return match coord.client_write(ar).await {
+            Ok(strata_cluster::raft::types::AppResponse::StateVersion(v)) => {
+                api_ok(serde_json::json!({ "version": v }))
+            }
+            Ok(_) => api_ok(serde_json::json!({ "version": 0 })),
+            Err(e) => cluster_write_error(e),
+        };
+    }
+
     let set = match tenant {
         Some(t) => engine.state_set_for_tenant(&t, &agent_id, &key, body).await,
         None => engine.state_set(&agent_id, &key, body).await,

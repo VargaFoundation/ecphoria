@@ -294,6 +294,26 @@ mod tests {
             .unwrap();
         assert_eq!(engine.memory_count().await.unwrap(), 1);
 
+        // State set through consensus.
+        coord
+            .client_write(AppRequest::StateSet {
+                agent_id: "bot".into(),
+                key: "mood".into(),
+                value: serde_json::json!("happy"),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .state_get("bot", "mood")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            serde_json::json!("happy")
+        );
+
         coord.shutdown().await.unwrap();
     }
 }

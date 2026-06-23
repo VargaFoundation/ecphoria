@@ -271,15 +271,33 @@ impl MemStore {
                 agent_id,
                 key,
                 value,
-            } => match engine.state_set(agent_id, key, value.clone()).await {
-                Ok(v) => AppResponse::StateVersion(v),
-                Err(e) => {
-                    tracing::error!(error = %e, "raft apply: state_set failed");
-                    AppResponse::StateVersion(0)
+                tenant,
+            } => {
+                let res = match tenant {
+                    Some(t) => {
+                        engine
+                            .state_set_for_tenant(t, agent_id, key, value.clone())
+                            .await
+                    }
+                    None => engine.state_set(agent_id, key, value.clone()).await,
+                };
+                match res {
+                    Ok(v) => AppResponse::StateVersion(v),
+                    Err(e) => {
+                        tracing::error!(error = %e, "raft apply: state_set failed");
+                        AppResponse::StateVersion(0)
+                    }
                 }
-            },
-            AppRequest::StateDelete { agent_id, key } => {
-                let _ = engine.state_delete(agent_id, key).await;
+            }
+            AppRequest::StateDelete {
+                agent_id,
+                key,
+                tenant,
+            } => {
+                let _ = match tenant {
+                    Some(t) => engine.state_delete_for_tenant(t, agent_id, key).await,
+                    None => engine.state_delete(agent_id, key).await,
+                };
                 AppResponse::Deleted
             }
             AppRequest::SemanticUpsert {
