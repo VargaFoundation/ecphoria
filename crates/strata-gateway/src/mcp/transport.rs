@@ -1,15 +1,22 @@
-//! MCP transport — JSON-RPC 2.0 over HTTP POST.
+//! MCP transport — Streamable HTTP (JSON-RPC 2.0) at `/mcp`.
 //!
-//! Implements the Model Context Protocol (MCP) server endpoint at `/mcp`. Clients POST JSON-RPC
-//! requests and receive JSON-RPC responses. NOTE: this is **POST-only** — not (yet) a full MCP
-//! "Streamable HTTP" server (no GET/SSE event stream or `Mcp-Session-Id` sessions). Claude Code
-//! connects natively; Claude Desktop connects via the `mcp-remote` bridge. See
-//! `docs/connect-claude.md`.
+//! Implements the Model Context Protocol (MCP) server endpoint:
+//! - **POST `/mcp`** — clients send JSON-RPC requests, receive JSON-RPC responses. The
+//!   `initialize` response carries an `Mcp-Session-Id` header (Streamable HTTP session).
+//! - **GET `/mcp`** — opens a server→client SSE stream. Strata is a stateless tool server
+//!   (no server-initiated messages), so this is an idle keep-alive stream; its presence lets
+//!   Streamable-HTTP clients (e.g. Claude Desktop) connect natively rather than via `mcp-remote`.
+//!
+//! See `docs/connect-claude.md`.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::Stream;
 use strata_core::memory::cognition::{MemoryInput, MemoryScope};
 use strata_core::StrataEngine;
 
@@ -61,12 +68,22 @@ impl McpResponse {
     }
 }
 
-/// Handle MCP JSON-RPC requests.
+/// Open a server→client SSE stream (Streamable HTTP `GET /mcp`).
+///
+/// Strata sends no server-initiated messages, so this is an idle keep-alive stream — it exists
+/// so Streamable-HTTP clients that probe `GET` get a valid `text/event-stream` instead of 405.
+pub async fn handle_mcp_sse() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::pending::<Result<Event, Infallible>>();
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Handle MCP JSON-RPC requests (Streamable HTTP `POST /mcp`).
 pub async fn handle_mcp(
     State(engine): State<Arc<StrataEngine>>,
     Json(req): Json<McpRequest>,
-) -> Json<McpResponse> {
+) -> Response {
     let id = req.id.clone();
+    let is_initialize = req.method == "initialize";
 
     let response = match req.method.as_str() {
         "initialize" => McpResponse::success(
@@ -151,7 +168,13 @@ pub async fn handle_mcp(
         _ => McpResponse::error(id, -32601, format!("method not found: {}", req.method)),
     };
 
-    Json(response)
+    if is_initialize {
+        // Hand the client a session id to echo on subsequent requests (Streamable HTTP).
+        let session_id = uuid::Uuid::new_v4().to_string();
+        ([("Mcp-Session-Id", session_id)], Json(response)).into_response()
+    } else {
+        Json(response).into_response()
+    }
 }
 
 /// Build a memory scope from MCP tool arguments (tenant/user/agent/session).
@@ -446,5 +469,54 @@ async fn call_tool(
         }
 
         _ => Err(format!("unknown tool: {name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn engine() -> Arc<StrataEngine> {
+        let mut c = strata_core::CoreConfig::default();
+        c.memory.episodic.db_path = ":memory:".into();
+        c.memory.state.db_path = ":memory:".into();
+        c.memory.cognition.db_path = ":memory:".into();
+        Arc::new(StrataEngine::new(c).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn initialize_issues_session_id() {
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "initialize".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_mcp(State(engine().await), Json(req)).await;
+        assert!(resp.headers().get("Mcp-Session-Id").is_some());
+    }
+
+    #[tokio::test]
+    async fn non_initialize_has_no_session_id() {
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "ping".into(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_mcp(State(engine().await), Json(req)).await;
+        assert!(resp.headers().get("Mcp-Session-Id").is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_stream_is_event_stream() {
+        let resp = handle_mcp_sse().await.into_response();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("text/event-stream"));
     }
 }

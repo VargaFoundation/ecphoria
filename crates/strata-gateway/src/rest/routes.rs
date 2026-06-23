@@ -171,7 +171,8 @@ pub fn router_with_engine_and_auth(
     let mut protocol_routes = Router::new()
         .route(
             "/mcp",
-            axum::routing::post(crate::mcp::transport::handle_mcp),
+            axum::routing::post(crate::mcp::transport::handle_mcp)
+                .get(crate::mcp::transport::handle_mcp_sse),
         )
         .route(
             "/v1/chat/completions",
