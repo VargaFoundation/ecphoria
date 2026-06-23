@@ -70,5 +70,7 @@ All requests carry **materialized** values so apply is deterministic on every no
 - ClusterCoordinator single-node Raft lifecycle (start → is_leader → shutdown)
 - Consensus round-trip: `client_write` → commit → apply lands on the engine (Ingest/State/Memory)
 - Deterministic apply: the same committed entry yields identical state on two independent engines
-- Note: `NetworkClient` is HTTP-only; true multi-node tests require standing up the gateway Raft
-  RPC endpoints on real ports (not yet automated). openraft covers multi-node replication upstream.
+- **Multi-node** (`tests/multi_node.rs`): a real 3-node openraft cluster over an in-process
+  network proves a leader write commits via quorum and **converges on every node's engine**
+  (same event id) — port-free and non-flaky. The HTTP `NetworkClient` transport itself is
+  covered by the single-node + unit tests (an in-process network is used here for determinism).
