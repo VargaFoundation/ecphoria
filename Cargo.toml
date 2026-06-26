@@ -101,6 +101,13 @@ rustyline = { version = "15" }
 tempfile = { version = "3" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
+[profile.dev]
+# Lighter debug info: keeps file:line in backtraces (panics, RUST_BACKTRACE),
+# but drops full DWARF variable info. Roughly halves the size of target/ for a
+# workspace with heavy native deps (duckdb/protobuf-src/aws-sdk). Set to "full"
+# locally if you need step-through variable inspection in a debugger.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
 
