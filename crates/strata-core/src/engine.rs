@@ -221,6 +221,7 @@ impl StrataEngine {
 
     /// Query events by source.
     pub async fn query_by_source(&self, source: &str, limit: usize) -> Result<Vec<Event>> {
+        let limit = limit.min(self.config.query.max_rows);
         self.episodic.query_by_source(source, limit).await
     }
 
@@ -458,6 +459,7 @@ impl StrataEngine {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>> {
+        let limit = limit.min(self.config.query.max_rows);
         self.episodic.list_sessions(agent_id, limit).await
     }
 
@@ -869,6 +871,8 @@ impl StrataEngine {
 
     /// List active memories in a scope (importance/recency order).
     pub async fn memory_all(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<Memory>> {
+        // Clamp to the configured cap so a caller can't request an unbounded result set (OOM).
+        let limit = limit.min(self.config.query.max_rows);
         self.memory_store.list_active(scope, limit).await
     }
 
@@ -1571,6 +1575,23 @@ mod tests {
         c.memory.state.db_path = ":memory:".into();
         c.memory.cognition.db_path = ":memory:".into();
         c
+    }
+
+    #[tokio::test]
+    async fn memory_all_clamps_to_max_rows() {
+        let mut cfg = inmem_config();
+        cfg.query.max_rows = 2; // hard cap
+        let engine = StrataEngine::new(cfg).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        for i in 0..5 {
+            engine
+                .memory_add(MemoryInput::new(scope.clone(), format!("fact {i}")))
+                .await
+                .unwrap();
+        }
+        // A huge requested limit is clamped to max_rows.
+        let mems = engine.memory_all(&scope, usize::MAX).await.unwrap();
+        assert_eq!(mems.len(), 2, "memory_all must clamp to query.max_rows");
     }
 
     #[tokio::test]
