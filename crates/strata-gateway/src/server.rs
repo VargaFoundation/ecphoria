@@ -37,6 +37,10 @@ pub struct GatewayConfig {
     /// Durable audit-log path (file-backed DuckDB). Empty/`:memory:` = in-memory (non-durable).
     #[serde(default)]
     pub audit_db_path: String,
+    /// HMAC-SHA256 secret for verifying incoming webhook signatures (GitHub-style
+    /// `X-Hub-Signature-256`). When set, unsigned/mis-signed webhooks are rejected.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -75,6 +79,7 @@ impl Default for GatewayConfig {
             rate_limit_per_key: 0,
             oidc: crate::auth::oidc::OidcConfig::default(),
             audit_db_path: "./data/audit.duckdb".into(),
+            webhook_secret: None,
         }
     }
 }
