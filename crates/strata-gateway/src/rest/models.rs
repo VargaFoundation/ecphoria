@@ -112,6 +112,22 @@ pub struct MemoryAddRequest {
     pub mem_type: Option<String>,
 }
 
+/// Consolidate a scope's lowest-importance memories into one summary.
+#[derive(Debug, Deserialize)]
+pub struct MemoryConsolidateRequest {
+    /// Keep this many highest-importance memories; fold the rest. Defaults to 20.
+    #[serde(default)]
+    pub keep: Option<usize>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Search memories within a scope.
 #[derive(Debug, Deserialize)]
 pub struct MemorySearchRequest {

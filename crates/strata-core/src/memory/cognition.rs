@@ -951,6 +951,21 @@ impl MemoryStore {
         Ok(ids)
     }
 
+    /// Expire an active memory by id (bi-temporal soft-delete: `state='expired'`, keeps history).
+    /// Returns true iff a row changed.
+    pub async fn expire(&self, id: Uuid) -> crate::Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let db = self.write_db.lock();
+        let n = db
+            .execute(
+                "UPDATE memories SET state='expired', valid_to=?::TIMESTAMPTZ, \
+                 updated_at=?::TIMESTAMPTZ WHERE id=? AND state='active'",
+                duckdb::params![now, now, id.to_string()],
+            )
+            .map_err(|e| crate::Error::State(format!("expire memory: {e}")))?;
+        Ok(n > 0)
+    }
+
     /// Export the `memories` table to a DuckDB `EXPORT DATABASE` directory (backup/snapshot).
     pub fn export_to(&self, dir: &Path) -> crate::Result<()> {
         let db = self.write_db.lock();

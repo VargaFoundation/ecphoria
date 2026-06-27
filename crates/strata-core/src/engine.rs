@@ -1028,6 +1028,75 @@ impl StrataEngine {
         Ok(out)
     }
 
+    /// Consolidate a scope's lowest-importance memories into one summary memory.
+    ///
+    /// When the scope has more than `keep` active memories, the lowest-importance tail is summarized
+    /// (LLM if `extraction = "llm"` + provider, else a deterministic bullet list), inserted as a new
+    /// memory citing its sources in metadata, and the originals are expired (bi-temporal — history is
+    /// kept). Returns the consolidated memory, or `None` if there was nothing to fold.
+    pub async fn memory_consolidate(
+        &self,
+        scope: &MemoryScope,
+        keep: usize,
+    ) -> Result<Option<MemoryAdd>> {
+        let actives = self
+            .memory_store
+            .list_active(scope, self.config.query.max_rows)
+            .await?;
+        if actives.len() <= keep {
+            return Ok(None);
+        }
+        // list_active is ordered importance DESC, so the tail past `keep` is the lowest-importance set.
+        let to_fold: Vec<Memory> = actives[keep..].to_vec();
+        if to_fold.is_empty() {
+            return Ok(None);
+        }
+
+        let summary = self.summarize_memories(&to_fold).await;
+        let source_ids: Vec<String> = to_fold.iter().map(|m| m.id.to_string()).collect();
+        let mut input = MemoryInput::new(scope.clone(), summary);
+        input.importance = Some(0.6);
+        input.metadata = serde_json::json!({
+            "consolidated": true,
+            "source_memory_ids": source_ids,
+        });
+        let added = self.memory_add(input).await?;
+
+        // Retire the folded originals (soft-delete + drop their vectors).
+        for m in &to_fold {
+            let _ = self.memory_store.expire(m.id).await;
+            let _ = self.memory_index.delete(m.id).await;
+        }
+        Ok(Some(added))
+    }
+
+    /// Summarize a set of memories (opt-in LLM, else a deterministic bullet list).
+    async fn summarize_memories(&self, mems: &[Memory]) -> String {
+        let joined = mems
+            .iter()
+            .map(|m| format!("- {}", m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.config.memory.cognition.extraction == "llm" {
+            if let Some(provider) = &self.completion {
+                if let Ok(text) = provider
+                    .complete(
+                        "Summarize the following memories into a concise paragraph capturing the \
+                         durable facts. Output only the summary.",
+                        &joined,
+                    )
+                    .await
+                {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        return t.to_string();
+                    }
+                }
+            }
+        }
+        format!("Consolidated {} memories:\n{}", mems.len(), joined)
+    }
+
     /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
     async fn extract_facts(&self, raw_text: &str) -> Vec<(Option<String>, String)> {
         if self.config.memory.cognition.extraction == "llm" {
@@ -1700,6 +1769,38 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn memory_consolidate_folds_lowest_importance() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        for i in 0..5 {
+            engine
+                .memory_add(MemoryInput::new(scope.clone(), format!("fact number {i}")))
+                .await
+                .unwrap();
+        }
+        // Keep the top 2; fold the other 3 into one summary memory.
+        let consolidated = engine.memory_consolidate(&scope, 2).await.unwrap();
+        assert!(consolidated.is_some());
+        let mems = engine.memory_all(&scope, 100).await.unwrap();
+        assert_eq!(
+            mems.len(),
+            3,
+            "2 kept + 1 consolidated; the 3 originals are expired"
+        );
+        let summary = mems
+            .iter()
+            .find(|m| m.content.starts_with("Consolidated 3 memories"))
+            .expect("a consolidated memory should exist");
+        assert_eq!(summary.metadata["consolidated"], serde_json::json!(true));
+        // Nothing to fold when within budget.
+        assert!(engine
+            .memory_consolidate(&scope, 10)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -133,6 +133,10 @@ pub fn router_with_engine_and_auth(
             "/admin/memory/decay",
             axum::routing::post(handlers::memory_decay),
         )
+        .route(
+            "/admin/memory/consolidate",
+            axum::routing::post(handlers::memory_consolidate),
+        )
         .route("/sessions", axum::routing::post(handlers::session_start))
         .route(
             "/sessions/{session_id}/end",
