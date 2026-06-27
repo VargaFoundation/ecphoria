@@ -1189,6 +1189,46 @@ impl StrataEngine {
             .await
     }
 
+    /// Multi-hop neighborhood: BFS from `entity` out to `depth` hops, returning the reachable edges
+    /// (deduplicated), capped at `max_edges`.
+    pub async fn memory_subgraph(
+        &self,
+        tenant: &str,
+        entity: &str,
+        depth: usize,
+        max_edges: usize,
+    ) -> Result<Vec<crate::memory::cognition::Edge>> {
+        let cap = max_edges.min(self.config.query.max_rows).max(1);
+        let mut seen_entities = std::collections::HashSet::new();
+        let mut seen_edges = std::collections::HashSet::new();
+        let mut frontier = vec![entity.to_string()];
+        seen_entities.insert(entity.to_string());
+        let mut edges = Vec::new();
+        for _ in 0..depth.max(1) {
+            let mut next = Vec::new();
+            for e in &frontier {
+                for edge in self.memory_store.neighbors(tenant, e, cap).await? {
+                    if seen_edges.insert(edge.id) {
+                        for endpoint in [edge.src.clone(), edge.dst.clone()] {
+                            if seen_entities.insert(endpoint.clone()) {
+                                next.push(endpoint);
+                            }
+                        }
+                        edges.push(edge);
+                        if edges.len() >= cap {
+                            return Ok(edges);
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(edges)
+    }
+
     /// Extract `(subject, relation, object)` triples from text and add them as graph edges.
     /// Returns the number of edges added.
     pub async fn memory_graph_from_text(
@@ -1197,12 +1237,35 @@ impl StrataEngine {
         text: &str,
         source: Option<uuid::Uuid>,
     ) -> Result<usize> {
-        let triples = crate::memory::cognition::extract_triples(text);
+        let triples = self.extract_triples_any(text).await;
         let n = triples.len();
         for (s, r, o) in triples {
             self.memory_link(tenant, &s, &r, &o, source).await?;
         }
         Ok(n)
+    }
+
+    /// Extract triples via LLM when `extraction = "llm"` + a provider is configured, else fall back
+    /// to the deterministic verb-pattern extractor.
+    async fn extract_triples_any(&self, text: &str) -> Vec<(String, String, String)> {
+        if self.config.memory.cognition.extraction == "llm" {
+            if let Some(provider) = &self.completion {
+                if let Ok(out) = provider
+                    .complete(
+                        "Extract factual relationships from the text as lines of \
+                         `subject | relation | object`. Output only those lines, nothing else.",
+                        text,
+                    )
+                    .await
+                {
+                    let parsed = parse_triple_lines(&out);
+                    if !parsed.is_empty() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+        crate::memory::cognition::extract_triples(text)
     }
 
     /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
@@ -1681,6 +1744,24 @@ pub(crate) fn scoped_agent(tenant: &str, agent_id: &str) -> String {
 /// Leniently parse an LLM extraction response into `(subject, content)` facts.
 ///
 /// Tolerates surrounding prose / Markdown fences by extracting the outermost `[...]` array.
+/// Parse LLM output of `subject | relation | object` lines into triples (relations normalized).
+fn parse_triple_lines(text: &str) -> Vec<(String, String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('|').map(|p| p.trim()).collect();
+            if parts.len() == 3 && !parts[0].is_empty() && !parts[2].is_empty() {
+                Some((
+                    parts[0].to_string(),
+                    parts[1].to_lowercase().replace(' ', "_"),
+                    parts[2].to_string(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn parse_extracted_facts(text: &str) -> Option<Vec<(Option<String>, String)>> {
     let start = text.find('[')?;
     let end = text.rfind(']')?;
@@ -1876,6 +1957,59 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn parse_triple_lines_parses_pipe_format() {
+        let t = parse_triple_lines("Alice | likes | coffee\nBob | works at | Acme\ngarbage line");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0], ("Alice".into(), "likes".into(), "coffee".into()));
+        assert_eq!(t[1], ("Bob".into(), "works_at".into(), "Acme".into()));
+    }
+
+    #[tokio::test]
+    async fn memory_subgraph_traverses_multiple_hops() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        // A → B → C → D chain.
+        engine
+            .memory_link("default", "A", "to", "B", None)
+            .await
+            .unwrap();
+        engine
+            .memory_link("default", "B", "to", "C", None)
+            .await
+            .unwrap();
+        engine
+            .memory_link("default", "C", "to", "D", None)
+            .await
+            .unwrap();
+        // 1 hop from A reaches only the A→B edge.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 1, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // 2 hops reaches A→B and B→C.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 2, 100)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // 3 hops reaches the whole chain.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 3, 100)
+                .await
+                .unwrap()
+                .len(),
+            3
         );
     }
 

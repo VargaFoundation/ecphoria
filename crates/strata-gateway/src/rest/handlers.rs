@@ -1296,10 +1296,20 @@ pub async fn memory_graph(
         .as_ref()
         .and_then(|Extension(c)| c.tenant_id.clone())
         .unwrap_or_else(|| "default".into());
-    match engine
-        .memory_neighbors(&tenant, &params.entity, params.limit.unwrap_or(50))
-        .await
-    {
+    let limit = params.limit.unwrap_or(50);
+    let result = match params.depth {
+        Some(d) if d > 1 => {
+            engine
+                .memory_subgraph(&tenant, &params.entity, d, limit)
+                .await
+        }
+        _ => {
+            engine
+                .memory_neighbors(&tenant, &params.entity, limit)
+                .await
+        }
+    };
+    match result {
         Ok(edges) => api_ok(serde_json::json!({ "entity": params.entity, "edges": edges })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -158,12 +158,14 @@ pub struct MemoryLinkRequest {
     pub dst: String,
 }
 
-/// Query a memory entity's 1-hop neighborhood.
+/// Query a memory entity's neighborhood (1 hop by default, `depth` for multi-hop traversal).
 #[derive(Debug, Deserialize)]
 pub struct MemoryGraphQuery {
     pub entity: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 /// Search memories within a scope.
