@@ -40,3 +40,15 @@ docker-compose.override.yml
 
 # Misc
 *.log
+
+# Runtime data stores (DuckDB / SQLite / USearch / Raft logs) — never commit
+**/data/*.duckdb
+**/data/*.duckdb.wal
+**/data/*.db
+**/data/*.db-wal
+**/data/*.db-shm
+**/data/state.db
+**/data/raft/
+**/data/wal/
+**/data/backups/
+**/data/*.usearch
