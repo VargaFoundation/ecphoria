@@ -114,9 +114,10 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
 }
 
 /// Factory creating a lazily-connected gRPC `Channel` per peer (HTTP/2, auto-reconnect). Carries
-/// the optional cluster auth token attached to every outbound RPC.
+/// the optional cluster auth token attached to every outbound RPC, and optional client TLS.
 pub struct GrpcRaftNetworkFactory {
     pub secret: Option<String>,
+    pub tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetworkFactory {
@@ -124,9 +125,14 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetworkFactory {
 
     async fn new_client(&mut self, _target: NodeId, node: &NodeInfo) -> GrpcRaftNetwork {
         // `connect_lazy` never fails here; the first RPC establishes (and retries) the connection.
-        let channel = Endpoint::from_shared(node.addr.clone())
-            .ok()
-            .map(|e| e.connect_lazy());
+        // When TLS is configured the peer addr must use the `https://` scheme.
+        let channel = Endpoint::from_shared(node.addr.clone()).ok().and_then(|e| {
+            let e = match &self.tls {
+                Some(t) => e.tls_config(t.clone()).ok()?,
+                None => e,
+            };
+            Some(e.connect_lazy())
+        });
         GrpcRaftNetwork {
             addr: node.addr.clone(),
             channel,
@@ -141,7 +147,10 @@ mod tests {
 
     #[tokio::test]
     async fn factory_builds_lazy_channel() {
-        let mut factory = GrpcRaftNetworkFactory { secret: None };
+        let mut factory = GrpcRaftNetworkFactory {
+            secret: None,
+            tls: None,
+        };
         let net = factory
             .new_client(
                 2,
@@ -158,7 +167,10 @@ mod tests {
 
     #[tokio::test]
     async fn factory_tolerates_bad_endpoint() {
-        let mut factory = GrpcRaftNetworkFactory { secret: None };
+        let mut factory = GrpcRaftNetworkFactory {
+            secret: None,
+            tls: None,
+        };
         let net = factory
             .new_client(
                 2,

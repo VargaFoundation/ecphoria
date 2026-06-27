@@ -74,9 +74,14 @@ stay on the HTTP gateway.
 
 **Inter-node auth:** set `STRATA_CLUSTER__SECRET` to require a shared Bearer token on every Raft
 RPC — the server rejects RPCs without it (constant-time check), so an unauthorized node can't inject
-AppendEntries/Vote and corrupt the cluster. `None` = no auth (single-node / trusted network). This is
-authentication, not encryption — for confidentiality use a service mesh / mTLS sidecar at the infra
-layer (transport-level TLS in-process is a future option).
+AppendEntries/Vote and corrupt the cluster. `None` = no auth (single-node / trusted network).
+
+**TLS (encryption + optional mTLS):** set `cluster.tls` (`cert_path`, `key_path`, optional `ca_path`,
+`domain`) to run the Raft gRPC transport over TLS. With `ca_path` the server requires + verifies peer
+certs (mutual TLS) and clients trust that CA. When TLS is on, peer addresses must use the `https://`
+scheme. The shared secret and TLS compose (TLS = confidentiality + peer identity; secret = cheap
+app-level check). `raft/tls.rs` builds the tonic configs from PEM files. A mesh/mTLS sidecar remains
+a valid alternative at the infra layer.
 
 **Migration caveat:** the wire format AND on-disk log format are binary (MessagePack) — a breaking
 change from the previous JSON. All nodes must run the same version, and on upgrade each node's
