@@ -104,3 +104,96 @@ async fn three_node_grpc_cluster_replicates_over_sockets() {
         let _ = c.shutdown().await;
     }
 }
+
+/// Write one shared self-signed cert (SAN "strata") + key, reused as the CA, and return a TLS config
+/// pointing at them (mutual TLS — every node presents and trusts the same identity).
+fn shared_tls(dir: &std::path::Path) -> strata_cluster::config::RaftTlsConfig {
+    let cert = rcgen::generate_simple_self_signed(vec!["strata".to_string()]).unwrap();
+    let cert_path = dir.join("node.pem");
+    let key_path = dir.join("node.key");
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&ca_path, cert.cert.pem()).unwrap(); // self-signed: cert is its own CA
+    strata_cluster::config::RaftTlsConfig {
+        cert_path: cert_path.to_string_lossy().into(),
+        key_path: key_path.to_string_lossy().into(),
+        ca_path: Some(ca_path.to_string_lossy().into()),
+        domain: "strata".into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_grpc_cluster_replicates_over_mtls() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = shared_tls(dir.path());
+
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    // TLS requires the `https://` scheme on peer addresses.
+    let peers: Vec<String> = ports
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}@https://127.0.0.1:{}", i + 1, p))
+        .collect();
+
+    let mut engines = Vec::new();
+    let mut coords: Vec<ClusterCoordinator> = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        let engine = inmem_engine().await;
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: (i + 1) as u64,
+            listen: format!("127.0.0.1:{port}"),
+            peers: peers.clone(),
+            data_dir: ":memory:".into(),
+            secret: Some("test-cluster-secret".into()),
+            tls: Some(tls.clone()),
+            shards: 1,
+        };
+        let mut coord = ClusterCoordinator::new(config);
+        coord.start_raft(engine.clone()).await.unwrap();
+        engines.push(engine);
+        coords.push(coord);
+    }
+
+    // Leader election requires successful mTLS handshakes between every pair of nodes.
+    let mut elected = false;
+    for _ in 0..200 {
+        if coords.iter().any(|c| c.is_leader()) {
+            elected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(elected, "cluster did not elect a leader over mTLS");
+
+    let leader = coords
+        .iter()
+        .find(|c| c.is_leader())
+        .expect("a leader coordinator");
+    let ev = strata_core::memory::episodic::Event::new("tls", "e", serde_json::json!({"t": 1}));
+    leader
+        .client_write(AppRequest::Ingest {
+            events: vec![ev],
+            tenant: None,
+        })
+        .await
+        .unwrap();
+
+    // The committed write converges on every node — over real TLS sockets.
+    for (i, engine) in engines.iter().enumerate() {
+        let mut converged = false;
+        for _ in 0..100 {
+            if engine.event_count().await.unwrap() == 1 {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(converged, "node {} did not converge over mTLS", i + 1);
+    }
+
+    for mut c in coords {
+        let _ = c.shutdown().await;
+    }
+}

@@ -27,6 +27,8 @@ pub struct StrataEngine {
     memory_store: Arc<MemoryStore>,
     /// Vector index over memories only (kept separate from event embeddings).
     memory_index: Arc<SemanticStore>,
+    /// Per-modality vector indexes (mixed-dimension multi-modal embeddings).
+    modal: crate::memory::semantic::MultiModalStore,
     ingest: IngestPipeline,
     /// Shared embedding provider for embed-and-search operations.
     embedding: Option<Arc<dyn EmbeddingProvider>>,
@@ -185,6 +187,7 @@ impl StrataEngine {
             state,
             memory_store,
             memory_index,
+            modal: crate::memory::semantic::MultiModalStore::new(),
             ingest,
             completion,
         })
@@ -327,17 +330,21 @@ impl StrataEngine {
             metadata = serde_json::json!({});
         }
         metadata["modality"] = serde_json::json!(modality);
-        self.semantic
-            .upsert(&SemanticEntry {
-                id,
-                content: content.into(),
-                embedding,
-                metadata,
-            })
+        // Route to the per-modality index so mixed dimensions (e.g. 512-d CLIP, 768-d text) coexist.
+        self.modal
+            .upsert(
+                modality,
+                &SemanticEntry {
+                    id,
+                    content: content.into(),
+                    embedding,
+                    metadata,
+                },
+            )
             .await
     }
 
-    /// Vector search restricted to one modality (or all when `modality` is None).
+    /// Vector search restricted to one modality (or all matching-dimension modalities when None).
     pub async fn semantic_search_modal(
         &self,
         vector: &[f32],
@@ -345,16 +352,14 @@ impl StrataEngine {
         modality: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         match modality {
-            Some(m) => {
-                let m = m.to_string();
-                self.semantic
-                    .search_filtered(vector, k, move |e| {
-                        e.metadata.get("modality").and_then(|v| v.as_str()) == Some(&m)
-                    })
-                    .await
-            }
-            None => self.semantic.search(vector, k).await,
+            Some(m) => self.modal.search(m, vector, k).await,
+            None => self.modal.search_all(vector, k).await,
         }
+    }
+
+    /// Modalities that currently have a vector index.
+    pub fn modalities(&self) -> Vec<String> {
+        self.modal.modalities()
     }
 
     /// Search semantic memory with metadata filters.
@@ -1177,6 +1182,18 @@ impl StrataEngine {
         self.memory_store.add_edge(tenant, &edge).await
     }
 
+    /// Apply a fully-materialized graph edge (deterministic — used by Raft apply so every node
+    /// inserts the identical row, edge id included).
+    pub async fn graph_apply_edge(
+        &self,
+        tenant: Option<&str>,
+        edge: &crate::memory::cognition::Edge,
+    ) -> Result<()> {
+        self.memory_store
+            .add_edge(tenant.unwrap_or("default"), edge)
+            .await
+    }
+
     /// Edges incident to `entity` (its 1-hop neighborhood) for a tenant.
     pub async fn memory_neighbors(
         &self,
@@ -1189,6 +1206,46 @@ impl StrataEngine {
             .await
     }
 
+    /// Multi-hop neighborhood: BFS from `entity` out to `depth` hops, returning the reachable edges
+    /// (deduplicated), capped at `max_edges`.
+    pub async fn memory_subgraph(
+        &self,
+        tenant: &str,
+        entity: &str,
+        depth: usize,
+        max_edges: usize,
+    ) -> Result<Vec<crate::memory::cognition::Edge>> {
+        let cap = max_edges.min(self.config.query.max_rows).max(1);
+        let mut seen_entities = std::collections::HashSet::new();
+        let mut seen_edges = std::collections::HashSet::new();
+        let mut frontier = vec![entity.to_string()];
+        seen_entities.insert(entity.to_string());
+        let mut edges = Vec::new();
+        for _ in 0..depth.max(1) {
+            let mut next = Vec::new();
+            for e in &frontier {
+                for edge in self.memory_store.neighbors(tenant, e, cap).await? {
+                    if seen_edges.insert(edge.id) {
+                        for endpoint in [edge.src.clone(), edge.dst.clone()] {
+                            if seen_entities.insert(endpoint.clone()) {
+                                next.push(endpoint);
+                            }
+                        }
+                        edges.push(edge);
+                        if edges.len() >= cap {
+                            return Ok(edges);
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(edges)
+    }
+
     /// Extract `(subject, relation, object)` triples from text and add them as graph edges.
     /// Returns the number of edges added.
     pub async fn memory_graph_from_text(
@@ -1197,12 +1254,35 @@ impl StrataEngine {
         text: &str,
         source: Option<uuid::Uuid>,
     ) -> Result<usize> {
-        let triples = crate::memory::cognition::extract_triples(text);
+        let triples = self.extract_triples_any(text).await;
         let n = triples.len();
         for (s, r, o) in triples {
             self.memory_link(tenant, &s, &r, &o, source).await?;
         }
         Ok(n)
+    }
+
+    /// Extract triples via LLM when `extraction = "llm"` + a provider is configured, else fall back
+    /// to the deterministic verb-pattern extractor.
+    async fn extract_triples_any(&self, text: &str) -> Vec<(String, String, String)> {
+        if self.config.memory.cognition.extraction == "llm" {
+            if let Some(provider) = &self.completion {
+                if let Ok(out) = provider
+                    .complete(
+                        "Extract factual relationships from the text as lines of \
+                         `subject | relation | object`. Output only those lines, nothing else.",
+                        text,
+                    )
+                    .await
+                {
+                    let parsed = parse_triple_lines(&out);
+                    if !parsed.is_empty() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+        crate::memory::cognition::extract_triples(text)
     }
 
     /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
@@ -1681,6 +1761,24 @@ pub(crate) fn scoped_agent(tenant: &str, agent_id: &str) -> String {
 /// Leniently parse an LLM extraction response into `(subject, content)` facts.
 ///
 /// Tolerates surrounding prose / Markdown fences by extracting the outermost `[...]` array.
+/// Parse LLM output of `subject | relation | object` lines into triples (relations normalized).
+fn parse_triple_lines(text: &str) -> Vec<(String, String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('|').map(|p| p.trim()).collect();
+            if parts.len() == 3 && !parts[0].is_empty() && !parts[2].is_empty() {
+                Some((
+                    parts[0].to_string(),
+                    parts[1].to_lowercase().replace(' ', "_"),
+                    parts[2].to_string(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn parse_extracted_facts(text: &str) -> Option<Vec<(Option<String>, String)>> {
     let start = text.find('[')?;
     let end = text.rfind(']')?;
@@ -1879,19 +1977,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_triple_lines_parses_pipe_format() {
+        let t = parse_triple_lines("Alice | likes | coffee\nBob | works at | Acme\ngarbage line");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0], ("Alice".into(), "likes".into(), "coffee".into()));
+        assert_eq!(t[1], ("Bob".into(), "works_at".into(), "Acme".into()));
+    }
+
     #[tokio::test]
-    async fn multimodal_upsert_and_search_by_modality() {
+    async fn memory_subgraph_traverses_multiple_hops() {
         let engine = StrataEngine::new(inmem_config()).await.unwrap();
-        let mut text_vec = vec![0.0f32; 768];
-        text_vec[0] = 1.0;
-        let mut img_vec = vec![0.0f32; 768];
-        img_vec[1] = 1.0;
+        // A → B → C → D chain.
+        engine
+            .memory_link("default", "A", "to", "B", None)
+            .await
+            .unwrap();
+        engine
+            .memory_link("default", "B", "to", "C", None)
+            .await
+            .unwrap();
+        engine
+            .memory_link("default", "C", "to", "D", None)
+            .await
+            .unwrap();
+        // 1 hop from A reaches only the A→B edge.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 1, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // 2 hops reaches A→B and B→C.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 2, 100)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // 3 hops reaches the whole chain.
+        assert_eq!(
+            engine
+                .memory_subgraph("default", "A", 3, 100)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn multimodal_indexes_support_mixed_dimensions() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        // Different modalities can have DIFFERENT vector dimensions (separate per-modality indexes).
+        let text_vec = vec![0.1f32; 768]; // e.g. a text embedder
+        let img_vec = vec![0.2f32; 512]; // e.g. CLIP image embeddings
         engine
             .semantic_upsert_modal(
                 uuid::Uuid::new_v4(),
                 "text",
                 "a caption",
-                text_vec,
+                text_vec.clone(),
                 serde_json::json!({}),
             )
             .await
@@ -1906,19 +2056,32 @@ mod tests {
             )
             .await
             .unwrap();
-        // Filtered to images → only the image entry, regardless of vector proximity.
-        let hits = engine
+        assert_eq!(
+            engine.modalities().len(),
+            2,
+            "two independent modality indexes"
+        );
+
+        // Each modality searches with its own dimension.
+        let img_hits = engine
             .semantic_search_modal(&img_vec, 5, Some("image"))
             .await
             .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].entry.content, "cat.png");
-        // Filtering to text excludes the image.
+        assert_eq!(img_hits.len(), 1);
+        assert_eq!(img_hits[0].entry.content, "cat.png");
         let text_hits = engine
-            .semantic_search_modal(&img_vec, 5, Some("text"))
+            .semantic_search_modal(&text_vec, 5, Some("text"))
             .await
             .unwrap();
-        assert!(text_hits.iter().all(|h| h.entry.content != "cat.png"));
+        assert_eq!(text_hits.len(), 1);
+        assert_eq!(text_hits[0].entry.content, "a caption");
+
+        // search_all with a 512-d vector only hits the matching-dimension (image) index.
+        let all = engine
+            .semantic_search_modal(&img_vec, 5, None)
+            .await
+            .unwrap();
+        assert!(all.iter().all(|h| h.entry.content == "cat.png"));
     }
 
     #[tokio::test]

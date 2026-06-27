@@ -19,6 +19,8 @@ openraft.workspace = true
 # gRPC transport for inter-node Raft RPCs (HTTP/2 + binary).
 tonic.workspace = true
 prost.workspace = true
+# TLS crypto provider for the Raft transport (installed once before tonic TLS use).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 serde.workspace = true
 serde_json.workspace = true

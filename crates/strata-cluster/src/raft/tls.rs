@@ -13,8 +13,18 @@ fn read_pem(path: &str, what: &str) -> crate::Result<Vec<u8>> {
     fs::read(path).map_err(|e| crate::Error::Coordination(format!("read TLS {what} '{path}': {e}")))
 }
 
+/// rustls 0.23 requires a process-wide `CryptoProvider`; install the ring provider once. Idempotent
+/// (a second install is ignored) so it's safe to call from every TLS-config build.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Server-side TLS: present this node's identity; require + verify client certs when a CA is set.
 pub fn server_tls(cfg: &RaftTlsConfig) -> crate::Result<ServerTlsConfig> {
+    ensure_crypto_provider();
     let cert = read_pem(&cfg.cert_path, "cert")?;
     let key = read_pem(&cfg.key_path, "key")?;
     let mut s = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
@@ -26,6 +36,7 @@ pub fn server_tls(cfg: &RaftTlsConfig) -> crate::Result<ServerTlsConfig> {
 
 /// Client-side TLS: trust the configured CA (if any) and present this node's identity (mTLS).
 pub fn client_tls(cfg: &RaftTlsConfig) -> crate::Result<ClientTlsConfig> {
+    ensure_crypto_provider();
     let mut c = ClientTlsConfig::new().domain_name(cfg.domain.clone());
     if let Some(ca) = &cfg.ca_path {
         c = c.ca_certificate(Certificate::from_pem(read_pem(ca, "ca")?));

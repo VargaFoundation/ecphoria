@@ -4642,6 +4642,7 @@ dependencies = [
  "rcgen",
  "rmp-serde",
  "rusqlite",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "strata-core",

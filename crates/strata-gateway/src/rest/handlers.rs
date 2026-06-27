@@ -1265,6 +1265,9 @@ pub async fn semantic_modal_search(
 pub async fn memory_link(
     State(engine): State<Arc<StrataEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
     Json(req): Json<MemoryLinkRequest>,
 ) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_link").increment(1);
@@ -1272,6 +1275,29 @@ pub async fn memory_link(
         .as_ref()
         .and_then(|Extension(c)| c.tenant_id.clone())
         .unwrap_or_else(|| "default".into());
+
+    // Cluster mode: generate the edge (id) on the leader and replicate it through the Raft log so
+    // followers apply the identical row (was previously snapshot-only).
+    if let Some(Extension(coord)) = cluster {
+        let edge = strata_core::memory::cognition::Edge {
+            id: uuid::Uuid::new_v4(),
+            src: req.src,
+            relation: req.relation,
+            dst: req.dst,
+            weight: 1.0,
+            source_memory_id: None,
+        };
+        let coord = coord.read().await;
+        let ar = strata_cluster::raft::types::AppRequest::GraphAddEdge {
+            tenant: Some(tenant),
+            edge,
+        };
+        return match coord.client_write(ar).await {
+            Ok(_) => api_ok(serde_json::json!({ "status": "ok" })),
+            Err(e) => cluster_write_error(e),
+        };
+    }
+
     match engine
         .memory_link(&tenant, &req.src, &req.relation, &req.dst, None)
         .await
@@ -1296,10 +1322,20 @@ pub async fn memory_graph(
         .as_ref()
         .and_then(|Extension(c)| c.tenant_id.clone())
         .unwrap_or_else(|| "default".into());
-    match engine
-        .memory_neighbors(&tenant, &params.entity, params.limit.unwrap_or(50))
-        .await
-    {
+    let limit = params.limit.unwrap_or(50);
+    let result = match params.depth {
+        Some(d) if d > 1 => {
+            engine
+                .memory_subgraph(&tenant, &params.entity, d, limit)
+                .await
+        }
+        _ => {
+            engine
+                .memory_neighbors(&tenant, &params.entity, limit)
+                .await
+        }
+    };
+    match result {
         Ok(edges) => api_ok(serde_json::json!({ "entity": params.entity, "edges": edges })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
