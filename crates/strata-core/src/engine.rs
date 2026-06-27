@@ -47,10 +47,13 @@ impl StrataEngine {
     pub async fn new(config: CoreConfig) -> Result<Self> {
         // Initialize episodic store (file-backed or in-memory DuckDB)
         let episodic_path = Path::new(&config.memory.episodic.db_path);
-        let episodic = Arc::new(EpisodicStore::open(episodic_path).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "falling back to in-memory episodic store");
-            EpisodicStore::new()
-        }));
+        let episodic = Arc::new(
+            EpisodicStore::open(episodic_path, config.memory.episodic.read_pool_size)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "falling back to in-memory episodic store");
+                    EpisodicStore::new()
+                }),
+        );
         if config.memory.episodic.db_path != ":memory:" {
             tracing::info!(path = %config.memory.episodic.db_path, "episodic store: file-backed");
         }
@@ -70,10 +73,14 @@ impl StrataEngine {
 
         // Initialize memory-cognition store (bi-temporal facts) + its dedicated vector index
         let memory_path = Path::new(&config.memory.cognition.db_path);
-        let memory_store = Arc::new(MemoryStore::open(memory_path).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "falling back to in-memory cognition store");
-            MemoryStore::new()
-        }));
+        let memory_store = Arc::new(
+            MemoryStore::open(memory_path, config.memory.cognition.read_pool_size).unwrap_or_else(
+                |e| {
+                    tracing::warn!(error = %e, "falling back to in-memory cognition store");
+                    MemoryStore::new()
+                },
+            ),
+        );
         let memory_index = Arc::new(
             SemanticStore::with_dimension(config.embedding.dimension)
                 .unwrap_or_else(|_| SemanticStore::new()),
