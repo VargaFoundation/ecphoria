@@ -624,6 +624,22 @@ pub async fn delete_tenant(
     }
 }
 
+/// Re-embed events left unembedded (e.g. provider was down at ingest). Admin; closes cross-store gap.
+pub async fn reindex(State(engine): State<Arc<StrataEngine>>) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "reindex").increment(1);
+    match engine.reindex_unembedded(10_000).await {
+        Ok(reindexed) => {
+            let pending = engine.unembedded_count().await.unwrap_or(0);
+            api_ok(serde_json::json!({ "reindexed": reindexed, "pending": pending }))
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REINDEX_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn backup(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "backup").increment(1);
 
@@ -1176,6 +1192,123 @@ pub async fn memory_history(
 /// Forget low-value memories via time-decay of importance (admin).
 ///
 /// POST /api/v1/admin/memory/decay
+pub async fn memory_consolidate(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<MemoryConsolidateRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_consolidate")
+        .increment(1);
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    match engine
+        .memory_consolidate(&scope, req.keep.unwrap_or(20))
+        .await
+    {
+        Ok(Some(m)) => api_ok(serde_json::json!({ "consolidated": m })),
+        Ok(None) => api_ok(serde_json::json!({ "consolidated": null })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Upsert a pre-computed multi-modal embedding (text/image/audio/…).
+pub async fn semantic_upsert(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<SemanticUpsertRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "semantic_upsert").increment(1);
+    let id = req
+        .id
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    match engine
+        .semantic_upsert_modal(
+            id,
+            &req.modality,
+            req.content,
+            req.embedding,
+            req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+    {
+        Ok(()) => api_ok(serde_json::json!({ "id": id.to_string() })),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "SEMANTIC_ERROR", e.to_string()),
+    }
+}
+
+/// Vector search optionally restricted to one modality.
+pub async fn semantic_modal_search(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<ModalSearchRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "semantic_modal_search")
+        .increment(1);
+    match engine
+        .semantic_search_modal(&req.vector, req.k.unwrap_or(5), req.modality.as_deref())
+        .await
+    {
+        Ok(results) => api_ok(serde_json::json!({ "results": results })),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "SEMANTIC_ERROR", e.to_string()),
+    }
+}
+
+/// Add a graph edge between two entities (tenant-scoped).
+pub async fn memory_link(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<MemoryLinkRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_link").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .memory_link(&tenant, &req.src, &req.relation, &req.dst, None)
+        .await
+    {
+        Ok(()) => api_ok(serde_json::json!({ "status": "ok" })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Get an entity's 1-hop neighborhood in the memory graph (tenant-scoped).
+pub async fn memory_graph(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(params): axum::extract::Query<MemoryGraphQuery>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_graph").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .memory_neighbors(&tenant, &params.entity, params.limit.unwrap_or(50))
+        .await
+    {
+        Ok(edges) => api_ok(serde_json::json!({ "entity": params.entity, "edges": edges })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn memory_decay(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_decay").increment(1);
     match engine.memory_enforce_decay().await {

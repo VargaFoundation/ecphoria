@@ -112,6 +112,60 @@ pub struct MemoryAddRequest {
     pub mem_type: Option<String>,
 }
 
+/// Consolidate a scope's lowest-importance memories into one summary.
+#[derive(Debug, Deserialize)]
+pub struct MemoryConsolidateRequest {
+    /// Keep this many highest-importance memories; fold the rest. Defaults to 20.
+    #[serde(default)]
+    pub keep: Option<usize>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Upsert a pre-computed multi-modal embedding (caller brings its own modality encoder).
+#[derive(Debug, Deserialize)]
+pub struct SemanticUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub modality: String,
+    pub content: String,
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Vector search optionally restricted to one modality.
+#[derive(Debug, Deserialize)]
+pub struct ModalSearchRequest {
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub k: Option<usize>,
+    #[serde(default)]
+    pub modality: Option<String>,
+}
+
+/// Add a graph edge (entity → relation → entity).
+#[derive(Debug, Deserialize)]
+pub struct MemoryLinkRequest {
+    pub src: String,
+    pub relation: String,
+    pub dst: String,
+}
+
+/// Query a memory entity's 1-hop neighborhood.
+#[derive(Debug, Deserialize)]
+pub struct MemoryGraphQuery {
+    pub entity: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Search memories within a scope.
 #[derive(Debug, Deserialize)]
 pub struct MemorySearchRequest {

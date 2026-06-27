@@ -1,5 +1,25 @@
 use serde::Deserialize;
 
+/// TLS for the inter-node Raft gRPC transport. When set, the server presents `cert`/`key`; when
+/// `ca` is also set, peers are verified against it (mutual TLS) and clients trust it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RaftTlsConfig {
+    /// PEM path to this node's certificate.
+    pub cert_path: String,
+    /// PEM path to this node's private key.
+    pub key_path: String,
+    /// PEM path to the CA that signs peer certs (enables mTLS + client trust). Optional.
+    pub ca_path: Option<String>,
+    /// SNI/domain name the cert is issued for (client-side verification). Default "strata".
+    #[serde(default = "default_tls_domain")]
+    pub domain: String,
+}
+
+fn default_tls_domain() -> String {
+    "strata".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
@@ -14,6 +34,18 @@ pub struct ClusterConfig {
     /// node from injecting AppendEntries/Vote and corrupting the cluster. `None` = no auth.
     #[serde(default)]
     pub secret: Option<String>,
+    /// TLS for the Raft transport (encryption in transit + optional mTLS). `None` = cleartext
+    /// HTTP/2 (rely on a service mesh / private network for confidentiality).
+    #[serde(default)]
+    pub tls: Option<RaftTlsConfig>,
+    /// Number of write shards (independent Raft groups). 1 = single group (today's default). >1 is
+    /// the consistent-hash routing foundation for horizontal write scaling.
+    #[serde(default = "default_shards")]
+    pub shards: usize,
+}
+
+fn default_shards() -> usize {
+    1
 }
 
 impl Default for ClusterConfig {
@@ -25,6 +57,8 @@ impl Default for ClusterConfig {
             peers: vec![],
             data_dir: "./data/raft".into(),
             secret: None,
+            tls: None,
+            shards: 1,
         }
     }
 }
@@ -73,6 +107,8 @@ mod tests {
             peers: vec!["peer1:9433".into()],
             data_dir: "/tmp/raft".into(),
             secret: None,
+            tls: None,
+            shards: 1,
         };
         let cloned = config.clone();
         assert_eq!(cloned.node_id, 5);

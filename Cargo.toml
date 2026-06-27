@@ -36,7 +36,7 @@ hyper = { version = "1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # gRPC
-tonic = { version = "0.12" }
+tonic = { version = "0.12", features = ["tls"] }
 prost = { version = "0.13" }
 prost-types = { version = "0.13" }
 tonic-build = { version = "0.12" }

@@ -104,6 +104,7 @@ pub fn router_with_engine_and_auth(
             axum::routing::get(handlers::retention_policies).put(handlers::retention_policies),
         )
         .route("/admin/backup", axum::routing::post(handlers::backup))
+        .route("/admin/reindex", axum::routing::post(handlers::reindex))
         .route(
             "/admin/tenants/{tenant_id}",
             axum::routing::delete(handlers::delete_tenant),
@@ -132,6 +133,23 @@ pub fn router_with_engine_and_auth(
         .route(
             "/admin/memory/decay",
             axum::routing::post(handlers::memory_decay),
+        )
+        .route(
+            "/admin/memory/consolidate",
+            axum::routing::post(handlers::memory_consolidate),
+        )
+        .route(
+            "/semantic/upsert",
+            axum::routing::post(handlers::semantic_upsert),
+        )
+        .route(
+            "/semantic/search",
+            axum::routing::post(handlers::semantic_modal_search),
+        )
+        .route("/memories/link", axum::routing::post(handlers::memory_link))
+        .route(
+            "/memories/graph",
+            axum::routing::get(handlers::memory_graph),
         )
         .route("/sessions", axum::routing::post(handlers::session_start))
         .route(

@@ -35,13 +35,25 @@ impl ClusterCoordinator {
         }
     }
 
+    /// Consistent-hash router for this cluster's write shards (see [`crate::shard`]). Single-group
+    /// clusters (`shards = 1`) route everything to shard 0; the accessor lets call sites compute a
+    /// key's target shard now, ahead of multi-group wiring.
+    pub fn shard_router(&self) -> crate::ShardRouter {
+        crate::ShardRouter::new(self.config.shards, 128)
+    }
+
     /// Start the Raft instance with the production gRPC network, and (in multi-node mode) serve
     /// this node's Raft instance to peers over gRPC on `cluster.listen`.
     pub async fn start_raft(&mut self, engine: Arc<StrataEngine>) -> crate::Result<()> {
+        let tls = match &self.config.tls {
+            Some(t) => Some(crate::raft::tls::client_tls(t)?),
+            None => None,
+        };
         self.start_raft_with_network(
             engine,
             GrpcRaftNetworkFactory {
                 secret: self.config.secret.clone(),
+                tls,
             },
         )
         .await?;
@@ -64,9 +76,15 @@ impl ClusterCoordinator {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let service =
             RaftGrpcServer::new(Arc::new(raft), self.config.secret.clone()).into_service();
+        let mut server = tonic::transport::Server::builder();
+        if let Some(t) = &self.config.tls {
+            server = server
+                .tls_config(crate::raft::tls::server_tls(t)?)
+                .map_err(|e| crate::Error::Coordination(format!("Raft server TLS: {e}")))?;
+        }
         tokio::spawn(async move {
             tracing::info!(%addr, "Raft gRPC server listening");
-            let result = tonic::transport::Server::builder()
+            let result = server
                 .add_service(service)
                 .serve_with_shutdown(addr, async {
                     let _ = rx.await;

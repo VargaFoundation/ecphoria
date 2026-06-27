@@ -202,6 +202,21 @@ impl StrataEngine {
         self.ingest.ingest(events).await
     }
 
+    /// Number of events whose vectors are not yet in the semantic index (cross-store drift gauge).
+    pub async fn unembedded_count(&self) -> Result<u64> {
+        self.episodic.unembedded_count().await
+    }
+
+    /// Re-embed and index up to `limit` events that were left unembedded (e.g. the embedding
+    /// provider was down at ingest). Returns the number newly indexed. Closes the cross-store gap.
+    pub async fn reindex_unembedded(&self, limit: usize) -> Result<usize> {
+        let events = self.episodic.unembedded_events(limit).await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.ingest.embed_and_index(&events).await)
+    }
+
     /// Ingest events scoped to a specific tenant.
     ///
     /// Sets the tenant_id on all events before ingestion so that
@@ -295,6 +310,51 @@ impl StrataEngine {
     /// Search semantic memory by vector.
     pub async fn semantic_search(&self, vector: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         self.semantic.search(vector, k).await
+    }
+
+    /// Upsert a pre-computed embedding of any modality (text/image/audio/…). Strata becomes the
+    /// multi-modal memory store; callers bring their own modality encoder (CLIP, etc.). The vector
+    /// must match the index dimension — mixed-dimension modalities need separate indexes (future).
+    pub async fn semantic_upsert_modal(
+        &self,
+        id: uuid::Uuid,
+        modality: &str,
+        content: impl Into<String>,
+        embedding: Vec<f32>,
+        mut metadata: serde_json::Value,
+    ) -> Result<()> {
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        metadata["modality"] = serde_json::json!(modality);
+        self.semantic
+            .upsert(&SemanticEntry {
+                id,
+                content: content.into(),
+                embedding,
+                metadata,
+            })
+            .await
+    }
+
+    /// Vector search restricted to one modality (or all when `modality` is None).
+    pub async fn semantic_search_modal(
+        &self,
+        vector: &[f32],
+        k: usize,
+        modality: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        match modality {
+            Some(m) => {
+                let m = m.to_string();
+                self.semantic
+                    .search_filtered(vector, k, move |e| {
+                        e.metadata.get("modality").and_then(|v| v.as_str()) == Some(&m)
+                    })
+                    .await
+            }
+            None => self.semantic.search(vector, k).await,
+        }
     }
 
     /// Search semantic memory with metadata filters.
@@ -1028,6 +1088,123 @@ impl StrataEngine {
         Ok(out)
     }
 
+    /// Consolidate a scope's lowest-importance memories into one summary memory.
+    ///
+    /// When the scope has more than `keep` active memories, the lowest-importance tail is summarized
+    /// (LLM if `extraction = "llm"` + provider, else a deterministic bullet list), inserted as a new
+    /// memory citing its sources in metadata, and the originals are expired (bi-temporal — history is
+    /// kept). Returns the consolidated memory, or `None` if there was nothing to fold.
+    pub async fn memory_consolidate(
+        &self,
+        scope: &MemoryScope,
+        keep: usize,
+    ) -> Result<Option<MemoryAdd>> {
+        let actives = self
+            .memory_store
+            .list_active(scope, self.config.query.max_rows)
+            .await?;
+        if actives.len() <= keep {
+            return Ok(None);
+        }
+        // list_active is ordered importance DESC, so the tail past `keep` is the lowest-importance set.
+        let to_fold: Vec<Memory> = actives[keep..].to_vec();
+        if to_fold.is_empty() {
+            return Ok(None);
+        }
+
+        let summary = self.summarize_memories(&to_fold).await;
+        let source_ids: Vec<String> = to_fold.iter().map(|m| m.id.to_string()).collect();
+        let mut input = MemoryInput::new(scope.clone(), summary);
+        input.importance = Some(0.6);
+        input.metadata = serde_json::json!({
+            "consolidated": true,
+            "source_memory_ids": source_ids,
+        });
+        let added = self.memory_add(input).await?;
+
+        // Retire the folded originals (soft-delete + drop their vectors).
+        for m in &to_fold {
+            let _ = self.memory_store.expire(m.id).await;
+            let _ = self.memory_index.delete(m.id).await;
+        }
+        Ok(Some(added))
+    }
+
+    /// Summarize a set of memories (opt-in LLM, else a deterministic bullet list).
+    async fn summarize_memories(&self, mems: &[Memory]) -> String {
+        let joined = mems
+            .iter()
+            .map(|m| format!("- {}", m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.config.memory.cognition.extraction == "llm" {
+            if let Some(provider) = &self.completion {
+                if let Ok(text) = provider
+                    .complete(
+                        "Summarize the following memories into a concise paragraph capturing the \
+                         durable facts. Output only the summary.",
+                        &joined,
+                    )
+                    .await
+                {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        return t.to_string();
+                    }
+                }
+            }
+        }
+        format!("Consolidated {} memories:\n{}", mems.len(), joined)
+    }
+
+    /// Add a graph edge (entity → relation → entity) for a tenant.
+    pub async fn memory_link(
+        &self,
+        tenant: &str,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        source: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        let edge = crate::memory::cognition::Edge {
+            id: uuid::Uuid::new_v4(),
+            src: src.to_string(),
+            relation: relation.to_string(),
+            dst: dst.to_string(),
+            weight: 1.0,
+            source_memory_id: source,
+        };
+        self.memory_store.add_edge(tenant, &edge).await
+    }
+
+    /// Edges incident to `entity` (its 1-hop neighborhood) for a tenant.
+    pub async fn memory_neighbors(
+        &self,
+        tenant: &str,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::memory::cognition::Edge>> {
+        self.memory_store
+            .neighbors(tenant, entity, limit.min(self.config.query.max_rows))
+            .await
+    }
+
+    /// Extract `(subject, relation, object)` triples from text and add them as graph edges.
+    /// Returns the number of edges added.
+    pub async fn memory_graph_from_text(
+        &self,
+        tenant: &str,
+        text: &str,
+        source: Option<uuid::Uuid>,
+    ) -> Result<usize> {
+        let triples = crate::memory::cognition::extract_triples(text);
+        let n = triples.len();
+        for (s, r, o) in triples {
+            self.memory_link(tenant, &s, &r, &o, source).await?;
+        }
+        Ok(n)
+    }
+
     /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
     async fn extract_facts(&self, raw_text: &str) -> Vec<(Option<String>, String)> {
         if self.config.memory.cognition.extraction == "llm" {
@@ -1700,6 +1877,99 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn multimodal_upsert_and_search_by_modality() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let mut text_vec = vec![0.0f32; 768];
+        text_vec[0] = 1.0;
+        let mut img_vec = vec![0.0f32; 768];
+        img_vec[1] = 1.0;
+        engine
+            .semantic_upsert_modal(
+                uuid::Uuid::new_v4(),
+                "text",
+                "a caption",
+                text_vec,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        engine
+            .semantic_upsert_modal(
+                uuid::Uuid::new_v4(),
+                "image",
+                "cat.png",
+                img_vec.clone(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        // Filtered to images → only the image entry, regardless of vector proximity.
+        let hits = engine
+            .semantic_search_modal(&img_vec, 5, Some("image"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.content, "cat.png");
+        // Filtering to text excludes the image.
+        let text_hits = engine
+            .semantic_search_modal(&img_vec, 5, Some("text"))
+            .await
+            .unwrap();
+        assert!(text_hits.iter().all(|h| h.entry.content != "cat.png"));
+    }
+
+    #[tokio::test]
+    async fn unembedded_events_are_visible_for_reindex() {
+        // No embedding provider configured → events are ingested but left unembedded, and the gap
+        // is now visible/recoverable instead of silently lost.
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .ingest(vec![
+                Event::new("s", "e", serde_json::json!({"x": 1})),
+                Event::new("s", "e", serde_json::json!({"x": 2})),
+                Event::new("s", "e", serde_json::json!({"x": 3})),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(engine.unembedded_count().await.unwrap(), 3);
+        // Reindex without a provider is a no-op (nothing to embed), leaving them recoverable.
+        assert_eq!(engine.reindex_unembedded(100).await.unwrap(), 0);
+        assert_eq!(engine.unembedded_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn memory_consolidate_folds_lowest_importance() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        for i in 0..5 {
+            engine
+                .memory_add(MemoryInput::new(scope.clone(), format!("fact number {i}")))
+                .await
+                .unwrap();
+        }
+        // Keep the top 2; fold the other 3 into one summary memory.
+        let consolidated = engine.memory_consolidate(&scope, 2).await.unwrap();
+        assert!(consolidated.is_some());
+        let mems = engine.memory_all(&scope, 100).await.unwrap();
+        assert_eq!(
+            mems.len(),
+            3,
+            "2 kept + 1 consolidated; the 3 originals are expired"
+        );
+        let summary = mems
+            .iter()
+            .find(|m| m.content.starts_with("Consolidated 3 memories"))
+            .expect("a consolidated memory should exist");
+        assert_eq!(summary.metadata["consolidated"], serde_json::json!(true));
+        // Nothing to fold when within budget.
+        assert!(engine
+            .memory_consolidate(&scope, 10)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
