@@ -333,6 +333,10 @@ impl MemStore {
                 let _ = engine.memory_delete(*id).await;
                 AppResponse::MemoryCount(1)
             }
+            AppRequest::GraphAddEdge { tenant, edge } => {
+                let _ = engine.graph_apply_edge(tenant.as_deref(), edge).await;
+                AppResponse::Ok
+            }
         }
     }
 }
@@ -662,6 +666,36 @@ mod tests {
             .await;
         assert!(matches!(resp, AppResponse::MemoryCount(1)));
         assert_eq!(engine.memory_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_graph_edge_replicates_to_engine() {
+        let engine = inmem_engine().await;
+        let store = MemStore::new(Some(engine.clone()));
+        let edge = strata_core::memory::cognition::Edge {
+            id: uuid::Uuid::new_v4(),
+            src: "Alice".into(),
+            relation: "likes".into(),
+            dst: "coffee".into(),
+            weight: 1.0,
+            source_memory_id: None,
+        };
+        let resp = store
+            .apply_request(&AppRequest::GraphAddEdge {
+                tenant: None,
+                edge: edge.clone(),
+            })
+            .await;
+        assert!(matches!(resp, AppResponse::Ok));
+        let n = engine
+            .memory_neighbors("default", "Alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(
+            n[0].id, edge.id,
+            "edge id replicated verbatim (deterministic)"
+        );
     }
 
     #[tokio::test]

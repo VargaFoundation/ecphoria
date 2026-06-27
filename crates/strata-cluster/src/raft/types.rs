@@ -56,6 +56,12 @@ pub enum AppRequest {
     },
     /// Delete a memory by id (deterministic).
     MemoryDelete { id: uuid::Uuid },
+    /// Add a graph edge (the leader generates the edge id so every node applies an identical row).
+    GraphAddEdge {
+        #[serde(default)]
+        tenant: Option<String>,
+        edge: strata_core::memory::cognition::Edge,
+    },
 }
 
 /// Application-level response from applying a Raft log entry.

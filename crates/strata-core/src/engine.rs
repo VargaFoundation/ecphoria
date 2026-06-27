@@ -1182,6 +1182,18 @@ impl StrataEngine {
         self.memory_store.add_edge(tenant, &edge).await
     }
 
+    /// Apply a fully-materialized graph edge (deterministic — used by Raft apply so every node
+    /// inserts the identical row, edge id included).
+    pub async fn graph_apply_edge(
+        &self,
+        tenant: Option<&str>,
+        edge: &crate::memory::cognition::Edge,
+    ) -> Result<()> {
+        self.memory_store
+            .add_edge(tenant.unwrap_or("default"), edge)
+            .await
+    }
+
     /// Edges incident to `entity` (its 1-hop neighborhood) for a tenant.
     pub async fn memory_neighbors(
         &self,
