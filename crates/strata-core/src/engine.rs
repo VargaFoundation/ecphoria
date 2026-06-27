@@ -852,16 +852,32 @@ impl StrataEngine {
                 .collect());
         }
 
-        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, k);
-        let mut out = Vec::with_capacity(fused.len());
-        for (id, score) in fused {
-            if let Some(memory) = by_id.remove(&id) {
-                out.push(MemoryHit { memory, score });
-            } else if let Ok(Some(memory)) = self.memory_store.get(id).await {
-                out.push(MemoryHit { memory, score });
-            }
+        // Over-fetch, then re-rank by relevance blended with importance + recency, so a recent or
+        // important memory can outrank a marginally-more-relevant stale one.
+        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, (k * 3).max(k));
+        let now = chrono::Utc::now();
+        let mut scored: Vec<MemoryHit> = Vec::with_capacity(fused.len());
+        for (id, rrf) in fused {
+            let memory = match by_id.remove(&id) {
+                Some(m) => m,
+                None => match self.memory_store.get(id).await {
+                    Ok(Some(m)) => m,
+                    _ => continue,
+                },
+            };
+            // Recency in [0,1] with a 30-day half-life; importance in [0,1].
+            let age_days = (now - memory.updated_at).num_seconds().max(0) as f32 / 86_400.0;
+            let recency = 0.5_f32.powf(age_days / 30.0);
+            let score = rrf * (1.0 + 0.3 * memory.importance + 0.2 * recency);
+            scored.push(MemoryHit { memory, score });
         }
-        Ok(out)
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
+        Ok(scored)
     }
 
     /// Get a memory by id.
