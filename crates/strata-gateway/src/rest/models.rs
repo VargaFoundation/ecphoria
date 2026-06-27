@@ -128,6 +128,28 @@ pub struct MemoryConsolidateRequest {
     pub session_id: Option<String>,
 }
 
+/// Upsert a pre-computed multi-modal embedding (caller brings its own modality encoder).
+#[derive(Debug, Deserialize)]
+pub struct SemanticUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub modality: String,
+    pub content: String,
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Vector search optionally restricted to one modality.
+#[derive(Debug, Deserialize)]
+pub struct ModalSearchRequest {
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub k: Option<usize>,
+    #[serde(default)]
+    pub modality: Option<String>,
+}
+
 /// Add a graph edge (entity → relation → entity).
 #[derive(Debug, Deserialize)]
 pub struct MemoryLinkRequest {

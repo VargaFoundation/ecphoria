@@ -138,6 +138,14 @@ pub fn router_with_engine_and_auth(
             "/admin/memory/consolidate",
             axum::routing::post(handlers::memory_consolidate),
         )
+        .route(
+            "/semantic/upsert",
+            axum::routing::post(handlers::semantic_upsert),
+        )
+        .route(
+            "/semantic/search",
+            axum::routing::post(handlers::semantic_modal_search),
+        )
         .route("/memories/link", axum::routing::post(handlers::memory_link))
         .route(
             "/memories/graph",

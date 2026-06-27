@@ -1220,6 +1220,47 @@ pub async fn memory_consolidate(
     }
 }
 
+/// Upsert a pre-computed multi-modal embedding (text/image/audio/…).
+pub async fn semantic_upsert(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<SemanticUpsertRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "semantic_upsert").increment(1);
+    let id = req
+        .id
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    match engine
+        .semantic_upsert_modal(
+            id,
+            &req.modality,
+            req.content,
+            req.embedding,
+            req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+    {
+        Ok(()) => api_ok(serde_json::json!({ "id": id.to_string() })),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "SEMANTIC_ERROR", e.to_string()),
+    }
+}
+
+/// Vector search optionally restricted to one modality.
+pub async fn semantic_modal_search(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<ModalSearchRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "semantic_modal_search")
+        .increment(1);
+    match engine
+        .semantic_search_modal(&req.vector, req.k.unwrap_or(5), req.modality.as_deref())
+        .await
+    {
+        Ok(results) => api_ok(serde_json::json!({ "results": results })),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "SEMANTIC_ERROR", e.to_string()),
+    }
+}
+
 /// Add a graph edge between two entities (tenant-scoped).
 pub async fn memory_link(
     State(engine): State<Arc<StrataEngine>>,

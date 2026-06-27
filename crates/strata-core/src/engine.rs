@@ -312,6 +312,51 @@ impl StrataEngine {
         self.semantic.search(vector, k).await
     }
 
+    /// Upsert a pre-computed embedding of any modality (text/image/audio/…). Strata becomes the
+    /// multi-modal memory store; callers bring their own modality encoder (CLIP, etc.). The vector
+    /// must match the index dimension — mixed-dimension modalities need separate indexes (future).
+    pub async fn semantic_upsert_modal(
+        &self,
+        id: uuid::Uuid,
+        modality: &str,
+        content: impl Into<String>,
+        embedding: Vec<f32>,
+        mut metadata: serde_json::Value,
+    ) -> Result<()> {
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        metadata["modality"] = serde_json::json!(modality);
+        self.semantic
+            .upsert(&SemanticEntry {
+                id,
+                content: content.into(),
+                embedding,
+                metadata,
+            })
+            .await
+    }
+
+    /// Vector search restricted to one modality (or all when `modality` is None).
+    pub async fn semantic_search_modal(
+        &self,
+        vector: &[f32],
+        k: usize,
+        modality: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        match modality {
+            Some(m) => {
+                let m = m.to_string();
+                self.semantic
+                    .search_filtered(vector, k, move |e| {
+                        e.metadata.get("modality").and_then(|v| v.as_str()) == Some(&m)
+                    })
+                    .await
+            }
+            None => self.semantic.search(vector, k).await,
+        }
+    }
+
     /// Search semantic memory with metadata filters.
     ///
     /// Filters can match on source, event_type, or any metadata field.
@@ -1832,6 +1877,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn multimodal_upsert_and_search_by_modality() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let mut text_vec = vec![0.0f32; 768];
+        text_vec[0] = 1.0;
+        let mut img_vec = vec![0.0f32; 768];
+        img_vec[1] = 1.0;
+        engine
+            .semantic_upsert_modal(
+                uuid::Uuid::new_v4(),
+                "text",
+                "a caption",
+                text_vec,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        engine
+            .semantic_upsert_modal(
+                uuid::Uuid::new_v4(),
+                "image",
+                "cat.png",
+                img_vec.clone(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        // Filtered to images → only the image entry, regardless of vector proximity.
+        let hits = engine
+            .semantic_search_modal(&img_vec, 5, Some("image"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.content, "cat.png");
+        // Filtering to text excludes the image.
+        let text_hits = engine
+            .semantic_search_modal(&img_vec, 5, Some("text"))
+            .await
+            .unwrap();
+        assert!(text_hits.iter().all(|h| h.entry.content != "cat.png"));
     }
 
     #[tokio::test]
