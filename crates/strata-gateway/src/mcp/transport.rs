@@ -444,6 +444,10 @@ async fn call_tool(
                     .map(|f| f as f32),
                 source_event_ids: vec![],
                 metadata: serde_json::json!({}),
+                mem_type: args
+                    .get("mem_type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             };
             if let Some(coord) = &cluster {
                 // Run cognition on the leader, replicate the materialized rows through the log.

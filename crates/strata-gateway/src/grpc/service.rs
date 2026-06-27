@@ -239,6 +239,7 @@ impl Strata for StrataGrpcService {
             importance: req.importance,
             source_event_ids: vec![],
             metadata: serde_json::json!({}),
+            mem_type: None,
         };
         let added = self
             .engine

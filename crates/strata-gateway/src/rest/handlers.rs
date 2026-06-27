@@ -951,6 +951,7 @@ pub async fn memory_add(
         importance: req.importance,
         source_event_ids: vec![],
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        mem_type: req.mem_type,
     };
 
     // Cluster mode: run cognition on the leader to materialize the change-set, then replicate it

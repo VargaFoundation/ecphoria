@@ -692,6 +692,9 @@ impl StrataEngine {
                 mem.valid_from = now;
                 mem.source_event_ids = input.source_event_ids.clone();
                 mem.metadata = input.metadata.clone();
+                if let Some(t) = &input.mem_type {
+                    mem.mem_type = t.clone();
+                }
                 rows.push(MemoryRow {
                     memory: mem.clone(),
                     embedding: embedding.clone(),
@@ -734,6 +737,9 @@ impl StrataEngine {
         mem.importance = importance;
         mem.source_event_ids = input.source_event_ids.clone();
         mem.metadata = input.metadata.clone();
+        if let Some(t) = &input.mem_type {
+            mem.mem_type = t.clone();
+        }
         Ok((
             MemoryAdd {
                 memory: mem.clone(),
@@ -1694,6 +1700,27 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn memory_type_roundtrips_and_defaults() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        // Default type is "semantic".
+        let added = engine
+            .memory_add(MemoryInput::new(scope.clone(), "a plain fact"))
+            .await
+            .unwrap();
+        assert_eq!(added.memory.mem_type, "semantic");
+        // Explicit "procedural" type round-trips through DuckDB.
+        let mut input = MemoryInput::new(scope.clone(), "how to deploy: run make");
+        input.mem_type = Some("procedural".into());
+        engine.memory_add(input).await.unwrap();
+        let mems = engine.memory_all(&scope, 100).await.unwrap();
+        assert!(mems
+            .iter()
+            .any(|m| m.mem_type == "procedural" && m.content.contains("deploy")));
+        assert!(mems.iter().any(|m| m.mem_type == "semantic"));
     }
 
     #[tokio::test]

@@ -107,6 +107,9 @@ pub struct MemoryAddRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Memory type: "semantic" (default), "episodic", or "procedural".
+    #[serde(default)]
+    pub mem_type: Option<String>,
 }
 
 /// Search memories within a scope.
