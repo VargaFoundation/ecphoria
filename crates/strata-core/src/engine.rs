@@ -876,6 +876,30 @@ impl StrataEngine {
         self.memory_store.list_active(scope, limit).await
     }
 
+    /// GDPR erasure: delete ALL of a tenant's data across every store — episodic events + sessions,
+    /// memories + their vectors, agent state, and event embeddings. Sequential best-effort (the
+    /// stores are independent engines, so it isn't a single transaction); returns a per-store
+    /// summary. Idempotent.
+    pub async fn delete_tenant(&self, tenant: &str) -> Result<serde_json::Value> {
+        let events = self.episodic.delete_by_tenant(tenant).await?;
+        let mem_ids = self.memory_store.delete_by_tenant(tenant).await?;
+        for id in &mem_ids {
+            let _ = self.memory_index.delete(*id).await;
+        }
+        let state = self
+            .state
+            .delete_by_prefix(&format!("{tenant}{TENANT_AGENT_SEP}"))
+            .await?;
+        let vectors = self.semantic.delete_by_tenant(tenant).await?;
+        Ok(serde_json::json!({
+            "tenant": tenant,
+            "events_deleted": events,
+            "memories_deleted": mem_ids.len(),
+            "state_deleted": state,
+            "vectors_deleted": vectors,
+        }))
+    }
+
     /// Full temporal history for a `(scope, subject)` — every version, oldest first.
     pub async fn memory_history(&self, scope: &MemoryScope, subject: &str) -> Result<Vec<Memory>> {
         self.memory_store.history(scope, subject).await
@@ -1575,6 +1599,68 @@ mod tests {
         c.memory.state.db_path = ":memory:".into();
         c.memory.cognition.db_path = ":memory:".into();
         c
+    }
+
+    #[tokio::test]
+    async fn delete_tenant_erases_all_stores() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let ta = crate::config::TenantContext::new("tenant-a");
+
+        // tenant-a data across stores.
+        engine
+            .ingest_for_tenant(vec![Event::new("s", "e", serde_json::json!({"x": 1}))], &ta)
+            .await
+            .unwrap();
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::tenant("tenant-a"),
+                "likes tea",
+            ))
+            .await
+            .unwrap();
+        engine
+            .state_set_for_tenant("tenant-a", "bot", "mood", serde_json::json!("happy"))
+            .await
+            .unwrap();
+        // tenant-b control data that must survive.
+        engine
+            .memory_add(MemoryInput::new(MemoryScope::tenant("tenant-b"), "b-fact"))
+            .await
+            .unwrap();
+
+        let summary = engine.delete_tenant("tenant-a").await.unwrap();
+        assert_eq!(summary["events_deleted"], 1);
+        assert_eq!(summary["memories_deleted"], 1);
+        assert_eq!(summary["state_deleted"], 1);
+
+        // tenant-a is gone…
+        let a_events = engine
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "tenant-a")
+            .await
+            .unwrap();
+        assert_eq!(a_events[0]["c"], "0");
+        assert_eq!(
+            engine
+                .memory_all(&MemoryScope::tenant("tenant-a"), 100)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(engine
+            .state_get_for_tenant("tenant-a", "bot", "mood")
+            .await
+            .unwrap()
+            .is_none());
+        // …but tenant-b survives.
+        assert_eq!(
+            engine
+                .memory_all(&MemoryScope::tenant("tenant-b"), 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

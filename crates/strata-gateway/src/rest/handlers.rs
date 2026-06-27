@@ -606,6 +606,24 @@ pub async fn enforce_retention(State(engine): State<Arc<StrataEngine>>) -> Respo
 }
 
 /// Trigger a backup of all stores to the configured data directory.
+/// GDPR erasure — delete ALL data for a tenant across every store. Admin only (under /admin/).
+///
+/// DELETE /api/v1/admin/tenants/{tenant_id}
+pub async fn delete_tenant(
+    State(engine): State<Arc<StrataEngine>>,
+    Path(tenant_id): Path<String>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "delete_tenant").increment(1);
+    match engine.delete_tenant(&tenant_id).await {
+        Ok(summary) => api_ok(summary),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_TENANT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn backup(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "backup").increment(1);
 

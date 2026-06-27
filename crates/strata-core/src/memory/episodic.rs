@@ -129,6 +129,22 @@ impl EpisodicStore {
         self.write_db.lock()
     }
 
+    /// Delete all events and sessions for a tenant (GDPR erasure). Returns events deleted.
+    pub async fn delete_by_tenant(&self, tenant: &str) -> crate::Result<u64> {
+        let db = self.write_db.lock();
+        let n = db
+            .execute(
+                "DELETE FROM episodic WHERE tenant_id = ?",
+                duckdb::params![tenant],
+            )
+            .map_err(|e| crate::Error::Query(format!("delete episodic by tenant: {e}")))?;
+        let _ = db.execute(
+            "DELETE FROM sessions WHERE tenant_id = ?",
+            duckdb::params![tenant],
+        );
+        Ok(n as u64)
+    }
+
     /// Acquire a connection for reading from the round-robin pool.
     fn read_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
         let idx = self.read_next.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
