@@ -455,9 +455,15 @@ impl MemoryStore {
         )
         .map_err(|e| crate::Error::Storage(format!("failed to create memories table: {e}")))?;
 
-        // Migration: memory typing (episodic / semantic / procedural).
-        let _ = conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type VARCHAR DEFAULT 'semantic';",
+        // Versioned migrations (ordered, applied-once, recorded in memory_schema_migrations).
+        let _ = super::migrations::run_migrations(
+            conn,
+            "memory_schema_migrations",
+            &[super::migrations::Migration {
+                version: 1,
+                // Memory typing (episodic / semantic / procedural).
+                sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type VARCHAR DEFAULT 'semantic';",
+            }],
         );
 
         let _ = conn.execute_batch(
