@@ -187,6 +187,59 @@ impl Memory {
     }
 }
 
+/// A directed, weighted edge in the memory graph (entity → relation → entity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Edge {
+    pub id: Uuid,
+    pub src: String,
+    pub relation: String,
+    pub dst: String,
+    pub weight: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_memory_id: Option<Uuid>,
+}
+
+/// Extract simple `(subject, relation, object)` triples from text via a few verb patterns.
+/// Deterministic and dependency-free (an LLM extractor can augment this later). Lower-cased
+/// relations; multi-word subjects/objects preserved.
+pub fn extract_triples(text: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for sentence in text.split(['.', '\n', ';', '!', '?']) {
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        if words.len() < 3 {
+            continue;
+        }
+        for (i, w) in words.iter().enumerate() {
+            if i == 0 || i + 1 >= words.len() {
+                continue;
+            }
+            let lw = w.to_lowercase();
+            let (rel, obj_start) = match lw.as_str() {
+                "likes" | "is" | "are" | "has" | "have" | "uses" | "knows" | "owns" | "prefers"
+                | "loves" | "hates" | "wants" => (lw.clone(), i + 1),
+                "works" | "lives"
+                    if words
+                        .get(i + 1)
+                        .map(|x| x.eq_ignore_ascii_case("at") || x.eq_ignore_ascii_case("in"))
+                        .unwrap_or(false) =>
+                {
+                    (format!("{lw}_{}", words[i + 1].to_lowercase()), i + 2)
+                }
+                _ => continue,
+            };
+            let subj = words[..i].join(" ");
+            let obj = words
+                .get(obj_start..)
+                .map(|w| w.join(" "))
+                .unwrap_or_default();
+            if !subj.is_empty() && !obj.is_empty() {
+                out.push((subj, rel, obj));
+            }
+        }
+    }
+    out
+}
+
 /// Input to add a memory through the cognition pipeline.
 #[derive(Debug, Clone)]
 pub struct MemoryInput {
@@ -459,11 +512,29 @@ impl MemoryStore {
         let _ = super::migrations::run_migrations(
             conn,
             "memory_schema_migrations",
-            &[super::migrations::Migration {
-                version: 1,
-                // Memory typing (episodic / semantic / procedural).
-                sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type VARCHAR DEFAULT 'semantic';",
-            }],
+            &[
+                super::migrations::Migration {
+                    version: 1,
+                    // Memory typing (episodic / semantic / procedural).
+                    sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type VARCHAR DEFAULT 'semantic';",
+                },
+                super::migrations::Migration {
+                    version: 2,
+                    // Graph memory: directed, weighted entity/relation edges.
+                    sql: "CREATE TABLE IF NOT EXISTS memory_edges (
+                            id               VARCHAR PRIMARY KEY,
+                            tenant_id        VARCHAR NOT NULL DEFAULT 'default',
+                            src              VARCHAR NOT NULL,
+                            relation         VARCHAR NOT NULL,
+                            dst              VARCHAR NOT NULL,
+                            weight           DOUBLE NOT NULL DEFAULT 1.0,
+                            source_memory_id VARCHAR,
+                            created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+                          );
+                          CREATE INDEX IF NOT EXISTS idx_edges_src ON memory_edges(tenant_id, src);
+                          CREATE INDEX IF NOT EXISTS idx_edges_dst ON memory_edges(tenant_id, dst);",
+                },
+            ],
         );
 
         let _ = conn.execute_batch(
@@ -835,6 +906,11 @@ impl MemoryStore {
             duckdb::params![tenant],
         )
         .map_err(|e| crate::Error::State(format!("delete memories by tenant: {e}")))?;
+        // Also drop the tenant's graph edges (best-effort; table may not exist on older DBs).
+        let _ = db.execute(
+            "DELETE FROM memory_edges WHERE tenant_id = ?",
+            duckdb::params![tenant],
+        );
         Ok(ids)
     }
 
@@ -966,6 +1042,58 @@ impl MemoryStore {
         Ok(n > 0)
     }
 
+    /// Add a graph edge (entity → relation → entity) for a tenant.
+    pub async fn add_edge(&self, tenant: &str, e: &Edge) -> crate::Result<()> {
+        let db = self.write_db.lock();
+        db.execute(
+            "INSERT INTO memory_edges \
+             (id, tenant_id, src, relation, dst, weight, source_memory_id, created_at) \
+             VALUES (?,?,?,?,?,?,?, now())",
+            duckdb::params![
+                e.id.to_string(),
+                tenant,
+                e.src,
+                e.relation,
+                e.dst,
+                e.weight as f64,
+                e.source_memory_id.map(|i| i.to_string()),
+            ],
+        )
+        .map_err(|e| crate::Error::Ingest(format!("add edge: {e}")))?;
+        Ok(())
+    }
+
+    /// All edges incident to `entity` (as src or dst) for a tenant, highest-weight first.
+    pub async fn neighbors(
+        &self,
+        tenant: &str,
+        entity: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<Edge>> {
+        let db = self.read_conn();
+        let mut stmt = db
+            .prepare(
+                "SELECT id, src, relation, dst, weight, source_memory_id FROM memory_edges \
+                 WHERE tenant_id = ? AND (src = ? OR dst = ?) ORDER BY weight DESC LIMIT ?",
+            )
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map(duckdb::params![tenant, entity, entity, limit as i64], |r| {
+                Ok(Edge {
+                    id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil()),
+                    src: r.get(1)?,
+                    relation: r.get(2)?,
+                    dst: r.get(3)?,
+                    weight: r.get::<_, f64>(4)? as f32,
+                    source_memory_id: r
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| Uuid::parse_str(&s).ok()),
+                })
+            })
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Export the `memories` table to a DuckDB `EXPORT DATABASE` directory (backup/snapshot).
     pub fn export_to(&self, dir: &Path) -> crate::Result<()> {
         let db = self.write_db.lock();
@@ -1053,6 +1181,53 @@ mod tests {
 
     fn scope() -> MemoryScope {
         MemoryScope::user("alice")
+    }
+
+    #[test]
+    fn extract_triples_matches_simple_patterns() {
+        let t = extract_triples("Alice likes coffee. Bob works at Acme. Carol is happy");
+        assert!(t.contains(&("Alice".into(), "likes".into(), "coffee".into())));
+        assert!(t.contains(&("Bob".into(), "works_at".into(), "Acme".into())));
+        assert!(t.contains(&("Carol".into(), "is".into(), "happy".into())));
+        // No verb → no triple.
+        assert!(extract_triples("a quiet morning").is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_edges_add_and_query() {
+        let store = MemoryStore::new();
+        store
+            .add_edge(
+                "default",
+                &Edge {
+                    id: Uuid::new_v4(),
+                    src: "Alice".into(),
+                    relation: "likes".into(),
+                    dst: "coffee".into(),
+                    weight: 1.0,
+                    source_memory_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let n = store.neighbors("default", "Alice", 10).await.unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].dst, "coffee");
+        // Querying from the object side also finds the edge.
+        assert_eq!(
+            store
+                .neighbors("default", "coffee", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Other tenant sees nothing.
+        assert!(store
+            .neighbors("other", "Alice", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

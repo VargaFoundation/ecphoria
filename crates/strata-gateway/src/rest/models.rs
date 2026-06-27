@@ -128,6 +128,22 @@ pub struct MemoryConsolidateRequest {
     pub session_id: Option<String>,
 }
 
+/// Add a graph edge (entity → relation → entity).
+#[derive(Debug, Deserialize)]
+pub struct MemoryLinkRequest {
+    pub src: String,
+    pub relation: String,
+    pub dst: String,
+}
+
+/// Query a memory entity's 1-hop neighborhood.
+#[derive(Debug, Deserialize)]
+pub struct MemoryGraphQuery {
+    pub entity: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Search memories within a scope.
 #[derive(Debug, Deserialize)]
 pub struct MemorySearchRequest {

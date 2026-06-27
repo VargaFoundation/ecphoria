@@ -1097,6 +1097,54 @@ impl StrataEngine {
         format!("Consolidated {} memories:\n{}", mems.len(), joined)
     }
 
+    /// Add a graph edge (entity → relation → entity) for a tenant.
+    pub async fn memory_link(
+        &self,
+        tenant: &str,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        source: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        let edge = crate::memory::cognition::Edge {
+            id: uuid::Uuid::new_v4(),
+            src: src.to_string(),
+            relation: relation.to_string(),
+            dst: dst.to_string(),
+            weight: 1.0,
+            source_memory_id: source,
+        };
+        self.memory_store.add_edge(tenant, &edge).await
+    }
+
+    /// Edges incident to `entity` (its 1-hop neighborhood) for a tenant.
+    pub async fn memory_neighbors(
+        &self,
+        tenant: &str,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::memory::cognition::Edge>> {
+        self.memory_store
+            .neighbors(tenant, entity, limit.min(self.config.query.max_rows))
+            .await
+    }
+
+    /// Extract `(subject, relation, object)` triples from text and add them as graph edges.
+    /// Returns the number of edges added.
+    pub async fn memory_graph_from_text(
+        &self,
+        tenant: &str,
+        text: &str,
+        source: Option<uuid::Uuid>,
+    ) -> Result<usize> {
+        let triples = crate::memory::cognition::extract_triples(text);
+        let n = triples.len();
+        for (s, r, o) in triples {
+            self.memory_link(tenant, &s, &r, &o, source).await?;
+        }
+        Ok(n)
+    }
+
     /// Extract facts from raw text (opt-in LLM, else single-memory fallback).
     async fn extract_facts(&self, raw_text: &str) -> Vec<(Option<String>, String)> {
         if self.config.memory.cognition.extraction == "llm" {

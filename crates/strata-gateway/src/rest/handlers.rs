@@ -1181,7 +1181,8 @@ pub async fn memory_consolidate(
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
     Json(req): Json<MemoryConsolidateRequest>,
 ) -> Response {
-    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_consolidate").increment(1);
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_consolidate")
+        .increment(1);
     let scope = scope_from(
         &auth,
         req.tenant_id.as_deref(),
@@ -1189,9 +1190,60 @@ pub async fn memory_consolidate(
         req.agent_id.as_deref(),
         req.session_id.as_deref(),
     );
-    match engine.memory_consolidate(&scope, req.keep.unwrap_or(20)).await {
+    match engine
+        .memory_consolidate(&scope, req.keep.unwrap_or(20))
+        .await
+    {
         Ok(Some(m)) => api_ok(serde_json::json!({ "consolidated": m })),
         Ok(None) => api_ok(serde_json::json!({ "consolidated": null })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Add a graph edge between two entities (tenant-scoped).
+pub async fn memory_link(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<MemoryLinkRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_link").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .memory_link(&tenant, &req.src, &req.relation, &req.dst, None)
+        .await
+    {
+        Ok(()) => api_ok(serde_json::json!({ "status": "ok" })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Get an entity's 1-hop neighborhood in the memory graph (tenant-scoped).
+pub async fn memory_graph(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(params): axum::extract::Query<MemoryGraphQuery>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_graph").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .memory_neighbors(&tenant, &params.entity, params.limit.unwrap_or(50))
+        .await
+    {
+        Ok(edges) => api_ok(serde_json::json!({ "entity": params.entity, "edges": edges })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "MEMORY_ERROR",

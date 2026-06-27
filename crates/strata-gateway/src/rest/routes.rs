@@ -137,6 +137,11 @@ pub fn router_with_engine_and_auth(
             "/admin/memory/consolidate",
             axum::routing::post(handlers::memory_consolidate),
         )
+        .route("/memories/link", axum::routing::post(handlers::memory_link))
+        .route(
+            "/memories/graph",
+            axum::routing::get(handlers::memory_graph),
+        )
         .route("/sessions", axum::routing::post(handlers::session_start))
         .route(
             "/sessions/{session_id}/end",
