@@ -624,6 +624,22 @@ pub async fn delete_tenant(
     }
 }
 
+/// Re-embed events left unembedded (e.g. provider was down at ingest). Admin; closes cross-store gap.
+pub async fn reindex(State(engine): State<Arc<StrataEngine>>) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "reindex").increment(1);
+    match engine.reindex_unembedded(10_000).await {
+        Ok(reindexed) => {
+            let pending = engine.unembedded_count().await.unwrap_or(0);
+            api_ok(serde_json::json!({ "reindexed": reindexed, "pending": pending }))
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REINDEX_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn backup(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "backup").increment(1);
 

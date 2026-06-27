@@ -190,6 +190,13 @@ impl EpisodicStore {
              CREATE INDEX IF NOT EXISTS idx_episodic_tenant ON episodic(tenant_id);",
         );
 
+        // Cross-store atomicity marker: true once the event's vector is in the semantic index.
+        // Events left false (provider down at ingest) are recoverable via reindex.
+        let _ = conn.execute_batch(
+            "ALTER TABLE episodic ADD COLUMN IF NOT EXISTS embedded BOOLEAN DEFAULT false;
+             CREATE INDEX IF NOT EXISTS idx_episodic_embedded ON episodic(embedded);",
+        );
+
         // Sessions table for conversation threading
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
@@ -364,6 +371,54 @@ impl EpisodicStore {
             .map_err(|e| crate::Error::Query(e.to_string()))?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Events whose vectors are not yet in the semantic index (`embedded = false`), oldest first.
+    pub async fn unembedded_events(&self, limit: usize) -> crate::Result<Vec<Event>> {
+        let db = self.read_conn();
+        let sql = format!(
+            "SELECT {} FROM episodic WHERE embedded IS NOT TRUE ORDER BY ts ASC LIMIT ?",
+            Self::SELECT_COLS
+        );
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map(duckdb::params![limit as i64], Self::parse_event)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Count events not yet embedded (cross-store drift gauge).
+    pub async fn unembedded_count(&self) -> crate::Result<u64> {
+        let db = self.read_conn();
+        let n: i64 = db
+            .query_row(
+                "SELECT count(*) FROM episodic WHERE embedded IS NOT TRUE",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    /// Mark events as embedded (their vectors are now in the semantic index).
+    pub async fn mark_embedded(&self, ids: &[Uuid]) -> crate::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE episodic SET embedded = true WHERE id IN ({placeholders})");
+        let params: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let boxed: Vec<Box<dyn duckdb::ToSql>> = params
+            .iter()
+            .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
+            .collect();
+        let refs: Vec<&dyn duckdb::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+        let db = self.write_db.lock();
+        db.execute(&sql, refs.as_slice())
+            .map_err(|e| crate::Error::State(format!("mark embedded: {e}")))?;
+        Ok(())
     }
 
     /// Validate that a SQL string contains only SELECT statements.

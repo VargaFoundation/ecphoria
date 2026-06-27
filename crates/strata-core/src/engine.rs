@@ -202,6 +202,21 @@ impl StrataEngine {
         self.ingest.ingest(events).await
     }
 
+    /// Number of events whose vectors are not yet in the semantic index (cross-store drift gauge).
+    pub async fn unembedded_count(&self) -> Result<u64> {
+        self.episodic.unembedded_count().await
+    }
+
+    /// Re-embed and index up to `limit` events that were left unembedded (e.g. the embedding
+    /// provider was down at ingest). Returns the number newly indexed. Closes the cross-store gap.
+    pub async fn reindex_unembedded(&self, limit: usize) -> Result<usize> {
+        let events = self.episodic.unembedded_events(limit).await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.ingest.embed_and_index(&events).await)
+    }
+
     /// Ingest events scoped to a specific tenant.
     ///
     /// Sets the tenant_id on all events before ingestion so that
@@ -1817,6 +1832,25 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn unembedded_events_are_visible_for_reindex() {
+        // No embedding provider configured → events are ingested but left unembedded, and the gap
+        // is now visible/recoverable instead of silently lost.
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .ingest(vec![
+                Event::new("s", "e", serde_json::json!({"x": 1})),
+                Event::new("s", "e", serde_json::json!({"x": 2})),
+                Event::new("s", "e", serde_json::json!({"x": 3})),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(engine.unembedded_count().await.unwrap(), 3);
+        // Reindex without a provider is a no-op (nothing to embed), leaving them recoverable.
+        assert_eq!(engine.reindex_unembedded(100).await.unwrap(), 0);
+        assert_eq!(engine.unembedded_count().await.unwrap(), 3);
     }
 
     #[tokio::test]

@@ -117,67 +117,72 @@ impl IngestPipeline {
             return Ok(0);
         }
 
-        // Step 1: Store in episodic memory
+        // Step 1: Store in episodic memory (committed).
         let count = self.episodic.append(&events).await?;
         tracing::debug!(count, "ingested events into episodic store");
 
-        // Step 2: Auto-embed if provider is available (batched)
-        if let (Some(semantic), Some(embedding)) = (&self.semantic, &self.embedding) {
-            // Build embedding texts: extract semantic content from payload,
-            // NOT metadata like source/event_type (those go in metadata filters).
-            let texts: Vec<String> = events.iter().map(Self::extract_embedding_text).collect();
+        // Step 2: Best-effort embed + index. Events that fail (or have no provider) stay marked
+        // `embedded = false` in episodic and are recoverable via `embed_and_index` (reindex).
+        self.embed_and_index(&events).await;
 
-            // Process embeddings in batches to respect API limits
-            let mut embedded = 0usize;
-            let paired: Vec<(&Event, &String)> = events.iter().zip(texts.iter()).collect();
+        Ok(count)
+    }
 
-            for chunk in paired.chunks(self.batch_size) {
-                let chunk_texts: Vec<String> = chunk.iter().map(|(_, t)| (*t).clone()).collect();
+    /// Embed events, upsert their vectors, and mark the **successful** ones `embedded = true` in
+    /// episodic. No-op (returns 0) when no embedding provider is configured. This is the shared path
+    /// for both initial ingest and reindex/repair of previously-unembedded events — so a transient
+    /// embedding outage no longer silently loses vectors.
+    pub async fn embed_and_index(&self, events: &[Event]) -> usize {
+        let (Some(semantic), Some(embedding)) = (&self.semantic, &self.embedding) else {
+            return 0;
+        };
+        let texts: Vec<String> = events.iter().map(Self::extract_embedding_text).collect();
+        let paired: Vec<(&Event, &String)> = events.iter().zip(texts.iter()).collect();
 
-                match embedding.embed(&chunk_texts).await {
-                    Ok(embeddings) => {
-                        for ((event, text), emb) in chunk.iter().zip(embeddings) {
-                            let entry = SemanticEntry {
-                                id: event.id,
-                                content: (*text).clone(),
-                                embedding: emb,
-                                metadata: serde_json::json!({
-                                    "source": event.source,
-                                    "event_type": event.event_type,
-                                    "timestamp": event.timestamp.to_rfc3339(),
-                                    "trace_id": event.trace_id,
-                                    "tags": event.tags,
-                                    // Tenant for row-level isolation of vector search (injected
-                                    // into the payload by ingest_for_tenant); default otherwise.
-                                    "tenant_id": event
-                                        .payload
-                                        .get("_tenant_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("default"),
-                                }),
-                            };
-                            if let Err(e) = semantic.upsert(&entry).await {
-                                tracing::warn!(error = %e, "failed to upsert semantic entry");
-                            }
+        let mut succeeded: Vec<uuid::Uuid> = Vec::new();
+        for chunk in paired.chunks(self.batch_size) {
+            let chunk_texts: Vec<String> = chunk.iter().map(|(_, t)| (*t).clone()).collect();
+            match embedding.embed(&chunk_texts).await {
+                Ok(embeddings) => {
+                    for ((event, text), emb) in chunk.iter().zip(embeddings) {
+                        let entry = SemanticEntry {
+                            id: event.id,
+                            content: (*text).clone(),
+                            embedding: emb,
+                            metadata: serde_json::json!({
+                                "source": event.source,
+                                "event_type": event.event_type,
+                                "timestamp": event.timestamp.to_rfc3339(),
+                                "trace_id": event.trace_id,
+                                "tags": event.tags,
+                                "tenant_id": event
+                                    .payload
+                                    .get("_tenant_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("default"),
+                            }),
+                        };
+                        match semantic.upsert(&entry).await {
+                            Ok(()) => succeeded.push(event.id),
+                            Err(e) => tracing::warn!(error = %e, "failed to upsert semantic entry"),
                         }
-                        embedded += chunk.len();
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            batch_size = chunk.len(),
-                            "auto-embedding batch failed, skipping"
-                        );
                     }
                 }
-            }
-
-            if embedded > 0 {
-                tracing::debug!(embedded, "auto-embedded events into semantic store");
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    batch_size = chunk.len(),
+                    "auto-embedding batch failed; events left unembedded (recoverable via reindex)"
+                ),
             }
         }
 
-        Ok(count)
+        // Mark only the events whose vectors actually landed (closes the cross-store gap visibly).
+        if !succeeded.is_empty() {
+            if let Err(e) = self.episodic.mark_embedded(&succeeded).await {
+                tracing::warn!(error = %e, "failed to mark events embedded");
+            }
+        }
+        succeeded.len()
     }
 }
 
