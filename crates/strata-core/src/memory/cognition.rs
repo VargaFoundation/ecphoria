@@ -137,6 +137,13 @@ pub struct Memory {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Memory type: "semantic" (facts), "episodic" (events), or "procedural" (skills/steps).
+    #[serde(default = "default_mem_type")]
+    pub mem_type: String,
+}
+
+fn default_mem_type() -> String {
+    "semantic".into()
 }
 
 impl Memory {
@@ -158,6 +165,7 @@ impl Memory {
             created_at: now,
             updated_at: now,
             metadata: serde_json::json!({}),
+            mem_type: default_mem_type(),
         }
     }
 
@@ -188,6 +196,8 @@ pub struct MemoryInput {
     pub importance: Option<f32>,
     pub source_event_ids: Vec<Uuid>,
     pub metadata: serde_json::Value,
+    /// Memory type (defaults to "semantic" when None).
+    pub mem_type: Option<String>,
 }
 
 impl MemoryInput {
@@ -200,6 +210,7 @@ impl MemoryInput {
             importance: None,
             source_event_ids: Vec::new(),
             metadata: serde_json::json!({}),
+            mem_type: None,
         }
     }
 
@@ -378,7 +389,8 @@ impl MemoryStore {
 
     const SELECT_COLS: &'static str = "id, tenant_id, user_id, agent_id, session_id, subject, \
          content, importance, valid_from::VARCHAR, valid_to::VARCHAR, state, supersedes, \
-         source_event_ids, version, created_at::VARCHAR, updated_at::VARCHAR, metadata::VARCHAR";
+         source_event_ids, version, created_at::VARCHAR, updated_at::VARCHAR, metadata::VARCHAR, \
+         mem_type";
 
     /// Create an in-memory store (testing).
     pub fn new() -> Self {
@@ -442,6 +454,17 @@ impl MemoryStore {
             );",
         )
         .map_err(|e| crate::Error::Storage(format!("failed to create memories table: {e}")))?;
+
+        // Versioned migrations (ordered, applied-once, recorded in memory_schema_migrations).
+        let _ = super::migrations::run_migrations(
+            conn,
+            "memory_schema_migrations",
+            &[super::migrations::Migration {
+                version: 1,
+                // Memory typing (episodic / semantic / procedural).
+                sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type VARCHAR DEFAULT 'semantic';",
+            }],
+        );
 
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(tenant_id, user_id, agent_id);
@@ -508,6 +531,9 @@ impl MemoryStore {
             metadata: metadata_str
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::Value::Null),
+            mem_type: row
+                .get::<_, String>(17)
+                .unwrap_or_else(|_| "semantic".to_string()),
         })
     }
 
@@ -550,9 +576,9 @@ impl MemoryStore {
             "INSERT OR IGNORE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, embedding)
+              created_at, updated_at, metadata, mem_type, embedding)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?::JSON)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -571,6 +597,7 @@ impl MemoryStore {
                 memory.created_at.to_rfc3339(),
                 memory.updated_at.to_rfc3339(),
                 metadata_str,
+                memory.mem_type,
                 embedding_json,
             ],
         )
@@ -606,9 +633,9 @@ impl MemoryStore {
             "INSERT OR REPLACE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, embedding)
+              created_at, updated_at, metadata, mem_type, embedding)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?::JSON)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -627,6 +654,7 @@ impl MemoryStore {
                 memory.created_at.to_rfc3339(),
                 memory.updated_at.to_rfc3339(),
                 metadata_str,
+                memory.mem_type,
                 embedding_json,
             ],
         )
@@ -810,6 +838,53 @@ impl MemoryStore {
         Ok(ids)
     }
 
+    /// Evict the lowest-importance active memories in a scope beyond `cap` (count-based forgetting /
+    /// per-tenant quota). Returns the evicted ids so the caller can purge their vectors. cap 0 = no-op.
+    pub async fn enforce_scope_cap(
+        &self,
+        scope: &MemoryScope,
+        cap: usize,
+    ) -> crate::Result<Vec<Uuid>> {
+        if cap == 0 {
+            return Ok(vec![]);
+        }
+        let (where_sql, params) = scope.where_clause();
+        let db = self.write_db.lock();
+        // Highest importance first → keep the top `cap`, evict the tail.
+        let sql = format!(
+            "SELECT id FROM memories WHERE {where_sql} AND state = 'active' \
+             ORDER BY importance DESC, updated_at DESC"
+        );
+        let all_ids: Vec<Uuid> = {
+            let mut stmt = db
+                .prepare(&sql)
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            let boxed: Vec<Box<dyn duckdb::ToSql>> = params
+                .iter()
+                .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
+                .collect();
+            let refs: Vec<&dyn duckdb::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(refs.as_slice(), |r| r.get::<_, String>(0))
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            rows.filter_map(|r| r.ok())
+                .filter_map(|s| Uuid::parse_str(&s).ok())
+                .collect()
+        };
+        if all_ids.len() <= cap {
+            return Ok(vec![]);
+        }
+        let evict: Vec<Uuid> = all_ids[cap..].to_vec();
+        for id in &evict {
+            db.execute(
+                "DELETE FROM memories WHERE id = ?",
+                duckdb::params![id.to_string()],
+            )
+            .map_err(|e| crate::Error::State(format!("evict memory: {e}")))?;
+        }
+        Ok(evict)
+    }
+
     /// Delete a memory by id, scoped to a tenant. Returns true iff a row was deleted.
     pub async fn delete_scoped(&self, id: Uuid, tenant: &str) -> crate::Result<bool> {
         let db = self.write_db.lock();
@@ -928,7 +1003,7 @@ impl MemoryStore {
         let rows = stmt
             .query_map([], |row| {
                 let memory = Self::parse_memory(row)?;
-                let emb_str: String = row.get(17)?;
+                let emb_str: String = row.get(18)?; // SELECT_COLS(0..=17) + embedding at 18
                 let embedding: Vec<f32> = serde_json::from_str(&emb_str).unwrap_or_default();
                 Ok((memory, embedding))
             })

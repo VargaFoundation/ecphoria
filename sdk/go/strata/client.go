@@ -323,3 +323,177 @@ func (c *Client) ClusterStatus(ctx context.Context) (*ClusterStatus, error) {
 	}
 	return &r, nil
 }
+
+// ── Memory cognition layer ──────────────────────────────────────────
+
+// MemoryScope scopes a memory operation (all fields optional; default tenant).
+type MemoryScope struct {
+	TenantID  string
+	UserID    string
+	AgentID   string
+	SessionID string
+}
+
+func (s MemoryScope) apply(m map[string]any) {
+	if s.TenantID != "" {
+		m["tenant_id"] = s.TenantID
+	}
+	if s.UserID != "" {
+		m["user_id"] = s.UserID
+	}
+	if s.AgentID != "" {
+		m["agent_id"] = s.AgentID
+	}
+	if s.SessionID != "" {
+		m["session_id"] = s.SessionID
+	}
+}
+
+func (s MemoryScope) query() url.Values {
+	q := url.Values{}
+	if s.TenantID != "" {
+		q.Set("tenant_id", s.TenantID)
+	}
+	if s.UserID != "" {
+		q.Set("user_id", s.UserID)
+	}
+	if s.AgentID != "" {
+		q.Set("agent_id", s.AgentID)
+	}
+	if s.SessionID != "" {
+		q.Set("session_id", s.SessionID)
+	}
+	return q
+}
+
+// MemoryAdd adds a memory through the cognition pipeline (dedup / contradiction / importance).
+func (c *Client) MemoryAdd(ctx context.Context, content string, scope MemoryScope, subject string, importance *float64) (map[string]any, error) {
+	body := map[string]any{"content": content}
+	scope.apply(body)
+	if subject != "" {
+		body["subject"] = subject
+	}
+	if importance != nil {
+		body["importance"] = *importance
+	}
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/memories", body)
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode memory_add: %w", err)
+	}
+	return r, nil
+}
+
+// MemorySearch does a hybrid (BM25 + vector) search over a scope's memories.
+func (c *Client) MemorySearch(ctx context.Context, query string, k int, scope MemoryScope) ([]map[string]any, error) {
+	body := map[string]any{"query": query, "k": k}
+	scope.apply(body)
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/memories/search", body)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Results []map[string]any `json:"results"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode memory_search: %w", err)
+	}
+	return r.Results, nil
+}
+
+// MemoryList lists active memories in a scope.
+func (c *Client) MemoryList(ctx context.Context, limit int, scope MemoryScope) ([]map[string]any, error) {
+	q := scope.query()
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Memories []map[string]any `json:"memories"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode memory_list: %w", err)
+	}
+	return r.Memories, nil
+}
+
+// MemoryGet returns a memory by id, or nil if not found (or not in your tenant).
+func (c *Client) MemoryGet(ctx context.Context, id string) (map[string]any, error) {
+	data, status, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories/"+url.PathEscape(id), nil)
+	if status == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode memory_get: %w", err)
+	}
+	return r, nil
+}
+
+// MemoryHistory returns the bi-temporal history for a memory's subject (oldest first).
+func (c *Client) MemoryHistory(ctx context.Context, id string) ([]map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories/"+url.PathEscape(id)+"/history", nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode memory_history: %w", err)
+	}
+	return r.History, nil
+}
+
+// MemoryDelete deletes a memory by id; returns false if it didn't exist (or not in your tenant).
+func (c *Client) MemoryDelete(ctx context.Context, id string) (bool, error) {
+	_, status, err := c.doRequest(ctx, http.MethodDelete, "/api/v1/memories/"+url.PathEscape(id), nil)
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ── Sessions ────────────────────────────────────────────────────────
+
+// SessionStart starts a conversation session.
+func (c *Client) SessionStart(ctx context.Context, sessionID, agentID string) error {
+	body := map[string]any{"session_id": sessionID, "agent_id": agentID}
+	_, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/sessions", body)
+	return err
+}
+
+// SessionEnd ends a session, optionally attaching a summary.
+func (c *Client) SessionEnd(ctx context.Context, sessionID, summary string) error {
+	body := map[string]any{}
+	if summary != "" {
+		body["summary"] = summary
+	}
+	_, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/end", body)
+	return err
+}
+
+// SessionRecall recalls all events recorded in a session.
+func (c *Client) SessionRecall(ctx context.Context, sessionID string) ([]map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/recall", nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("strata: decode session_recall: %w", err)
+	}
+	return r.Events, nil
+}

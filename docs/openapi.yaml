@@ -1,0 +1,226 @@
+openapi: 3.0.3
+info:
+  title: Strata Context Lake API
+  description: >
+    REST API for Strata — episodic events, semantic search, agent state, and the bi-temporal
+    memory cognition layer. When `auth_enabled`, all `/api/v1/*` routes require
+    `Authorization: Bearer <token>` (API key, JWT HS256, or OIDC RS256) and are tenant-scoped.
+  version: "0.2.0"
+  license:
+    name: Apache-2.0
+servers:
+  - url: http://localhost:8432
+    description: Local
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+    Scope:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        user_id: { type: string }
+        agent_id: { type: string }
+        session_id: { type: string }
+  responses:
+    Unauthorized:
+      description: Missing/invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+paths:
+  /health:
+    get:
+      summary: Liveness + subsystem health
+      security: []
+      responses: { '200': { description: OK } }
+  /ready:
+    get:
+      summary: Readiness probe
+      security: []
+      responses: { '200': { description: Ready }, '503': { description: Not ready } }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses: { '200': { description: Prometheus text format } }
+  /api/v1/query:
+    post:
+      summary: Execute a SELECT-only SQL query (tenant-scoped)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { sql: { type: string } }, required: [sql] }
+      responses:
+        '200':
+          description: Rows
+          content:
+            application/json:
+              schema: { type: object, properties: { rows: { type: array, items: { type: object } }, count: { type: integer } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { description: Invalid (non-SELECT) query }
+  /api/v1/ingest:
+    post:
+      summary: Ingest events into episodic memory (auto-embedded)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, events]
+              properties:
+                source: { type: string }
+                events: { type: array, items: { type: object } }
+      responses:
+        '200': { description: '{ ingested: N }' }
+        '422': { description: Batch too large (>10k) }
+  /api/v1/webhook/{source}:
+    post:
+      summary: Webhook ingestion (HMAC-verified if webhook_secret set)
+      parameters: [ { name: source, in: path, required: true, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses: { '200': { description: Normalized + ingested }, '401': { description: Bad signature } }
+  /api/v1/search:
+    post:
+      summary: Semantic vector search (tenant-scoped)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query: { type: string }
+                vector: { type: array, items: { type: number } }
+                k: { type: integer, default: 5 }
+      responses: { '200': { description: Ranked results } }
+  /api/v1/embed-and-search:
+    post:
+      summary: Embed text + search in one call
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { text: { type: string }, k: { type: integer } } } } } }
+      responses: { '200': { description: Ranked results } }
+  /api/v1/state/{agent_id}/{key}:
+    get:
+      summary: Get agent state
+      parameters:
+        - { name: agent_id, in: path, required: true, schema: { type: string } }
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: Entry }, '404': { description: Not found } }
+    put:
+      summary: Set agent state (body is the JSON value)
+      parameters:
+        - { name: agent_id, in: path, required: true, schema: { type: string } }
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/json: { schema: {} } } }
+      responses: { '200': { description: '{ version: N }' } }
+  /api/v1/memories:
+    post:
+      summary: Add a memory (dedup / contradiction / importance)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                subject: { type: string }
+                importance: { type: number }
+                user_id: { type: string }
+                agent_id: { type: string }
+                session_id: { type: string }
+                metadata: { type: object }
+      responses: { '200': { description: MemoryAdd (memory + outcome) } }
+    get:
+      summary: List active memories in a scope
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: user_id, in: query, schema: { type: string } }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+      responses: { '200': { description: '{ memories: [...], count: N }' } }
+  /api/v1/memories/search:
+    post:
+      summary: Hybrid (BM25 + vector) memory search, re-ranked by importance + recency
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                k: { type: integer, default: 5 }
+                user_id: { type: string }
+                agent_id: { type: string }
+                session_id: { type: string }
+      responses: { '200': { description: Ranked memory hits } }
+  /api/v1/memories/{id}:
+    get:
+      summary: Get a memory by id (404 if not in your tenant)
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: Memory }, '404': { description: Not found } }
+    delete:
+      summary: Delete a memory by id
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: Deleted }, '404': { description: Not found } }
+  /api/v1/memories/{id}/history:
+    get:
+      summary: Bi-temporal history for a memory's subject
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: '{ history: [...], count: N }' } }
+  /api/v1/sessions:
+    post:
+      summary: Start a conversation session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [session_id, agent_id], properties: { session_id: { type: string }, agent_id: { type: string }, parent_session_id: { type: string }, metadata: { type: object } } }
+      responses: { '200': { description: Started } }
+  /api/v1/sessions/{id}/end:
+    post:
+      summary: End a session
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { summary: { type: string } } } } } }
+      responses: { '200': { description: Ended } }
+  /api/v1/sessions/{id}/recall:
+    get:
+      summary: Recall a session's events
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: '{ events: [...], count: N }' } }
+  /api/v1/admin/backup:
+    post:
+      summary: Trigger a full backup (admin)
+      responses: { '200': { description: Backup path } }
+  /api/v1/admin/tenants/{tenant_id}:
+    delete:
+      summary: GDPR erasure — delete all data for a tenant across every store (admin)
+      parameters: [ { name: tenant_id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: Per-store deletion summary } }
+  /mcp:
+    post:
+      summary: MCP JSON-RPC (Streamable HTTP); initialize returns Mcp-Session-Id
+      responses: { '200': { description: JSON-RPC response } }
+  /v1/chat/completions:
+    post:
+      summary: OpenAI-compatible chat completions with auto-RAG, streaming, tool-use
+      responses: { '200': { description: Completion (or text/event-stream if stream=true) } }

@@ -613,7 +613,17 @@ impl StrataEngine {
     /// - Otherwise a fresh memory is inserted (`Inserted`).
     pub async fn memory_add(&self, input: MemoryInput) -> Result<MemoryAdd> {
         let (result, rows) = self.memory_plan(input).await?;
+        let scope = result.memory.scope.clone();
         self.memory_apply_rows(rows).await?;
+        // Count-based forgetting / per-tenant quota: evict the lowest-importance memories beyond cap.
+        let cap = self.config.memory.cognition.max_memories_per_scope;
+        if cap > 0 {
+            if let Ok(evicted) = self.memory_store.enforce_scope_cap(&scope, cap).await {
+                for id in evicted {
+                    let _ = self.memory_index.delete(id).await;
+                }
+            }
+        }
         Ok(result)
     }
 
@@ -682,6 +692,9 @@ impl StrataEngine {
                 mem.valid_from = now;
                 mem.source_event_ids = input.source_event_ids.clone();
                 mem.metadata = input.metadata.clone();
+                if let Some(t) = &input.mem_type {
+                    mem.mem_type = t.clone();
+                }
                 rows.push(MemoryRow {
                     memory: mem.clone(),
                     embedding: embedding.clone(),
@@ -724,6 +737,9 @@ impl StrataEngine {
         mem.importance = importance;
         mem.source_event_ids = input.source_event_ids.clone();
         mem.metadata = input.metadata.clone();
+        if let Some(t) = &input.mem_type {
+            mem.mem_type = t.clone();
+        }
         Ok((
             MemoryAdd {
                 memory: mem.clone(),
@@ -1684,6 +1700,46 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn memory_type_roundtrips_and_defaults() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        // Default type is "semantic".
+        let added = engine
+            .memory_add(MemoryInput::new(scope.clone(), "a plain fact"))
+            .await
+            .unwrap();
+        assert_eq!(added.memory.mem_type, "semantic");
+        // Explicit "procedural" type round-trips through DuckDB.
+        let mut input = MemoryInput::new(scope.clone(), "how to deploy: run make");
+        input.mem_type = Some("procedural".into());
+        engine.memory_add(input).await.unwrap();
+        let mems = engine.memory_all(&scope, 100).await.unwrap();
+        assert!(mems
+            .iter()
+            .any(|m| m.mem_type == "procedural" && m.content.contains("deploy")));
+        assert!(mems.iter().any(|m| m.mem_type == "semantic"));
+    }
+
+    #[tokio::test]
+    async fn memory_scope_cap_evicts_lowest() {
+        let mut cfg = inmem_config();
+        cfg.memory.cognition.max_memories_per_scope = 3;
+        let engine = StrataEngine::new(cfg).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        for i in 0..5 {
+            engine
+                .memory_add(MemoryInput::new(
+                    scope.clone(),
+                    format!("distinct fact {i}"),
+                ))
+                .await
+                .unwrap();
+        }
+        let mems = engine.memory_all(&scope, 100).await.unwrap();
+        assert_eq!(mems.len(), 3, "scope should be capped at 3 memories");
     }
 
     #[tokio::test]
