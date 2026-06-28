@@ -341,16 +341,23 @@ pub async fn require_auth(
     }
 
     // ── Rate limiting ────────────────────────────────────────────
+    // A request reverse-proxied from another shard was already rate-limited on the origin pod
+    // (it carries `x-strata-shard-forwarded`); don't double-count it on the destination shard.
+    let is_shard_forwarded = req.headers().contains_key("x-strata-shard-forwarded");
     if let Some(ref limiter) = state.rate_limiter {
-        let (allowed, remaining) = limiter.try_acquire(&auth_ctx.identity);
-        if !allowed {
-            let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
-            resp.headers_mut()
-                .insert("X-RateLimit-Remaining", "0".parse().unwrap());
-            return Err(resp);
+        if is_shard_forwarded {
+            // Skip acquisition; still authenticated above.
+        } else {
+            let (allowed, remaining) = limiter.try_acquire(&auth_ctx.identity);
+            if !allowed {
+                let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
+                resp.headers_mut()
+                    .insert("X-RateLimit-Remaining", "0".parse().unwrap());
+                return Err(resp);
+            }
+            // Store remaining for the response header (injected after handler runs)
+            req.extensions_mut().insert(RateLimitInfo { remaining });
         }
-        // Store remaining for the response header (injected after handler runs)
-        req.extensions_mut().insert(RateLimitInfo { remaining });
     }
 
     // Capture for audit logging
