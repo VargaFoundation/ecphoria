@@ -180,6 +180,9 @@ pub fn router_with_engine_and_auth(
     // Coordinator handle for write replication (also handed to the MCP protocol routes below).
     let coordinator = cluster_state.as_ref().map(|cs| cs.coordinator.clone());
 
+    // Keep a copy of the shard-routing state for the MCP/LLM protocol routes (below).
+    let shard_state_protocol = shard_state.clone();
+
     // Middleware execution order (request flows outer→inner): auth → shard-route → leader-forward →
     // handler. In axum the LAST-applied route_layer is the OUTERMOST (runs first), so apply them in
     // reverse: leader-forward first (innermost), then shard-route, then auth last (outermost).
@@ -234,6 +237,17 @@ pub fn router_with_engine_and_auth(
     // handler checks leadership itself).
     if let Some(coord) = coordinator {
         protocol_routes = protocol_routes.layer(axum::Extension(coord));
+    }
+
+    // Shard routing for MCP/LLM (inner) — register before auth so execution is auth → shard-route →
+    // handler. A tenant's MCP writes route to its shard (same Raft group as its REST writes).
+    if let Some(shard_state) = shard_state_protocol {
+        if shard_state.router.shards() > 1 {
+            protocol_routes = protocol_routes.route_layer(axum::middleware::from_fn_with_state(
+                shard_state,
+                crate::cluster::shard_route::route_to_owning_shard,
+            ));
+        }
     }
 
     // When auth is enabled, MCP and the LLM proxy require a Bearer token too
