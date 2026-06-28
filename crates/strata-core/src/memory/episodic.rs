@@ -224,6 +224,13 @@ impl EpisodicStore {
             return Ok(0);
         }
 
+        // Fast path: DuckDB is columnar, so row-wise INSERT is slow. When no event needs idempotency
+        // dedup (which requires `INSERT OR IGNORE` on the UNIQUE key — unsupported by the Appender),
+        // bulk-load via the Appender (~order of magnitude faster).
+        if events.iter().all(|e| e.idempotency_key.is_none()) {
+            return self.append_fast(events);
+        }
+
         let start = std::time::Instant::now();
         let db = self.write_db.lock();
 
@@ -298,9 +305,97 @@ impl EpisodicStore {
         result
     }
 
+    /// Bulk-append via the DuckDB Appender. Caller guarantees no event carries an `idempotency_key`
+    /// (the Appender has no `OR IGNORE`, and the column is `UNIQUE`). The `ts` TIMESTAMPTZ is written
+    /// as a typed `Value::Timestamp` (the Appender does not coerce strings); other columns are
+    /// strings/Options; `embedded`/`idempotency_key` use their column defaults (NULL/false).
+    fn append_fast(&self, events: &[Event]) -> crate::Result<u64> {
+        let start = std::time::Instant::now();
+        let db = self.write_db.lock();
+        {
+            let mut appender = db
+                .appender_with_columns(
+                    "episodic",
+                    &[
+                        "id",
+                        "source",
+                        "event_type",
+                        "payload",
+                        "ts",
+                        "parent_id",
+                        "trace_id",
+                        "tags",
+                        "tenant_id",
+                    ],
+                )
+                .map_err(|e| crate::Error::Ingest(format!("appender: {e}")))?;
+            for ev in events {
+                let payload_str = serde_json::to_string(&ev.payload)
+                    .map_err(|e| crate::Error::Ingest(e.to_string()))?;
+                let tags = if ev.tags.is_empty() {
+                    None
+                } else {
+                    Some(ev.tags.join(","))
+                };
+                let tenant = ev
+                    .payload
+                    .get("_tenant_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string();
+                appender
+                    .append_row(duckdb::params![
+                        ev.id.to_string(),
+                        ev.source,
+                        ev.event_type,
+                        payload_str,
+                        duckdb::types::Value::Timestamp(
+                            duckdb::types::TimeUnit::Microsecond,
+                            ev.timestamp.timestamp_micros()
+                        ),
+                        ev.parent_id.map(|p| p.to_string()),
+                        ev.trace_id.clone(),
+                        tags,
+                        tenant,
+                    ])
+                    .map_err(|e| crate::Error::Ingest(format!("append_row: {e}")))?;
+            }
+            appender
+                .flush()
+                .map_err(|e| crate::Error::Ingest(format!("appender flush: {e}")))?;
+        }
+        let count = events.len() as u64;
+        metrics::histogram!("strata_episodic_append_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("strata_episodic_events_ingested_total").increment(count);
+        Ok(count)
+    }
+
     /// Parse an Event from a DuckDB row.
     /// Expected columns: id(0), source(1), event_type(2), payload::VARCHAR(3), ts::VARCHAR(4),
     ///                    parent_id(5), trace_id(6), tags(7), idempotency_key(8)
+    /// Parse a DuckDB `TIMESTAMPTZ::VARCHAR` rendering, which is NOT RFC3339 — it uses a space
+    /// separator and a short `+00` offset (e.g. `2024-03-15 10:30:00.123456+00`), and the Appender
+    /// path can render with no offset at all. Try the variants, assuming UTC when none is present.
+    fn parse_ts(s: &str) -> DateTime<Utc> {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return dt.with_timezone(&Utc);
+        }
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+            return dt.with_timezone(&Utc);
+        }
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%#z") {
+            return dt.with_timezone(&Utc);
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return ndt.and_utc();
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return ndt.and_utc();
+        }
+        Utc::now()
+    }
+
     fn parse_event(row: &duckdb::Row<'_>) -> duckdb::Result<Event> {
         let id_str: String = row.get(0)?;
         let payload_str: String = row.get(3)?;
@@ -315,9 +410,7 @@ impl EpisodicStore {
             source: row.get(1)?,
             event_type: row.get(2)?,
             payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
-            timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            timestamp: Self::parse_ts(&ts_str),
             parent_id: parent_str.and_then(|s| Uuid::parse_str(&s).ok()),
             trace_id,
             tags: tags_str
@@ -866,6 +959,32 @@ mod tests {
         let store = EpisodicStore::new();
         let count = store.append(&[]).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn fast_path_preserves_timestamp_and_payload() {
+        // No idempotency key → the Appender fast path. Verify the typed TIMESTAMPTZ + JSON payload
+        // round-trip exactly (the riskiest part of the Appender rewrite).
+        let store = EpisodicStore::new();
+        let ts = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut ev = Event::new("src", "etype", serde_json::json!({"k": "v", "n": 42}));
+        ev.timestamp = ts;
+        assert!(ev.idempotency_key.is_none());
+        store.append(std::slice::from_ref(&ev)).await.unwrap();
+
+        let got = store
+            .query_time_range(
+                ts - chrono::Duration::seconds(1),
+                ts + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, ev.id);
+        assert_eq!(got[0].payload, ev.payload);
+        assert_eq!(got[0].timestamp.timestamp_micros(), ts.timestamp_micros());
     }
 
     #[tokio::test]

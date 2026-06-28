@@ -17,7 +17,7 @@ relative/regression comparison, not as a spec.
 
 | Benchmark | What it measures | Median |
 |-----------|------------------|--------|
-| `ingest_100_events` | Batch append of 100 **fresh** events to episodic (one transaction) | ~429 ms |
+| `ingest_100_events` | Batch append of 100 **fresh** events to episodic (DuckDB Appender fast path) | ~5.9 ms |
 | `query_select_100` | `SELECT … FROM episodic ORDER BY ts DESC LIMIT 100` over 500 rows | ~1.5 ms |
 | `state_set_get` | One KV set + get (SQLite + hot cache) | ~44 µs |
 | `semantic_search_k10` | HNSW k-NN over 200 vectors (768-d) | ~40 µs |
@@ -29,10 +29,10 @@ relative/regression comparison, not as a spec.
 
 - The semantic search path (USearch HNSW) is the fastest hot path (~40 µs) — vector retrieval is not
   the bottleneck.
-- `memory_add` and `query`/`ingest` are dominated by DuckDB write/commit cost (~4.3 ms/event for
-  row inserts; DuckDB is columnar, so row-wise INSERT is its slow path). Batch where possible.
-  **Future optimization:** DuckDB's Appender API is ~10–50× faster for bulk loads, but it bypasses
-  `INSERT OR IGNORE`, so a fast path would apply only when no idempotency keys are present.
+- **Ingest uses the DuckDB Appender fast path** when no event in the batch carries an
+  `idempotency_key` (~72× faster than row INSERTs: 429 ms → 5.9 ms / 100 events). Batches that need
+  idempotency dedup fall back to `INSERT OR IGNORE` (the Appender has no conflict handling).
+- `memory_add` is still row-insert bound (cognition does a contradiction-check SELECT + insert).
 - With an embedding provider configured, `ingest` and `memory_add` additionally pay the provider's
   embedding latency (network-bound, not measured here).
 - The benchmark suite covers the flagship cognition + graph paths so regressions surface in CI.
