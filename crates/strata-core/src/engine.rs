@@ -15,6 +15,7 @@ use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
+use crate::rerank::Reranker;
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
@@ -34,6 +35,8 @@ pub struct StrataEngine {
     embedding: Option<Arc<dyn EmbeddingProvider>>,
     /// Optional completion provider for opt-in LLM fact extraction (cognition layer).
     completion: Option<Arc<dyn CompletionProvider>>,
+    /// Optional second-stage reranker applied to `memory_search` results (read-path only).
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl std::fmt::Debug for StrataEngine {
@@ -165,6 +168,49 @@ impl StrataEngine {
                 _ => None,
             };
 
+        // Initialize optional reranker (read-path only; no Raft/determinism impact). Reuses the
+        // same chat-completion backends as cognition extraction; off unless `rerank.provider` set.
+        let reranker: Option<Arc<dyn Reranker>> = match config.rerank.provider.as_str() {
+            "llm" => {
+                let backend: Option<Arc<dyn CompletionProvider>> =
+                    match config.rerank.backend.as_str() {
+                        "ollama" => Some(Arc::new(crate::llm::ollama::OllamaCompletion::new(
+                            config.embedding.ollama_url.clone(),
+                            config.rerank.model.clone(),
+                        ))),
+                        "openai" if !config.embedding.openai_api_key.is_empty() => {
+                            Some(Arc::new(crate::llm::openai::OpenAiCompletion::new(
+                                config.embedding.openai_api_key.clone(),
+                                config.rerank.model.clone(),
+                            )))
+                        }
+                        _ => None,
+                    };
+                match backend {
+                    Some(c) => {
+                        tracing::info!(
+                            model = %config.rerank.model,
+                            backend = %config.rerank.backend,
+                            "reranker: llm"
+                        );
+                        Some(Arc::new(crate::rerank::LlmReranker::new(c)))
+                    }
+                    None => {
+                        tracing::warn!(
+                            backend = %config.rerank.backend,
+                            "reranker: llm requested but backend unavailable — disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            "none" | "" => None,
+            other => {
+                tracing::warn!(provider = %other, "unknown reranker provider — disabled");
+                None
+            }
+        };
+
         // Initialize ingest pipeline (keep a reference to embedding for embed-and-search)
         let embedding_ref = embedding.clone();
         let ingest = match embedding {
@@ -190,6 +236,7 @@ impl StrataEngine {
             modal: crate::memory::semantic::MultiModalStore::new(),
             ingest,
             completion,
+            reranker,
         })
     }
 
@@ -896,6 +943,14 @@ impl StrataEngine {
                 .collect());
         }
 
+        // Over-fetch a deeper candidate pool when a reranker will re-order it; otherwise keep the
+        // historical 3k width (so behavior is unchanged when no reranker is configured).
+        let pool = if self.reranker.is_some() {
+            self.config.rerank.candidates.max(k)
+        } else {
+            (k * 3).max(k)
+        };
+
         // Candidate universe for lexical ranking + id→memory map.
         let candidates = self
             .memory_store
@@ -914,7 +969,10 @@ impl StrataEngine {
         let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
         if !self.memory_index.is_empty() {
             if let Ok(vector) = self.embed_text(query).await {
-                if let Ok(hits) = self.memory_index_search(&vector, scope, k * 4).await {
+                if let Ok(hits) = self
+                    .memory_index_search(&vector, scope, pool.max(k * 4))
+                    .await
+                {
                     for h in hits {
                         vec_ids.push(h.memory.id);
                         by_id.entry(h.memory.id).or_insert(h.memory);
@@ -942,7 +1000,7 @@ impl StrataEngine {
 
         // Over-fetch, then re-rank by relevance blended with importance + recency, so a recent or
         // important memory can outrank a marginally-more-relevant stale one.
-        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, (k * 3).max(k));
+        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, pool);
         let now = chrono::Utc::now();
         let mut scored: Vec<MemoryHit> = Vec::with_capacity(fused.len());
         for (id, rrf) in fused {
@@ -964,6 +1022,39 @@ impl StrataEngine {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Optional second-stage reranking over the fused pool (read-path, best-effort): a
+        // cross-encoder/LLM relevance model reorders the candidates. Failures (e.g. network)
+        // degrade gracefully to the fused order computed above.
+        if let Some(reranker) = &self.reranker {
+            if !scored.is_empty() {
+                let docs: Vec<String> = scored.iter().map(|h| h.memory.content.clone()).collect();
+                match reranker.rerank(query, &docs).await {
+                    Ok(rscores) if rscores.len() == scored.len() => {
+                        for (hit, rs) in scored.iter_mut().zip(rscores) {
+                            let age_days = (now - hit.memory.updated_at).num_seconds().max(0)
+                                as f32
+                                / 86_400.0;
+                            let recency = 0.5_f32.powf(age_days / 30.0);
+                            // Rerank relevance dominates; a tiny recency nudge only breaks ties.
+                            hit.score = rs * (1.0 + 0.1 * recency);
+                        }
+                        scored.sort_by(|a, b| {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "reranker returned mismatched score count — keeping fused order"
+                        )
+                    }
+                    Err(e) => tracing::debug!(error = %e, "reranker failed — keeping fused order"),
+                }
+            }
+        }
+
         scored.truncate(k);
         Ok(scored)
     }
@@ -1087,6 +1178,83 @@ impl StrataEngine {
             let _ = self.memory_index.delete(id).await;
         }
         Ok(n)
+    }
+
+    /// Export a tenant's FULL data (episodic events + memories + agent state) as a JSON snapshot, for
+    /// moving the tenant to another shard. Counterpart: [`import_tenant`].
+    pub async fn export_tenant(&self, tenant: &str) -> Result<serde_json::Value> {
+        let events = self.episodic.events_by_tenant(tenant, 10_000_000).await?;
+        let memories = self.memory_store.list_by_tenant(tenant, 10_000_000).await?;
+        let state = self
+            .state
+            .export_by_prefix(&format!("{tenant}{TENANT_AGENT_SEP}"))
+            .await?;
+        Ok(serde_json::json!({
+            "events": events,
+            "memories": memories,
+            "state": state,
+        }))
+    }
+
+    /// Import a tenant snapshot produced by [`export_tenant`] (events re-ingested under `tenant`,
+    /// memories upserted verbatim, state set with its tenant-prefixed agent ids). Returns counts.
+    pub async fn import_tenant(
+        &self,
+        tenant: &str,
+        snapshot: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut ev_count = 0u64;
+        if let Some(events) = snapshot
+            .get("events")
+            .and_then(|v| serde_json::from_value::<Vec<Event>>(v.clone()).ok())
+        {
+            if !events.is_empty() {
+                ev_count = self
+                    .ingest_for_tenant(events, &crate::config::TenantContext::new(tenant))
+                    .await?;
+            }
+        }
+        let mut mem_count = 0usize;
+        if let Some(mems) = snapshot
+            .get("memories")
+            .and_then(|v| serde_json::from_value::<Vec<Memory>>(v.clone()).ok())
+        {
+            mem_count = self.import_memories(&mems).await?;
+        }
+        let mut state_count = 0u64;
+        if let Some(state) = snapshot.get("state").and_then(|v| v.as_array()) {
+            for item in state {
+                if let (Some(agent), Some(key), Some(value)) = (
+                    item.get(0).and_then(|x| x.as_str()),
+                    item.get(1).and_then(|x| x.as_str()),
+                    item.get(2),
+                ) {
+                    // agent_id retains its tenant prefix → set verbatim on the raw store.
+                    if self.state.set(agent, key, value.clone()).await.is_ok() {
+                        state_count += 1;
+                    }
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "events": ev_count,
+            "memories": mem_count,
+            "state": state_count,
+        }))
+    }
+
+    /// Move a tenant's FULL data (events + memories + state) from this engine to `dest`, then erase
+    /// it here. Best-effort across two independent engines (not a single transaction).
+    pub async fn migrate_tenant_to(
+        &self,
+        dest: &StrataEngine,
+        tenant: &str,
+    ) -> Result<serde_json::Value> {
+        let snapshot = self.export_tenant(tenant).await?;
+        let imported = dest.import_tenant(tenant, &snapshot).await?;
+        // Full move → the cascade delete is correct here (everything was copied to dest).
+        self.delete_tenant(tenant).await?;
+        Ok(imported)
     }
 
     /// Forget low-value memories via time-decay of importance (configurable half-life /
@@ -2211,6 +2379,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrate_tenant_full_moves_events_memories_state() {
+        // A FULL tenant move relocates episodic events + memories + state, then erases the source.
+        let a = StrataEngine::new(inmem_config()).await.unwrap();
+        let b = StrataEngine::new(inmem_config()).await.unwrap();
+        let ta = crate::config::TenantContext::new("t");
+        a.ingest_for_tenant(vec![Event::new("s", "e", serde_json::json!({"x": 1}))], &ta)
+            .await
+            .unwrap();
+        a.memory_add(MemoryInput::new(MemoryScope::tenant("t"), "fact"))
+            .await
+            .unwrap();
+        a.state_set_for_tenant("t", "bot", "k", serde_json::json!("v"))
+            .await
+            .unwrap();
+
+        a.migrate_tenant_to(&b, "t").await.unwrap();
+
+        // Everything is on the destination.
+        let ev_b = b
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "t")
+            .await
+            .unwrap();
+        assert_eq!(ev_b[0]["c"], "1");
+        assert_eq!(
+            b.memory_all(&MemoryScope::tenant("t"), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            b.state_get_for_tenant("t", "bot", "k")
+                .await
+                .unwrap()
+                .map(|e| e.value),
+            Some(serde_json::json!("v"))
+        );
+        // And erased from the source.
+        let ev_a = a
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "t")
+            .await
+            .unwrap();
+        assert_eq!(ev_a[0]["c"], "0");
+        assert_eq!(
+            a.memory_all(&MemoryScope::tenant("t"), 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(a
+            .state_get_for_tenant("t", "bot", "k")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn migrate_tenant_memories_preserves_source_events() {
         // A rebalance memory-move must NOT cascade-delete the tenant's episodic events on the source.
         let a = StrataEngine::new(inmem_config()).await.unwrap();
@@ -2437,6 +2663,51 @@ mod tests {
             .unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].memory.content, "alice works as a software engineer");
+    }
+
+    #[tokio::test]
+    async fn memory_search_applies_reranker() {
+        use crate::rerank::Reranker;
+
+        // A reranker that forces any "mountains" passage to the top, overriding BM25/recency.
+        struct KeywordReranker;
+        #[async_trait::async_trait]
+        impl Reranker for KeywordReranker {
+            async fn rerank(&self, _q: &str, docs: &[String]) -> Result<Vec<f32>> {
+                Ok(docs
+                    .iter()
+                    .map(|d| if d.contains("mountains") { 10.0 } else { 1.0 })
+                    .collect())
+            }
+            fn model_name(&self) -> &str {
+                "keyword"
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        // Both share the term "alice", so both are in the lexical candidate pool the reranker sees.
+        for content in [
+            "alice works as a software engineer",
+            "alice loves hiking in the mountains",
+        ] {
+            engine
+                .memory_add(MemoryInput::new(scope.clone(), content))
+                .await
+                .unwrap();
+        }
+
+        // Without a reranker the keyword doc is not first for this query.
+        let baseline = engine.memory_search("alice", &scope, 2).await.unwrap();
+        assert_eq!(baseline.len(), 2);
+
+        // With the reranker, the "mountains" passage is promoted to rank 0.
+        engine.reranker = Some(Arc::new(KeywordReranker));
+        let reranked = engine.memory_search("alice", &scope, 2).await.unwrap();
+        assert_eq!(
+            reranked[0].memory.content,
+            "alice loves hiking in the mountains"
+        );
     }
 
     #[test]

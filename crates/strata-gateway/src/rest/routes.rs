@@ -113,6 +113,15 @@ pub fn router_with_engine_and_auth(
         .route("/admin/backup", axum::routing::post(handlers::backup))
         .route("/admin/reindex", axum::routing::post(handlers::reindex))
         .route(
+            "/admin/tenants/{tenant}/export",
+            axum::routing::get(handlers::export_tenant),
+        )
+        .route(
+            "/admin/tenants/{tenant}/import",
+            axum::routing::post(handlers::import_tenant),
+        )
+        .route("/admin/rebalance", axum::routing::post(handlers::rebalance))
+        .route(
             "/admin/tenants/{tenant_id}",
             axum::routing::delete(handlers::delete_tenant),
         )

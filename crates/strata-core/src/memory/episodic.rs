@@ -131,6 +131,24 @@ impl EpisodicStore {
         self.write_db.lock()
     }
 
+    /// Export all events for a tenant (for moving a tenant between shards). The returned `Event`s
+    /// carry their original ids/timestamps; re-ingesting them on the destination preserves both.
+    pub async fn events_by_tenant(&self, tenant: &str, limit: usize) -> crate::Result<Vec<Event>> {
+        let db = self.read_conn();
+        let sql = format!(
+            "SELECT {} FROM episodic WHERE tenant_id = ? ORDER BY ts ASC LIMIT {}",
+            Self::SELECT_COLS,
+            limit.clamp(1, 10_000_000)
+        );
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map(duckdb::params![tenant], Self::parse_event)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Delete all events and sessions for a tenant (GDPR erasure). Returns events deleted.
     pub async fn delete_by_tenant(&self, tenant: &str) -> crate::Result<u64> {
         let db = self.write_db.lock();

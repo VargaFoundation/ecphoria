@@ -624,6 +624,130 @@ pub async fn delete_tenant(
     }
 }
 
+/// Export a tenant's full data (events + memories + state) as a JSON snapshot. Admin.
+///
+/// GET /api/v1/admin/tenants/{tenant}/export
+pub async fn export_tenant(
+    State(engine): State<Arc<StrataEngine>>,
+    Path(tenant): Path<String>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "export_tenant").increment(1);
+    match engine.export_tenant(&tenant).await {
+        Ok(snapshot) => api_ok(snapshot),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EXPORT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Import a tenant snapshot (from `export`). Admin.
+///
+/// POST /api/v1/admin/tenants/{tenant}/import
+pub async fn import_tenant(
+    State(engine): State<Arc<StrataEngine>>,
+    Path(tenant): Path<String>,
+    Json(snapshot): Json<serde_json::Value>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "import_tenant").increment(1);
+    match engine.import_tenant(&tenant, &snapshot).await {
+        Ok(counts) => api_ok(counts),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IMPORT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Rebalance: move a tenant's full data from THIS shard to `target_shard`. Admin. Runs on the source
+/// shard's pod: export locally → POST to the target shard's import endpoint → erase locally.
+///
+/// POST /api/v1/admin/rebalance  { "tenant": "...", "target_shard": N }
+pub async fn rebalance(
+    State(engine): State<Arc<StrataEngine>>,
+    shard: Option<Extension<crate::cluster::shard_route::ShardRoutingState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<super::models::RebalanceRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "rebalance").increment(1);
+    let Some(Extension(s)) = shard else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "NOT_SHARDED",
+            "rebalance requires sharded mode (cluster.shards > 1)".into(),
+        );
+    };
+    let Some(base) = s.base_urls.get(req.target_shard) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_SHARD",
+            format!("no base URL for shard {}", req.target_shard),
+        );
+    };
+    // Export locally.
+    let snapshot = match engine.export_tenant(&req.tenant).await {
+        Ok(s) => s,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EXPORT_ERROR",
+                e.to_string(),
+            )
+        }
+    };
+    // Push to the target shard's import endpoint.
+    let url = format!(
+        "{}/api/v1/admin/tenants/{}/import",
+        base.trim_end_matches('/'),
+        urlencoding(&req.tenant)
+    );
+    let mut rb = s
+        .http
+        .post(&url)
+        .header("x-strata-shard-forwarded", "1")
+        .json(&snapshot);
+    if let Some(auth) = headers.get("authorization") {
+        rb = rb.header("authorization", auth.clone());
+    }
+    match rb.send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "IMPORT_FAILED",
+                format!("target shard returned {}", resp.status()),
+            )
+        }
+        Err(e) => return api_error(StatusCode::BAD_GATEWAY, "IMPORT_UNREACHABLE", e.to_string()),
+    }
+    // Import succeeded → erase the tenant locally (the move is complete).
+    match engine.delete_tenant(&req.tenant).await {
+        Ok(_) => api_ok(
+            serde_json::json!({ "status": "ok", "tenant": req.tenant, "target_shard": req.target_shard }),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Minimal percent-encoding for a path segment (UTF-8-byte correct; tenant ids are usually plain).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Re-embed events left unembedded (e.g. provider was down at ingest). Admin; closes cross-store gap.
 pub async fn reindex(State(engine): State<Arc<StrataEngine>>) -> Response {
     metrics::counter!("strata_rest_requests_total", "endpoint" => "reindex").increment(1);

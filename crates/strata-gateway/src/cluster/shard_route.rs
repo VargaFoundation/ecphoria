@@ -346,6 +346,120 @@ mod tests {
         );
     }
 
+    async fn inmem_engine() -> std::sync::Arc<strata_core::StrataEngine> {
+        let mut c = strata_core::CoreConfig::default();
+        c.memory.episodic.db_path = ":memory:".into();
+        c.memory.state.db_path = ":memory:".into();
+        c.memory.cognition.db_path = ":memory:".into();
+        std::sync::Arc::new(strata_core::StrataEngine::new(c).await.unwrap())
+    }
+
+    /// End-to-end cross-pod rebalance (single process, real socket): seed a tenant on shard A, POST
+    /// `/admin/rebalance` to A, and verify the tenant's events + memory + state landed on shard B and
+    /// were erased from A. Exercises export → HTTP import → delete across two real gateways.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebalance_moves_tenant_across_pods() {
+        use strata_core::memory::cognition::{MemoryInput, MemoryScope};
+        use tower::ServiceExt;
+
+        // Shard B: a real gateway on a real port.
+        let engine_b = inmem_engine().await;
+        let router_b = crate::rest::router_with_engine(engine_b.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router_b).await.unwrap() });
+
+        // Shard A: router with shard routing, base_urls[1] → shard B.
+        let engine_a = inmem_engine().await;
+        let shard_state = ShardRoutingState {
+            router: Arc::new(ShardRouter::new(2, 128)),
+            my_shard: 0,
+            base_urls: Arc::new(vec![
+                "http://127.0.0.1:1".into(),
+                format!("http://{addr_b}"),
+            ]),
+            http: reqwest::Client::new(),
+        };
+        let router_a = crate::rest::router_with_engine_and_auth(
+            engine_a.clone(),
+            None,
+            None,
+            Some(shard_state),
+            &crate::server::GatewayConfig::default(),
+        );
+
+        // Seed tenant "t" on shard A: an event, a memory, a state key.
+        let ta = strata_core::config::TenantContext::new("t");
+        engine_a
+            .ingest_for_tenant(
+                vec![strata_core::memory::episodic::Event::new(
+                    "s",
+                    "e",
+                    serde_json::json!({"x": 1}),
+                )],
+                &ta,
+            )
+            .await
+            .unwrap();
+        engine_a
+            .memory_add(MemoryInput::new(MemoryScope::tenant("t"), "fact"))
+            .await
+            .unwrap();
+        engine_a
+            .state_set_for_tenant("t", "bot", "k", serde_json::json!("v"))
+            .await
+            .unwrap();
+
+        // Rebalance tenant "t" from shard 0 → shard 1.
+        let resp = router_a
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/rebalance")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&serde_json::json!({"tenant": "t", "target_shard": 1}))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "rebalance should succeed");
+
+        // Tenant data is now on shard B …
+        assert_eq!(
+            engine_b
+                .memory_all(&MemoryScope::tenant("t"), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine_b
+                .state_get_for_tenant("t", "bot", "k")
+                .await
+                .unwrap()
+                .map(|e| e.value),
+            Some(serde_json::json!("v"))
+        );
+        let ev_b = engine_b
+            .query_sql_for_tenant("SELECT count(*)::VARCHAR AS c FROM episodic", "t")
+            .await
+            .unwrap();
+        assert_eq!(ev_b[0]["c"], "1");
+        // … and erased from shard A.
+        assert_eq!(
+            engine_a
+                .memory_all(&MemoryScope::tenant("t"), 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
     /// End-to-end (single process, real socket): a request for a tenant owned by another shard is
     /// reverse-proxied to that shard's URL; a request for a local tenant is served locally. Proves
     /// the proxy plumbing without a k8s cluster. Uses the `DELETE /admin/tenants/{id}` path so the
