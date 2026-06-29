@@ -128,6 +128,13 @@ pub struct MemoryConsolidateRequest {
     pub session_id: Option<String>,
 }
 
+/// Move a tenant's full data from the current shard to `target_shard`.
+#[derive(Debug, Deserialize)]
+pub struct RebalanceRequest {
+    pub tenant: String,
+    pub target_shard: usize,
+}
+
 /// Upsert a pre-computed multi-modal embedding (caller brings its own modality encoder).
 #[derive(Debug, Deserialize)]
 pub struct SemanticUpsertRequest {

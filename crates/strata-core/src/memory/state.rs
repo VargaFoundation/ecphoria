@@ -313,6 +313,39 @@ impl StateStore {
         Ok(n as u64)
     }
 
+    /// Export all `(agent_id, key, value)` rows whose agent_id starts with `prefix` (for moving a
+    /// tenant between shards). `agent_id` is returned with its tenant prefix intact, so re-importing
+    /// via `set(agent_id, key, value)` round-trips exactly.
+    pub async fn export_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> crate::Result<Vec<(String, String, serde_json::Value)>> {
+        let esc = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{esc}%");
+        let db = self.db.lock();
+        let mut stmt = db
+            .prepare("SELECT agent_id, key, value FROM state WHERE agent_id LIKE ?1 ESCAPE '\\'")
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| crate::Error::State(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows.flatten() {
+            let value = serde_json::from_str(&r.2).unwrap_or(serde_json::Value::Null);
+            out.push((r.0, r.1, value));
+        }
+        Ok(out)
+    }
+
     /// Delete a key.
     pub async fn delete(&self, agent_id: &str, key: &str) -> crate::Result<()> {
         let db = self.db.lock();
