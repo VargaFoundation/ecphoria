@@ -1,0 +1,24 @@
+# Render.com Blueprint — one-click self-hosted Strata.
+#
+# Use: in the Render dashboard, "New +" → "Blueprint" → point at this repo (or use a
+# "Deploy to Render" button). Strata runs as a single container with a persistent disk for /data.
+#
+# Note: Render routes to the port your service binds. Strata listens on 8432 below; if your Render
+# setup injects $PORT, set STRATA_GATEWAY__LISTEN to bind it instead.
+services:
+  - type: web
+    name: strata
+    runtime: image
+    image:
+      url: ghcr.io/vargafoundation/strata:latest
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: STRATA_GATEWAY__LISTEN
+        value: 0.0.0.0:8432
+      - key: STRATA_STORAGE__DATA_DIR
+        value: /data
+    disk:
+      name: strata-data
+      mountPath: /data
+      sizeGB: 1

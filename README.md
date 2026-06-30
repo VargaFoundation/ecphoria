@@ -242,6 +242,8 @@ Strata automatically:
 
 ## Features
 
+- **Agentic platform** — durable agent runs, the agent loop, sub-agent workflows, human-in-the-loop
+  approvals, event triggers, and a governed MCP tool-gateway ([docs](docs/agentic-platform.md))
 - **PostgreSQL wire protocol** — psql, DBeaver, Metabase, Grafana
 - **Three unified memories** — episodic + semantic + state in one binary
 - **MCP server** — native Claude, Cursor, VS Code integration
@@ -267,6 +269,14 @@ Strata automatically:
 | Compose | `docker compose up` | Teams, full stack |
 | Cluster | `docker compose -f deploy/docker-compose.cluster.yml up` | HA testing |
 | Kubernetes | `helm install strata deploy/helm/strata/` | Production HA |
+| Render | Blueprint at [`render.yaml`](render.yaml) (New + → Blueprint) | One-click hosted |
+
+## Documentation
+
+- [Agentic platform](docs/agentic-platform.md) — runs, agent loop, HITL, workflows, triggers, tools
+- [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Strata adds for free
+- [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
+- [Web Explorer](examples/web-ui/) — single-file UI for SQL, memory search, and run traces
 
 ## Full Dev Stack
 
