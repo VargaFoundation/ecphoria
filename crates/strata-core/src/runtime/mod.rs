@@ -5,5 +5,7 @@
 //! (agent loop, scheduler, tool gateway) builds on this.
 
 pub mod store;
+pub mod tools;
 
 pub use store::{Run, RunPatch, RunStatus, RunStore, WorkflowNode};
+pub use tools::ToolExecutor;

@@ -224,8 +224,10 @@ pub fn router_with_engine_and_auth(
         config.webhook_secret.clone(),
     )));
 
-    // MCP tool-gateway: a governed registry of downstream MCP servers agents can call.
+    // MCP tool-gateway: a governed registry of downstream MCP servers agents can call. Also injected
+    // into the engine so the agent loop can invoke registered tools via `TOOL call`.
     let tool_gateway = std::sync::Arc::new(crate::rest::tool_gateway::ToolGateway::new());
+    engine.set_tool_executor(tool_gateway.clone());
     api_routes = api_routes.layer(axum::Extension(tool_gateway));
 
     // Coordinator handle for write replication (also handed to the MCP protocol routes below).

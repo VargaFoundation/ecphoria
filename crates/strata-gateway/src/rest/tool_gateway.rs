@@ -101,6 +101,21 @@ impl ToolGateway {
     }
 }
 
+/// Bridge so the agent loop (in `strata-core`) can invoke downstream MCP tools through the gateway.
+#[async_trait::async_trait]
+impl strata_core::runtime::ToolExecutor for ToolGateway {
+    async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> strata_core::Result<serde_json::Value> {
+        self.call(server, tool, arguments)
+            .await
+            .map_err(strata_core::Error::Ingest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
