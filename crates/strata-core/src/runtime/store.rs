@@ -22,6 +22,8 @@ pub enum RunStatus {
     #[default]
     Pending,
     Running,
+    /// Paused awaiting a human-in-the-loop approval.
+    WaitingApproval,
     Succeeded,
     Failed,
     Cancelled,
@@ -32,6 +34,7 @@ impl RunStatus {
         match self {
             RunStatus::Pending => "pending",
             RunStatus::Running => "running",
+            RunStatus::WaitingApproval => "waiting_approval",
             RunStatus::Succeeded => "succeeded",
             RunStatus::Failed => "failed",
             RunStatus::Cancelled => "cancelled",
@@ -41,6 +44,7 @@ impl RunStatus {
     fn from_str(s: &str) -> Self {
         match s {
             "running" => RunStatus::Running,
+            "waiting_approval" => RunStatus::WaitingApproval,
             "succeeded" => RunStatus::Succeeded,
             "failed" => RunStatus::Failed,
             "cancelled" => RunStatus::Cancelled,
@@ -105,6 +109,16 @@ pub struct RunPatch {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// A node in a workflow DAG: a sub-agent invocation gated on `deps` (other node ids).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowNode {
+    pub id: String,
+    pub agent_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
 }
 
 const COLS: &str = "id, tenant_id, agent_id, parent_run_id, status, input, result, error, cursor, \

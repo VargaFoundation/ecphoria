@@ -1638,6 +1638,7 @@ pub async fn run_list(
         Some("succeeded") => Some(strata_core::runtime::RunStatus::Succeeded),
         Some("failed") => Some(strata_core::runtime::RunStatus::Failed),
         Some("cancelled") => Some(strata_core::runtime::RunStatus::Cancelled),
+        Some("waiting_approval") => Some(strata_core::runtime::RunStatus::WaitingApproval),
         _ => None,
     };
     match engine
@@ -1794,6 +1795,153 @@ pub async fn run_cancel(
     }
     match engine.run_apply_update(id, &patch, now).await {
         Ok(_) => api_ok(serde_json::json!({ "status": "cancelled" })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUN_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Run an agent end-to-end (durable LLM↔tool loop) and return the resulting run. Requires a
+/// completion provider; the run + its step trace are persisted (see `/runs/{id}/trace`).
+pub async fn run_agent_endpoint(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<RunAgentRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "run_agent").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .run_agent(
+            &tenant,
+            &req.agent_id,
+            &req.question,
+            req.max_turns.unwrap_or(8),
+        )
+        .await
+    {
+        Ok(run) => api_ok(serde_json::json!({ "run": run })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "AGENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Register a downstream MCP tool server (governed by the existing auth layer).
+pub async fn register_tool(
+    gateway: Option<Extension<std::sync::Arc<crate::rest::tool_gateway::ToolGateway>>>,
+    Json(req): Json<RegisterToolServer>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "register_tool").increment(1);
+    match gateway {
+        Some(Extension(gw)) => {
+            gw.register(req.name.clone(), req.url);
+            api_ok(serde_json::json!({ "status": "registered", "name": req.name }))
+        }
+        None => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NO_TOOL_GATEWAY",
+            "tool gateway not enabled".to_string(),
+        ),
+    }
+}
+
+/// List the registered downstream MCP tool servers.
+pub async fn list_tools(
+    gateway: Option<Extension<std::sync::Arc<crate::rest::tool_gateway::ToolGateway>>>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "list_tools").increment(1);
+    match gateway {
+        Some(Extension(gw)) => api_ok(serde_json::json!({ "servers": gw.list() })),
+        None => api_ok(serde_json::json!({ "servers": [] })),
+    }
+}
+
+/// Invoke a tool on a registered downstream MCP server (the leader-side tool side effect).
+pub async fn call_tool(
+    gateway: Option<Extension<std::sync::Arc<crate::rest::tool_gateway::ToolGateway>>>,
+    axum::extract::Path(server): axum::extract::Path<String>,
+    Json(req): Json<CallToolRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "call_tool").increment(1);
+    let Some(Extension(gw)) = gateway else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NO_TOOL_GATEWAY",
+            "tool gateway not enabled".to_string(),
+        );
+    };
+    match gw.call(&server, &req.tool, req.arguments).await {
+        Ok(result) => api_ok(serde_json::json!({ "result": result })),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "TOOL_CALL_FAILED", e),
+    }
+}
+
+/// Pause a run awaiting human approval (HITL).
+pub async fn run_request_approval(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<RequestApprovalRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "run_request_approval")
+        .increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(i) => i,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                "run id must be a UUID".to_string(),
+            )
+        }
+    };
+    match engine.run_request_approval(id, &tenant, &req.prompt).await {
+        Ok(()) => api_ok(serde_json::json!({ "status": "waiting_approval" })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUN_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Approve or reject a run awaiting approval (HITL).
+pub async fn run_approve(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<ApproveRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "run_approve").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    let id = match uuid::Uuid::parse_str(&id) {
+        Ok(i) => i,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                "run id must be a UUID".to_string(),
+            )
+        }
+    };
+    match engine.run_resolve_approval(id, &tenant, req.approve).await {
+        Ok(()) => api_ok(serde_json::json!({
+            "status": if req.approve { "approved" } else { "rejected" }
+        })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "RUN_ERROR",

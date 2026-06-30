@@ -180,6 +180,44 @@ pub struct CreateRunRequest {
     pub input: serde_json::Value,
 }
 
+/// Register a downstream MCP tool server.
+#[derive(Debug, Deserialize)]
+pub struct RegisterToolServer {
+    pub name: String,
+    pub url: String,
+}
+
+/// Invoke a tool on a registered downstream MCP server.
+#[derive(Debug, Deserialize)]
+pub struct CallToolRequest {
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// Run an agent end-to-end (durable LLM↔tool loop).
+#[derive(Debug, Deserialize)]
+pub struct RunAgentRequest {
+    pub agent_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+/// Request human approval for a run (HITL).
+#[derive(Debug, Deserialize)]
+pub struct RequestApprovalRequest {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// Approve or reject a run awaiting approval (HITL).
+#[derive(Debug, Deserialize)]
+pub struct ApproveRequest {
+    #[serde(default)]
+    pub approve: bool,
+}
+
 /// List runs, optionally filtered by status.
 #[derive(Debug, Deserialize)]
 pub struct ListRunsQuery {

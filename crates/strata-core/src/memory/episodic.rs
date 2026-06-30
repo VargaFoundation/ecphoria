@@ -262,8 +262,8 @@ impl EpisodicStore {
             // post-insert UPDATE that could mis-tag concurrent batches.
             let mut stmt = db
                 .prepare(
-                    "INSERT OR IGNORE INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags, idempotency_key, tenant_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO episodic (id, source, event_type, payload, ts, parent_id, trace_id, tags, idempotency_key, tenant_id, session_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
 
@@ -283,6 +283,9 @@ impl EpisodicStore {
                     .get("_tenant_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
+                // session_id links steps to a run/session (e.g. an agent run); read from the
+                // `_session_id` payload tag, mirroring `_tenant_id`.
+                let session = event.payload.get("_session_id").and_then(|v| v.as_str());
                 let rows = stmt
                     .execute(duckdb::params![
                         event.id.to_string(),
@@ -295,6 +298,7 @@ impl EpisodicStore {
                         tags_str,
                         event.idempotency_key,
                         tenant,
+                        session,
                     ])
                     .map_err(|e| crate::Error::Ingest(format!("insert error: {e}")))?;
                 inserted += rows as u64;
@@ -344,6 +348,7 @@ impl EpisodicStore {
                         "trace_id",
                         "tags",
                         "tenant_id",
+                        "session_id",
                     ],
                 )
                 .map_err(|e| crate::Error::Ingest(format!("appender: {e}")))?;
@@ -361,6 +366,11 @@ impl EpisodicStore {
                     .and_then(|v| v.as_str())
                     .unwrap_or("default")
                     .to_string();
+                let session = ev
+                    .payload
+                    .get("_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 appender
                     .append_row(duckdb::params![
                         ev.id.to_string(),
@@ -375,6 +385,7 @@ impl EpisodicStore {
                         ev.trace_id.clone(),
                         tags,
                         tenant,
+                        session,
                     ])
                     .map_err(|e| crate::Error::Ingest(format!("append_row: {e}")))?;
             }

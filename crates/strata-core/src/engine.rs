@@ -16,7 +16,7 @@ use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
 use crate::rerank::Reranker;
-use crate::runtime::{Run, RunPatch, RunStatus, RunStore};
+use crate::runtime::{Run, RunPatch, RunStatus, RunStore, WorkflowNode};
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
@@ -207,6 +207,16 @@ impl StrataEngine {
                     }
                 }
             }
+            "cross_encoder" => {
+                // The production reranker (a local ONNX bge-reranker — no LLM latency). It requires
+                // a local ONNX runtime + model weights, so it is documented but not bundled in the
+                // default build (see `crate::rerank::cross_encoder`). Degrade gracefully for now.
+                tracing::warn!(
+                    "reranker: 'cross_encoder' is the documented production path but is not built \
+                     into this binary — falling back to no rerank (use provider='llm' meanwhile)"
+                );
+                None
+            }
             "none" | "" => None,
             other => {
                 tracing::warn!(provider = %other, "unknown reranker provider — disabled");
@@ -288,18 +298,19 @@ impl StrataEngine {
             started_at: None,
             ended_at: None,
         };
-        self.runs.create(&run).await?;
+        self.run_apply_create(&run).await?;
         Ok(run)
     }
 
     /// Apply a fully-materialized run (deterministic — used by Raft apply).
     pub async fn run_apply_create(&self, run: &Run) -> Result<()> {
+        metrics::counter!("strata_runs_created_total").increment(1);
         self.runs.create(run).await
     }
 
     /// Patch a run, stamping `updated_at = now` (single-node convenience).
     pub async fn run_update(&self, id: uuid::Uuid, patch: RunPatch) -> Result<bool> {
-        self.runs.update(id, &patch, chrono::Utc::now()).await
+        self.run_apply_update(id, &patch, chrono::Utc::now()).await
     }
 
     /// Apply a run patch with a leader-supplied `updated_at` (deterministic — used by Raft apply).
@@ -309,6 +320,12 @@ impl StrataEngine {
         patch: &RunPatch,
         updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
+        if let Some(s) = patch.status {
+            if s.is_terminal() {
+                metrics::counter!("strata_runs_completed_total", "status" => s.as_str())
+                    .increment(1);
+            }
+        }
         self.runs.update(id, patch, updated_at).await
     }
 
@@ -333,6 +350,426 @@ impl StrataEngine {
     /// Full step trace of a run = the episodic events tagged with `session_id = run_id`.
     pub async fn run_trace(&self, id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
         self.session_recall(&id.to_string()).await
+    }
+
+    // ── Event triggers (event-driven agent runs) ─────────────────────
+
+    /// Register an event trigger: when an event matching `source` + `event_type` (each `*` = any)
+    /// is observed, [`Self::fire_triggers`] starts a run of `agent_id`. Persisted in the state store
+    /// (so it replicates via `StateSet`).
+    pub async fn trigger_register(
+        &self,
+        name: &str,
+        source: &str,
+        event_type: &str,
+        agent_id: &str,
+    ) -> Result<()> {
+        self.state_set(
+            "__trigger",
+            name,
+            serde_json::json!({ "source": source, "event_type": event_type, "agent_id": agent_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// List the registered event triggers.
+    pub async fn trigger_list(&self) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        for name in self.state_list_keys("__trigger").await? {
+            if let Some(entry) = self.state_get("__trigger", &name).await? {
+                let mut v = entry.value;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("name".into(), name.clone().into());
+                }
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fire all triggers matching an event, starting a run per match. Returns the new run ids. The
+    /// hook for event-driven agents (e.g. call this after a webhook ingest).
+    pub async fn fire_triggers(
+        &self,
+        tenant: &str,
+        source: &str,
+        event_type: &str,
+        input: serde_json::Value,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let mut fired = Vec::new();
+        for name in self.state_list_keys("__trigger").await.unwrap_or_default() {
+            let Ok(Some(entry)) = self.state_get("__trigger", &name).await else {
+                continue;
+            };
+            let v = entry.value;
+            let want_src = v.get("source").and_then(|x| x.as_str()).unwrap_or("*");
+            let want_evt = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("*");
+            if (want_src == "*" || want_src == source)
+                && (want_evt == "*" || want_evt == event_type)
+            {
+                let agent = v
+                    .get("agent_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("trigger")
+                    .to_string();
+                let run = self
+                    .run_create(tenant, Some(agent), None, input.clone())
+                    .await?;
+                fired.push(run.id);
+            }
+        }
+        Ok(fired)
+    }
+
+    // ── Human-in-the-loop (HITL) ─────────────────────────────────────
+
+    /// Pause a run for human approval: set it `WaitingApproval`, record a `pending` approval in the
+    /// state store (keyed by run id, so a watcher can wake the driver), and journal a `hitl_request`.
+    pub async fn run_request_approval(
+        &self,
+        run_id: uuid::Uuid,
+        tenant: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        self.state_set(
+            &format!("__approval:{run_id}"),
+            "status",
+            serde_json::json!({ "state": "pending", "prompt": prompt }),
+        )
+        .await?;
+        self.run_update(
+            run_id,
+            RunPatch {
+                status: Some(RunStatus::WaitingApproval),
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.run_log_step(
+            run_id,
+            tenant,
+            "hitl_request",
+            serde_json::json!({ "prompt": prompt }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve a pending approval: record the verdict and move the run back to `Running` (approved)
+    /// or `Cancelled` (rejected); journal a `hitl_resolve` step.
+    pub async fn run_resolve_approval(
+        &self,
+        run_id: uuid::Uuid,
+        tenant: &str,
+        approved: bool,
+    ) -> Result<()> {
+        self.state_set(
+            &format!("__approval:{run_id}"),
+            "status",
+            serde_json::json!({ "state": if approved { "approved" } else { "rejected" } }),
+        )
+        .await?;
+        let patch = if approved {
+            RunPatch {
+                status: Some(RunStatus::Running),
+                ..Default::default()
+            }
+        } else {
+            RunPatch {
+                status: Some(RunStatus::Cancelled),
+                ended_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            }
+        };
+        self.run_update(run_id, patch).await?;
+        self.run_log_step(
+            run_id,
+            tenant,
+            "hitl_resolve",
+            serde_json::json!({ "approved": approved }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Current approval state for a run (`pending` / `approved` / `rejected`), if any.
+    pub async fn run_approval_status(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .state_get(&format!("__approval:{run_id}"), "status")
+            .await?
+            .map(|e| e.value))
+    }
+
+    /// Append one durable step to a run's trace: an episodic event tagged `_session_id = run_id`
+    /// (so `run_trace` recalls it) and `_tenant_id`. The step is the unit of agent observability.
+    pub async fn run_log_step(
+        &self,
+        run_id: uuid::Uuid,
+        tenant: &str,
+        event_type: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<()> {
+        metrics::counter!("strata_run_steps_total", "type" => event_type.to_string()).increment(1);
+        if !payload.is_object() {
+            payload = serde_json::json!({ "value": payload });
+        }
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("_session_id".into(), run_id.to_string().into());
+            obj.insert(
+                "_tenant_id".into(),
+                if tenant.is_empty() { "default" } else { tenant }.into(),
+            );
+        }
+        let ev = Event {
+            id: uuid::Uuid::new_v4(),
+            source: "agent".into(),
+            event_type: event_type.into(),
+            payload,
+            timestamp: chrono::Utc::now(),
+            parent_id: None,
+            trace_id: Some(run_id.to_string()),
+            tags: vec![],
+            idempotency_key: None,
+        };
+        self.ingest(vec![ev]).await.map(|_| ())
+    }
+
+    /// Run a minimal **durable agent loop** on the leader: drive an LLM↔tool loop until it answers,
+    /// journaling every step (`run_start` / `tool_call` / `llm_answer`) as part of the run's trace,
+    /// and transitioning the run's status. The one built-in tool is `search` (memory retrieval): the
+    /// model invokes it by replying `TOOL search: <query>`; any other reply is the final answer.
+    ///
+    /// Single-node today (writes runs + steps locally); the cluster driver replicates via
+    /// `RunCreate`/`RunUpdate` + `Ingest`. Requires a completion provider.
+    pub async fn run_agent(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        question: &str,
+        max_turns: usize,
+    ) -> Result<Run> {
+        self.run_agent_with_parent(tenant, agent_id, question, max_turns, None)
+            .await
+    }
+
+    /// Like [`Self::run_agent`] but links the run to `parent_run_id` — a **sub-agent** of a workflow.
+    pub async fn run_agent_with_parent(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        question: &str,
+        max_turns: usize,
+        parent_run_id: Option<uuid::Uuid>,
+    ) -> Result<Run> {
+        let completion = match &self.completion {
+            Some(c) => c.clone(),
+            None => {
+                return Err(crate::Error::Llm(
+                    "run_agent requires a completion provider".into(),
+                ))
+            }
+        };
+        let run = self
+            .run_create(
+                tenant,
+                Some(agent_id.to_string()),
+                parent_run_id,
+                serde_json::json!({ "question": question }),
+            )
+            .await?;
+        let _ = self
+            .run_update(
+                run.id,
+                RunPatch {
+                    status: Some(RunStatus::Running),
+                    started_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.run_log_step(
+            run.id,
+            tenant,
+            "run_start",
+            serde_json::json!({ "question": question }),
+        )
+        .await?;
+
+        let scope = MemoryScope {
+            tenant_id: if tenant.is_empty() {
+                "default".into()
+            } else {
+                tenant.to_string()
+            },
+            agent_id: Some(agent_id.to_string()),
+            ..Default::default()
+        };
+        let system =
+            "You are an agent answering the user's question. To search your memory, reply \
+                      EXACTLY `TOOL search: <query>` and nothing else. Otherwise, reply with the \
+                      final answer.";
+        let mut transcript = format!("Question: {question}\n");
+        let mut final_answer = None;
+
+        for _turn in 0..max_turns.max(1) {
+            let reply = completion.complete(system, &transcript).await?;
+            let trimmed = reply.trim().to_string();
+            if let Some(q) = trimmed.strip_prefix("TOOL search:") {
+                let q = q.trim();
+                let hits = self.memory_search(q, &scope, 5).await.unwrap_or_default();
+                let results: Vec<String> = hits.iter().map(|h| h.memory.content.clone()).collect();
+                self.run_log_step(
+                    run.id,
+                    tenant,
+                    "tool_call",
+                    serde_json::json!({ "tool": "search", "query": q, "results": results }),
+                )
+                .await?;
+                transcript.push_str(&format!(
+                    "Assistant: TOOL search: {q}\nObservation: {}\n",
+                    results.join(" | ")
+                ));
+            } else {
+                self.run_log_step(
+                    run.id,
+                    tenant,
+                    "llm_answer",
+                    serde_json::json!({ "answer": trimmed }),
+                )
+                .await?;
+                final_answer = Some(trimmed);
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let patch = match &final_answer {
+            Some(ans) => RunPatch {
+                status: Some(RunStatus::Succeeded),
+                result: Some(serde_json::json!({ "answer": ans })),
+                ended_at: Some(now),
+                ..Default::default()
+            },
+            None => RunPatch {
+                status: Some(RunStatus::Failed),
+                error: Some("max turns exceeded without a final answer".into()),
+                ended_at: Some(now),
+                ..Default::default()
+            },
+        };
+        self.run_update(run.id, patch).await?;
+        Ok(self.run_get(run.id).await?.unwrap_or(run))
+    }
+
+    /// Run a **workflow DAG**: create a parent run, then execute each node (a sub-agent) once its
+    /// `deps` have completed, in topological order, linking children via `parent_run_id` and
+    /// journaling a `subagent` step per node. Returns the parent run. Requires a completion provider.
+    pub async fn run_workflow(&self, tenant: &str, nodes: Vec<WorkflowNode>) -> Result<Run> {
+        let order = Self::topo_order(&nodes).ok_or_else(|| {
+            crate::Error::Ingest("workflow has a dependency cycle or unknown dep".into())
+        })?;
+        let parent = self
+            .run_create(
+                tenant,
+                Some("workflow".into()),
+                None,
+                serde_json::json!({ "nodes": nodes.len() }),
+            )
+            .await?;
+        let _ = self
+            .run_update(
+                parent.id,
+                RunPatch {
+                    status: Some(RunStatus::Running),
+                    started_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let mut children = Vec::new();
+        let mut failed = false;
+        for i in order {
+            let node = &nodes[i];
+            let child = self
+                .run_agent_with_parent(tenant, &node.agent_id, &node.question, 4, Some(parent.id))
+                .await?;
+            self.run_log_step(
+                parent.id,
+                tenant,
+                "subagent",
+                serde_json::json!({ "node": node.id, "child_run": child.id, "status": child.status.as_str() }),
+            )
+            .await?;
+            children.push(serde_json::json!({ "node": node.id, "run_id": child.id }));
+            if child.status != RunStatus::Succeeded {
+                failed = true;
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let patch = if failed {
+            RunPatch {
+                status: Some(RunStatus::Failed),
+                result: Some(serde_json::json!({ "children": children })),
+                error: Some("a workflow node did not succeed".into()),
+                ended_at: Some(now),
+                ..Default::default()
+            }
+        } else {
+            RunPatch {
+                status: Some(RunStatus::Succeeded),
+                result: Some(serde_json::json!({ "children": children })),
+                ended_at: Some(now),
+                ..Default::default()
+            }
+        };
+        self.run_update(parent.id, patch).await?;
+        Ok(self.run_get(parent.id).await?.unwrap_or(parent))
+    }
+
+    /// Kahn topological sort of workflow nodes by their `deps`. Returns node indices in execution
+    /// order (deterministic), or `None` on a cycle or an unknown dependency id.
+    fn topo_order(nodes: &[WorkflowNode]) -> Option<Vec<usize>> {
+        use std::collections::HashMap;
+        let index: HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+        let mut indeg = vec![0usize; nodes.len()];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for (i, n) in nodes.iter().enumerate() {
+            for d in &n.deps {
+                let j = *index.get(d.as_str())?;
+                adj[j].push(i);
+                indeg[i] += 1;
+            }
+        }
+        let mut queue: Vec<usize> = (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
+        queue.sort_unstable();
+        let mut order = Vec::new();
+        let mut qi = 0;
+        while qi < queue.len() {
+            let i = queue[qi];
+            qi += 1;
+            order.push(i);
+            let mut newly = Vec::new();
+            for &k in &adj[i] {
+                indeg[k] -= 1;
+                if indeg[k] == 0 {
+                    newly.push(k);
+                }
+            }
+            newly.sort_unstable();
+            queue.extend(newly);
+        }
+        (order.len() == nodes.len()).then_some(order)
     }
 
     // ── Episodic Memory ──────────────────────────────────────────────
@@ -3144,6 +3581,175 @@ mod tests {
         assert_eq!(rows[0].result, rows[1].result);
         assert_eq!(rows[0].updated_at, rows[1].updated_at);
         assert_eq!(rows[0].ended_at, rows[1].ended_at);
+    }
+
+    #[tokio::test]
+    async fn run_agent_loops_tool_then_answers_and_journals_steps() {
+        use crate::llm::CompletionProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Scripted model: first turn calls the search tool, second turn answers.
+        struct Scripted {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl CompletionProvider for Scripted {
+            async fn complete(&self, _system: &str, _user: &str) -> crate::Result<String> {
+                Ok(match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => "TOOL search: cats".to_string(),
+                    _ => "Cats are fluffy companions.".to_string(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine.completion = Some(std::sync::Arc::new(Scripted {
+            calls: AtomicUsize::new(0),
+        }));
+        let scope = MemoryScope {
+            tenant_id: "default".into(),
+            agent_id: Some("a1".into()),
+            ..Default::default()
+        };
+        engine
+            .memory_add(MemoryInput::new(scope, "cats are fluffy"))
+            .await
+            .unwrap();
+
+        let run = engine
+            .run_agent("default", "a1", "tell me about cats", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, crate::runtime::RunStatus::Succeeded);
+        assert_eq!(run.result["answer"], "Cats are fluffy companions.");
+
+        // The trace journaled run_start + tool_call + llm_answer (3 steps), recallable by run id.
+        let steps = engine.run_trace(run.id).await.unwrap();
+        assert_eq!(steps.len(), 3);
+        assert!(steps.iter().any(|s| s["event_type"] == "tool_call"));
+        assert!(steps.iter().any(|s| s["event_type"] == "llm_answer"));
+    }
+
+    #[tokio::test]
+    async fn triggers_register_match_and_fire_runs() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .trigger_register("on_pr", "github", "pull_request.opened", "pr-agent")
+            .await
+            .unwrap();
+        engine
+            .trigger_register("on_any", "*", "*", "catch-all")
+            .await
+            .unwrap();
+        assert_eq!(engine.trigger_list().await.unwrap().len(), 2);
+
+        // A GitHub PR event matches both the exact and the wildcard trigger → 2 runs.
+        let fired = engine
+            .fire_triggers(
+                "default",
+                "github",
+                "pull_request.opened",
+                serde_json::json!({"pr": 42}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fired.len(), 2);
+
+        // A different source matches only the wildcard → 1 run.
+        let fired2 = engine
+            .fire_triggers("default", "sentry", "issue.created", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fired2.len(), 1);
+
+        assert_eq!(engine.run_list("default", None, 10).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn hitl_request_then_approve() {
+        use crate::runtime::RunStatus;
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let run = engine
+            .run_create("default", Some("a".into()), None, serde_json::json!({}))
+            .await
+            .unwrap();
+
+        engine
+            .run_request_approval(run.id, "default", "ship it?")
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.run_get(run.id).await.unwrap().unwrap().status,
+            RunStatus::WaitingApproval
+        );
+        assert_eq!(
+            engine.run_approval_status(run.id).await.unwrap().unwrap()["state"],
+            "pending"
+        );
+
+        engine
+            .run_resolve_approval(run.id, "default", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.run_get(run.id).await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            engine.run_approval_status(run.id).await.unwrap().unwrap()["state"],
+            "approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_executes_subagents_in_dep_order() {
+        use crate::llm::CompletionProvider;
+        use crate::runtime::{RunStatus, WorkflowNode};
+
+        struct Echo;
+        #[async_trait::async_trait]
+        impl CompletionProvider for Echo {
+            async fn complete(&self, _s: &str, _u: &str) -> crate::Result<String> {
+                Ok("done".to_string())
+            }
+            fn model_name(&self) -> &str {
+                "echo"
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine.completion = Some(std::sync::Arc::new(Echo));
+
+        // Node "b" depends on "a"; topo order must run a before b.
+        let nodes = vec![
+            WorkflowNode {
+                id: "b".into(),
+                agent_id: "agent".into(),
+                question: "second".into(),
+                deps: vec!["a".into()],
+            },
+            WorkflowNode {
+                id: "a".into(),
+                agent_id: "agent".into(),
+                question: "first".into(),
+                deps: vec![],
+            },
+        ];
+        let parent = engine.run_workflow("default", nodes).await.unwrap();
+        assert_eq!(parent.status, RunStatus::Succeeded);
+
+        // Parent + 2 sub-agent children; children link back to the parent.
+        let runs = engine.run_list("default", None, 10).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        let children: Vec<_> = runs
+            .iter()
+            .filter(|r| r.parent_run_id == Some(parent.id))
+            .collect();
+        assert_eq!(children.len(), 2);
     }
 
     #[test]
