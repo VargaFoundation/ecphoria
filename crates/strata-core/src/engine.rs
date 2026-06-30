@@ -288,18 +288,19 @@ impl StrataEngine {
             started_at: None,
             ended_at: None,
         };
-        self.runs.create(&run).await?;
+        self.run_apply_create(&run).await?;
         Ok(run)
     }
 
     /// Apply a fully-materialized run (deterministic — used by Raft apply).
     pub async fn run_apply_create(&self, run: &Run) -> Result<()> {
+        metrics::counter!("strata_runs_created_total").increment(1);
         self.runs.create(run).await
     }
 
     /// Patch a run, stamping `updated_at = now` (single-node convenience).
     pub async fn run_update(&self, id: uuid::Uuid, patch: RunPatch) -> Result<bool> {
-        self.runs.update(id, &patch, chrono::Utc::now()).await
+        self.run_apply_update(id, &patch, chrono::Utc::now()).await
     }
 
     /// Apply a run patch with a leader-supplied `updated_at` (deterministic — used by Raft apply).
@@ -309,6 +310,12 @@ impl StrataEngine {
         patch: &RunPatch,
         updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
+        if let Some(s) = patch.status {
+            if s.is_terminal() {
+                metrics::counter!("strata_runs_completed_total", "status" => s.as_str())
+                    .increment(1);
+            }
+        }
         self.runs.update(id, patch, updated_at).await
     }
 
@@ -344,6 +351,7 @@ impl StrataEngine {
         event_type: &str,
         mut payload: serde_json::Value,
     ) -> Result<()> {
+        metrics::counter!("strata_run_steps_total", "type" => event_type.to_string()).increment(1);
         if !payload.is_object() {
             payload = serde_json::json!({ "value": payload });
         }
