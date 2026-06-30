@@ -111,6 +111,16 @@ pub struct RunPatch {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// A node in a workflow DAG: a sub-agent invocation gated on `deps` (other node ids).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowNode {
+    pub id: String,
+    pub agent_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
+}
+
 const COLS: &str = "id, tenant_id, agent_id, parent_run_id, status, input, result, error, cursor, \
                     created_at, updated_at, started_at, ended_at";
 

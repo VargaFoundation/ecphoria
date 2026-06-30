@@ -6,4 +6,4 @@
 
 pub mod store;
 
-pub use store::{Run, RunPatch, RunStatus, RunStore};
+pub use store::{Run, RunPatch, RunStatus, RunStore, WorkflowNode};

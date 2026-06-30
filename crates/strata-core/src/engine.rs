@@ -16,7 +16,7 @@ use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
 use crate::rerank::Reranker;
-use crate::runtime::{Run, RunPatch, RunStatus, RunStore};
+use crate::runtime::{Run, RunPatch, RunStatus, RunStore, WorkflowNode};
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
@@ -542,6 +542,19 @@ impl StrataEngine {
         question: &str,
         max_turns: usize,
     ) -> Result<Run> {
+        self.run_agent_with_parent(tenant, agent_id, question, max_turns, None)
+            .await
+    }
+
+    /// Like [`Self::run_agent`] but links the run to `parent_run_id` — a **sub-agent** of a workflow.
+    pub async fn run_agent_with_parent(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        question: &str,
+        max_turns: usize,
+        parent_run_id: Option<uuid::Uuid>,
+    ) -> Result<Run> {
         let completion = match &self.completion {
             Some(c) => c.clone(),
             None => {
@@ -554,7 +567,7 @@ impl StrataEngine {
             .run_create(
                 tenant,
                 Some(agent_id.to_string()),
-                None,
+                parent_run_id,
                 serde_json::json!({ "question": question }),
             )
             .await?;
@@ -640,6 +653,113 @@ impl StrataEngine {
         };
         self.run_update(run.id, patch).await?;
         Ok(self.run_get(run.id).await?.unwrap_or(run))
+    }
+
+    /// Run a **workflow DAG**: create a parent run, then execute each node (a sub-agent) once its
+    /// `deps` have completed, in topological order, linking children via `parent_run_id` and
+    /// journaling a `subagent` step per node. Returns the parent run. Requires a completion provider.
+    pub async fn run_workflow(&self, tenant: &str, nodes: Vec<WorkflowNode>) -> Result<Run> {
+        let order = Self::topo_order(&nodes).ok_or_else(|| {
+            crate::Error::Ingest("workflow has a dependency cycle or unknown dep".into())
+        })?;
+        let parent = self
+            .run_create(
+                tenant,
+                Some("workflow".into()),
+                None,
+                serde_json::json!({ "nodes": nodes.len() }),
+            )
+            .await?;
+        let _ = self
+            .run_update(
+                parent.id,
+                RunPatch {
+                    status: Some(RunStatus::Running),
+                    started_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let mut children = Vec::new();
+        let mut failed = false;
+        for i in order {
+            let node = &nodes[i];
+            let child = self
+                .run_agent_with_parent(tenant, &node.agent_id, &node.question, 4, Some(parent.id))
+                .await?;
+            self.run_log_step(
+                parent.id,
+                tenant,
+                "subagent",
+                serde_json::json!({ "node": node.id, "child_run": child.id, "status": child.status.as_str() }),
+            )
+            .await?;
+            children.push(serde_json::json!({ "node": node.id, "run_id": child.id }));
+            if child.status != RunStatus::Succeeded {
+                failed = true;
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let patch = if failed {
+            RunPatch {
+                status: Some(RunStatus::Failed),
+                result: Some(serde_json::json!({ "children": children })),
+                error: Some("a workflow node did not succeed".into()),
+                ended_at: Some(now),
+                ..Default::default()
+            }
+        } else {
+            RunPatch {
+                status: Some(RunStatus::Succeeded),
+                result: Some(serde_json::json!({ "children": children })),
+                ended_at: Some(now),
+                ..Default::default()
+            }
+        };
+        self.run_update(parent.id, patch).await?;
+        Ok(self.run_get(parent.id).await?.unwrap_or(parent))
+    }
+
+    /// Kahn topological sort of workflow nodes by their `deps`. Returns node indices in execution
+    /// order (deterministic), or `None` on a cycle or an unknown dependency id.
+    fn topo_order(nodes: &[WorkflowNode]) -> Option<Vec<usize>> {
+        use std::collections::HashMap;
+        let index: HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+        let mut indeg = vec![0usize; nodes.len()];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for (i, n) in nodes.iter().enumerate() {
+            for d in &n.deps {
+                let j = *index.get(d.as_str())?;
+                adj[j].push(i);
+                indeg[i] += 1;
+            }
+        }
+        let mut queue: Vec<usize> = (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
+        queue.sort_unstable();
+        let mut order = Vec::new();
+        let mut qi = 0;
+        while qi < queue.len() {
+            let i = queue[qi];
+            qi += 1;
+            order.push(i);
+            let mut newly = Vec::new();
+            for &k in &adj[i] {
+                indeg[k] -= 1;
+                if indeg[k] == 0 {
+                    newly.push(k);
+                }
+            }
+            newly.sort_unstable();
+            queue.extend(newly);
+        }
+        (order.len() == nodes.len()).then_some(order)
     }
 
     // ── Episodic Memory ──────────────────────────────────────────────
@@ -3573,6 +3693,53 @@ mod tests {
             engine.run_approval_status(run.id).await.unwrap().unwrap()["state"],
             "approved"
         );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_executes_subagents_in_dep_order() {
+        use crate::llm::CompletionProvider;
+        use crate::runtime::{RunStatus, WorkflowNode};
+
+        struct Echo;
+        #[async_trait::async_trait]
+        impl CompletionProvider for Echo {
+            async fn complete(&self, _s: &str, _u: &str) -> crate::Result<String> {
+                Ok("done".to_string())
+            }
+            fn model_name(&self) -> &str {
+                "echo"
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine.completion = Some(std::sync::Arc::new(Echo));
+
+        // Node "b" depends on "a"; topo order must run a before b.
+        let nodes = vec![
+            WorkflowNode {
+                id: "b".into(),
+                agent_id: "agent".into(),
+                question: "second".into(),
+                deps: vec!["a".into()],
+            },
+            WorkflowNode {
+                id: "a".into(),
+                agent_id: "agent".into(),
+                question: "first".into(),
+                deps: vec![],
+            },
+        ];
+        let parent = engine.run_workflow("default", nodes).await.unwrap();
+        assert_eq!(parent.status, RunStatus::Succeeded);
+
+        // Parent + 2 sub-agent children; children link back to the parent.
+        let runs = engine.run_list("default", None, 10).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        let children: Vec<_> = runs
+            .iter()
+            .filter(|r| r.parent_run_id == Some(parent.id))
+            .collect();
+        assert_eq!(children.len(), 2);
     }
 
     #[test]
