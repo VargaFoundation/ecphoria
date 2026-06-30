@@ -335,6 +335,153 @@ impl StrataEngine {
         self.session_recall(&id.to_string()).await
     }
 
+    /// Append one durable step to a run's trace: an episodic event tagged `_session_id = run_id`
+    /// (so `run_trace` recalls it) and `_tenant_id`. The step is the unit of agent observability.
+    pub async fn run_log_step(
+        &self,
+        run_id: uuid::Uuid,
+        tenant: &str,
+        event_type: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<()> {
+        if !payload.is_object() {
+            payload = serde_json::json!({ "value": payload });
+        }
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("_session_id".into(), run_id.to_string().into());
+            obj.insert(
+                "_tenant_id".into(),
+                if tenant.is_empty() { "default" } else { tenant }.into(),
+            );
+        }
+        let ev = Event {
+            id: uuid::Uuid::new_v4(),
+            source: "agent".into(),
+            event_type: event_type.into(),
+            payload,
+            timestamp: chrono::Utc::now(),
+            parent_id: None,
+            trace_id: Some(run_id.to_string()),
+            tags: vec![],
+            idempotency_key: None,
+        };
+        self.ingest(vec![ev]).await.map(|_| ())
+    }
+
+    /// Run a minimal **durable agent loop** on the leader: drive an LLM↔tool loop until it answers,
+    /// journaling every step (`run_start` / `tool_call` / `llm_answer`) as part of the run's trace,
+    /// and transitioning the run's status. The one built-in tool is `search` (memory retrieval): the
+    /// model invokes it by replying `TOOL search: <query>`; any other reply is the final answer.
+    ///
+    /// Single-node today (writes runs + steps locally); the cluster driver replicates via
+    /// `RunCreate`/`RunUpdate` + `Ingest`. Requires a completion provider.
+    pub async fn run_agent(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        question: &str,
+        max_turns: usize,
+    ) -> Result<Run> {
+        let completion = match &self.completion {
+            Some(c) => c.clone(),
+            None => {
+                return Err(crate::Error::Llm(
+                    "run_agent requires a completion provider".into(),
+                ))
+            }
+        };
+        let run = self
+            .run_create(
+                tenant,
+                Some(agent_id.to_string()),
+                None,
+                serde_json::json!({ "question": question }),
+            )
+            .await?;
+        let _ = self
+            .run_update(
+                run.id,
+                RunPatch {
+                    status: Some(RunStatus::Running),
+                    started_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.run_log_step(
+            run.id,
+            tenant,
+            "run_start",
+            serde_json::json!({ "question": question }),
+        )
+        .await?;
+
+        let scope = MemoryScope {
+            tenant_id: if tenant.is_empty() {
+                "default".into()
+            } else {
+                tenant.to_string()
+            },
+            agent_id: Some(agent_id.to_string()),
+            ..Default::default()
+        };
+        let system =
+            "You are an agent answering the user's question. To search your memory, reply \
+                      EXACTLY `TOOL search: <query>` and nothing else. Otherwise, reply with the \
+                      final answer.";
+        let mut transcript = format!("Question: {question}\n");
+        let mut final_answer = None;
+
+        for _turn in 0..max_turns.max(1) {
+            let reply = completion.complete(system, &transcript).await?;
+            let trimmed = reply.trim().to_string();
+            if let Some(q) = trimmed.strip_prefix("TOOL search:") {
+                let q = q.trim();
+                let hits = self.memory_search(q, &scope, 5).await.unwrap_or_default();
+                let results: Vec<String> = hits.iter().map(|h| h.memory.content.clone()).collect();
+                self.run_log_step(
+                    run.id,
+                    tenant,
+                    "tool_call",
+                    serde_json::json!({ "tool": "search", "query": q, "results": results }),
+                )
+                .await?;
+                transcript.push_str(&format!(
+                    "Assistant: TOOL search: {q}\nObservation: {}\n",
+                    results.join(" | ")
+                ));
+            } else {
+                self.run_log_step(
+                    run.id,
+                    tenant,
+                    "llm_answer",
+                    serde_json::json!({ "answer": trimmed }),
+                )
+                .await?;
+                final_answer = Some(trimmed);
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let patch = match &final_answer {
+            Some(ans) => RunPatch {
+                status: Some(RunStatus::Succeeded),
+                result: Some(serde_json::json!({ "answer": ans })),
+                ended_at: Some(now),
+                ..Default::default()
+            },
+            None => RunPatch {
+                status: Some(RunStatus::Failed),
+                error: Some("max turns exceeded without a final answer".into()),
+                ended_at: Some(now),
+                ..Default::default()
+            },
+        };
+        self.run_update(run.id, patch).await?;
+        Ok(self.run_get(run.id).await?.unwrap_or(run))
+    }
+
     // ── Episodic Memory ──────────────────────────────────────────────
 
     /// Ingest events via the pipeline.
@@ -3144,6 +3291,57 @@ mod tests {
         assert_eq!(rows[0].result, rows[1].result);
         assert_eq!(rows[0].updated_at, rows[1].updated_at);
         assert_eq!(rows[0].ended_at, rows[1].ended_at);
+    }
+
+    #[tokio::test]
+    async fn run_agent_loops_tool_then_answers_and_journals_steps() {
+        use crate::llm::CompletionProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Scripted model: first turn calls the search tool, second turn answers.
+        struct Scripted {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl CompletionProvider for Scripted {
+            async fn complete(&self, _system: &str, _user: &str) -> crate::Result<String> {
+                Ok(match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => "TOOL search: cats".to_string(),
+                    _ => "Cats are fluffy companions.".to_string(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine.completion = Some(std::sync::Arc::new(Scripted {
+            calls: AtomicUsize::new(0),
+        }));
+        let scope = MemoryScope {
+            tenant_id: "default".into(),
+            agent_id: Some("a1".into()),
+            ..Default::default()
+        };
+        engine
+            .memory_add(MemoryInput::new(scope, "cats are fluffy"))
+            .await
+            .unwrap();
+
+        let run = engine
+            .run_agent("default", "a1", "tell me about cats", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, crate::runtime::RunStatus::Succeeded);
+        assert_eq!(run.result["answer"], "Cats are fluffy companions.");
+
+        // The trace journaled run_start + tool_call + llm_answer (3 steps), recallable by run id.
+        let steps = engine.run_trace(run.id).await.unwrap();
+        assert_eq!(steps.len(), 3);
+        assert!(steps.iter().any(|s| s["event_type"] == "tool_call"));
+        assert!(steps.iter().any(|s| s["event_type"] == "llm_answer"));
     }
 
     #[test]
