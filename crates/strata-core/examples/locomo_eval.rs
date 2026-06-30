@@ -8,10 +8,14 @@
 //!   cargo run -p strata-core --example locomo_eval
 //!
 //! Run it on a REAL dataset with an embedding provider (true hybrid retrieval, closer to the
-//! published LoCoMo setups):
+//! published LoCoMo setups), optionally with second-stage LLM reranking:
 //!   LOCOMO_PATH=examples/locomo-sample.json \
 //!   STRATA_EMBEDDING__PROVIDER=ollama \
+//!   STRATA_RERANK__PROVIDER=llm STRATA_RERANK__BACKEND=ollama STRATA_RERANK__MODEL=llama3.2 \
 //!   cargo run -p strata-core --example locomo_eval
+//!
+//! Env overrides recognized by this harness: STRATA_EMBEDDING__{PROVIDER,MODEL,OLLAMA_URL,
+//! OPENAI_API_KEY} and STRATA_RERANK__{PROVIDER,BACKEND,MODEL}.
 //!
 //! Dataset schema (JSON): an array of conversations, each:
 //!   { "user": "alice",
@@ -82,6 +86,30 @@ fn embedded_dataset() -> Vec<Conversation> {
     ]
 }
 
+/// Apply the `STRATA_*` env overrides this harness understands onto an in-memory config, so the
+/// documented `STRATA_EMBEDDING__…` / `STRATA_RERANK__…` knobs take effect (the example builds a
+/// `CoreConfig::default()` directly rather than going through the server's env-layered loader).
+fn apply_env(config: &mut CoreConfig) {
+    let set = |dst: &mut String, key: &str| {
+        if let Ok(v) = std::env::var(key) {
+            *dst = v;
+        }
+    };
+    set(&mut config.embedding.provider, "STRATA_EMBEDDING__PROVIDER");
+    set(&mut config.embedding.model, "STRATA_EMBEDDING__MODEL");
+    set(
+        &mut config.embedding.ollama_url,
+        "STRATA_EMBEDDING__OLLAMA_URL",
+    );
+    set(
+        &mut config.embedding.openai_api_key,
+        "STRATA_EMBEDDING__OPENAI_API_KEY",
+    );
+    set(&mut config.rerank.provider, "STRATA_RERANK__PROVIDER");
+    set(&mut config.rerank.backend, "STRATA_RERANK__BACKEND");
+    set(&mut config.rerank.model, "STRATA_RERANK__MODEL");
+}
+
 fn load_dataset() -> Vec<Conversation> {
     if let Ok(path) = std::env::var("LOCOMO_PATH") {
         match std::fs::read_to_string(&path) {
@@ -109,6 +137,7 @@ async fn run() {
     config.memory.episodic.db_path = ":memory:".into();
     config.memory.state.db_path = ":memory:".into();
     config.memory.cognition.db_path = ":memory:".into();
+    apply_env(&mut config);
     let engine = StrataEngine::new(config).await.expect("engine");
 
     let dataset = load_dataset();
@@ -210,6 +239,13 @@ async fn run() {
             "hybrid (BM25 + vector)"
         } else {
             "lexical (BM25 only — set STRATA_EMBEDDING__PROVIDER for hybrid)"
+        }
+    );
+    println!(
+        "rerank:           {}",
+        match engine.config().rerank.provider.as_str() {
+            "none" | "" => "off",
+            p => p,
         }
     );
 }
