@@ -1,6 +1,6 @@
 {
   "name": "@strata/client",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "TypeScript/JavaScript client for the Strata context lake",
   "license": "Apache-2.0",
   "type": "module",

@@ -386,6 +386,130 @@ export class StrataClient {
     return data.events ?? [];
   }
 
+  // ── Agentic platform (runs, agents, triggers, tools) ─────────────
+
+  /** Create a durable agent/workflow run. Returns the run. */
+  async runCreate(
+    opts: { agentId?: string; input?: Record<string, unknown>; parentRunId?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {};
+    if (opts.agentId !== undefined) body.agent_id = opts.agentId;
+    if (opts.input !== undefined) body.input = opts.input;
+    if (opts.parentRunId !== undefined) body.parent_run_id = opts.parentRunId;
+    const data = await this.post<{ run: Record<string, unknown> }>("/api/v1/runs", body);
+    return data.run ?? {};
+  }
+
+  /** Get a run by id. */
+  async runGet(id: string): Promise<Record<string, unknown> | null> {
+    const data = await this.get<{ run?: Record<string, unknown> }>(
+      `/api/v1/runs/${encodeURIComponent(id)}`,
+    );
+    return data.run ?? null;
+  }
+
+  /** List runs (newest first), optionally filtered by status. */
+  async runList(
+    opts: { status?: string; limit?: number } = {},
+  ): Promise<Record<string, unknown>[]> {
+    const params = new URLSearchParams();
+    params.set("limit", String(opts.limit ?? 50));
+    if (opts.status) params.set("status", opts.status);
+    const data = await this.get<{ runs: Record<string, unknown>[] }>(
+      `/api/v1/runs?${params.toString()}`,
+    );
+    return data.runs ?? [];
+  }
+
+  /** Full step trace of a run (LLM/tool/HITL steps). */
+  async runTrace(id: string): Promise<Record<string, unknown>[]> {
+    const data = await this.get<{ steps: Record<string, unknown>[] }>(
+      `/api/v1/runs/${encodeURIComponent(id)}/trace`,
+    );
+    return data.steps ?? [];
+  }
+
+  /** Cancel a run. */
+  async runCancel(id: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>(
+      `/api/v1/runs/${encodeURIComponent(id)}/cancel`,
+      {},
+    );
+  }
+
+  /** Run an agent end-to-end (durable LLM↔tool loop). Returns the resulting run. */
+  async runAgent(
+    agentId: string,
+    question: string,
+    opts: { maxTurns?: number } = {},
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = { agent_id: agentId, question };
+    if (opts.maxTurns !== undefined) body.max_turns = opts.maxTurns;
+    const data = await this.post<{ run: Record<string, unknown> }>("/api/v1/agents/run", body);
+    return data.run ?? {};
+  }
+
+  /** Approve or reject a run awaiting approval (HITL). */
+  async runApprove(id: string, approve = true): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>(
+      `/api/v1/runs/${encodeURIComponent(id)}/approve`,
+      { approve },
+    );
+  }
+
+  /** Resume an approved run (durable resume after HITL). */
+  async runResume(id: string): Promise<Record<string, unknown>> {
+    const data = await this.post<{ run: Record<string, unknown> }>(
+      `/api/v1/runs/${encodeURIComponent(id)}/resume`,
+      {},
+    );
+    return data.run ?? {};
+  }
+
+  /** Register an event trigger: matching events start a run of `agentId`. */
+  async triggerRegister(
+    name: string,
+    agentId: string,
+    opts: { source?: string; eventType?: string } = {},
+  ): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/v1/triggers", {
+      name,
+      agent_id: agentId,
+      source: opts.source ?? "*",
+      event_type: opts.eventType ?? "*",
+    });
+  }
+
+  /** List registered event triggers. */
+  async triggerList(): Promise<Record<string, unknown>[]> {
+    const data = await this.get<{ triggers: Record<string, unknown>[] }>("/api/v1/triggers");
+    return data.triggers ?? [];
+  }
+
+  /** Register a downstream MCP tool server. */
+  async toolRegister(name: string, url: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/v1/tools", { name, url });
+  }
+
+  /** List registered downstream MCP tool servers. */
+  async toolList(): Promise<Record<string, unknown>[]> {
+    const data = await this.get<{ servers: Record<string, unknown>[] }>("/api/v1/tools");
+    return data.servers ?? [];
+  }
+
+  /** Invoke a tool on a registered downstream MCP server. */
+  async toolCall(
+    server: string,
+    tool: string,
+    args: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    const data = await this.post<{ result: unknown }>(
+      `/api/v1/tools/${encodeURIComponent(server)}/call`,
+      { tool, arguments: args },
+    );
+    return data.result;
+  }
+
   // ── Cluster ──────────────────────────────────────────────────────
 
   /** Get Raft cluster status. */

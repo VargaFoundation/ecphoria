@@ -534,6 +534,152 @@ class StrataClient:
         resp.raise_for_status()
         return resp.json().get("events", [])
 
+    # ── Agentic platform (runs, agents, triggers, tools) ─────────────
+
+    async def run_create(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        input: Optional[dict[str, Any]] = None,
+        parent_run_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a durable agent/workflow run. Returns the run."""
+        body: dict[str, Any] = {}
+        for k, v in (
+            ("agent_id", agent_id),
+            ("input", input),
+            ("parent_run_id", parent_run_id),
+        ):
+            if v is not None:
+                body[k] = v
+        resp = await self._request("POST", "/api/v1/runs", json=body)
+        resp.raise_for_status()
+        return resp.json().get("run", {})
+
+    async def run_get(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Get a run by id. None if not found (or not in your tenant)."""
+        resp = await self._request("GET", f"/api/v1/runs/{run_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json().get("run")
+
+    async def run_list(
+        self, *, status: Optional[str] = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List runs (newest first), optionally filtered by status."""
+        params: dict[str, Any] = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        resp = await self._request("GET", "/api/v1/runs", params=params)
+        resp.raise_for_status()
+        return resp.json().get("runs", [])
+
+    async def run_trace(self, run_id: str) -> list[dict[str, Any]]:
+        """Full step trace of a run (LLM/tool/HITL steps)."""
+        resp = await self._request("GET", f"/api/v1/runs/{run_id}/trace")
+        resp.raise_for_status()
+        return resp.json().get("steps", [])
+
+    async def run_cancel(self, run_id: str) -> dict[str, Any]:
+        """Cancel a run."""
+        resp = await self._request("POST", f"/api/v1/runs/{run_id}/cancel")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def run_agent(
+        self, agent_id: str, question: str, *, max_turns: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Run an agent end-to-end (durable LLM↔tool loop). Returns the resulting run.
+
+        The run pauses (status ``waiting_approval``) if the agent requests human approval;
+        approve with ``run_approve`` then ``run_resume``.
+        """
+        body: dict[str, Any] = {"agent_id": agent_id, "question": question}
+        if max_turns is not None:
+            body["max_turns"] = max_turns
+        resp = await self._request("POST", "/api/v1/agents/run", json=body)
+        resp.raise_for_status()
+        return resp.json().get("run", {})
+
+    async def run_request_approval(
+        self, run_id: str, *, prompt: str = ""
+    ) -> dict[str, Any]:
+        """Pause a run for human approval (HITL)."""
+        resp = await self._request(
+            "POST", f"/api/v1/runs/{run_id}/request-approval", json={"prompt": prompt}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def run_approve(self, run_id: str, approve: bool = True) -> dict[str, Any]:
+        """Approve or reject a run awaiting approval (HITL)."""
+        resp = await self._request(
+            "POST", f"/api/v1/runs/{run_id}/approve", json={"approve": approve}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def run_resume(self, run_id: str) -> dict[str, Any]:
+        """Resume an approved run (durable resume)."""
+        resp = await self._request("POST", f"/api/v1/runs/{run_id}/resume")
+        resp.raise_for_status()
+        return resp.json().get("run", {})
+
+    async def trigger_register(
+        self,
+        name: str,
+        agent_id: str,
+        *,
+        source: str = "*",
+        event_type: str = "*",
+    ) -> dict[str, Any]:
+        """Register an event trigger: matching events start a run of ``agent_id``."""
+        resp = await self._request(
+            "POST",
+            "/api/v1/triggers",
+            json={
+                "name": name,
+                "agent_id": agent_id,
+                "source": source,
+                "event_type": event_type,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def trigger_list(self) -> list[dict[str, Any]]:
+        """List registered event triggers."""
+        resp = await self._request("GET", "/api/v1/triggers")
+        resp.raise_for_status()
+        return resp.json().get("triggers", [])
+
+    async def tool_register(self, name: str, url: str) -> dict[str, Any]:
+        """Register a downstream MCP tool server."""
+        resp = await self._request(
+            "POST", "/api/v1/tools", json={"name": name, "url": url}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def tool_list(self) -> list[dict[str, Any]]:
+        """List registered downstream MCP tool servers."""
+        resp = await self._request("GET", "/api/v1/tools")
+        resp.raise_for_status()
+        return resp.json().get("servers", [])
+
+    async def tool_call(
+        self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None
+    ) -> Any:
+        """Invoke a tool on a registered downstream MCP server."""
+        resp = await self._request(
+            "POST",
+            f"/api/v1/tools/{server}/call",
+            json={"tool": tool, "arguments": arguments or {}},
+        )
+        resp.raise_for_status()
+        return resp.json().get("result")
+
     # ── Admin ────────────────────────────────────────────────────────
 
     async def backup(self) -> dict[str, Any]:
