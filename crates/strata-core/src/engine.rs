@@ -16,7 +16,7 @@ use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
 use crate::rerank::Reranker;
-use crate::runtime::{Run, RunPatch, RunStatus, RunStore, WorkflowNode};
+use crate::runtime::{Run, RunPatch, RunStatus, RunStore, ToolExecutor, WorkflowNode};
 use crate::Result;
 
 /// Top-level engine that owns all subsystems of the Strata context lake.
@@ -40,6 +40,8 @@ pub struct StrataEngine {
     reranker: Option<Arc<dyn Reranker>>,
     /// Durable agent-run ledger (agentic-platform substrate).
     runs: Arc<RunStore>,
+    /// Optional executor for external tools (e.g. downstream MCP servers), injected by the gateway.
+    tool_executor: parking_lot::RwLock<Option<Arc<dyn ToolExecutor>>>,
 }
 
 impl std::fmt::Debug for StrataEngine {
@@ -259,12 +261,19 @@ impl StrataEngine {
             completion,
             reranker,
             runs,
+            tool_executor: parking_lot::RwLock::new(None),
         })
     }
 
     /// Get a reference to the configuration.
     pub fn config(&self) -> &CoreConfig {
         &self.config
+    }
+
+    /// Inject a tool executor (e.g. the gateway's MCP tool-gateway) so the agent loop can invoke
+    /// external tools via `TOOL call <server> <tool>: {args}`. Replaces any previous executor.
+    pub fn set_tool_executor(&self, executor: Arc<dyn ToolExecutor>) {
+        *self.tool_executor.write() = Some(executor);
     }
 
     // ---- Agent-run ledger (agentic-platform substrate) ----
@@ -690,10 +699,10 @@ impl StrataEngine {
             agent_id: Some(agent_id.to_string()),
             ..Default::default()
         };
-        let system =
-            "You are an agent answering the user's question. To search your memory, reply EXACTLY \
-             `TOOL search: <query>`. To request human approval before continuing, reply EXACTLY \
-             `TOOL approve: <reason>`. Otherwise reply with the final answer.";
+        let system = "You are an agent answering the user's question. Reply with EXACTLY ONE of: \
+             `TOOL search: <query>` (search your memory), `TOOL remember: <fact>` (save a fact), \
+             `TOOL call <server> <tool>: {json args}` (call an external tool), \
+             `TOOL approve: <reason>` (request human approval), or the final answer.";
 
         let mut final_answer = None;
         for _turn in 0..max_turns.max(1) {
@@ -713,6 +722,50 @@ impl StrataEngine {
                 transcript.push_str(&format!(
                     "Assistant: TOOL search: {q}\nObservation: {}\n",
                     results.join(" | ")
+                ));
+            } else if let Some(text) = trimmed.strip_prefix("TOOL remember:") {
+                let text = text.trim();
+                let _ = self
+                    .memory_add(crate::memory::cognition::MemoryInput::new(
+                        scope.clone(),
+                        text,
+                    ))
+                    .await;
+                self.run_log_step(
+                    run_id,
+                    tenant,
+                    "tool_call",
+                    serde_json::json!({ "tool": "remember", "content": text }),
+                )
+                .await?;
+                transcript.push_str(&format!(
+                    "Assistant: TOOL remember: {text}\nObservation: stored\n"
+                ));
+            } else if let Some(rest) = trimmed.strip_prefix("TOOL call ") {
+                // Downstream MCP tool: `TOOL call <server> <tool>: {json args}`.
+                let (head, args_str) = rest.split_once(':').unwrap_or((rest, "{}"));
+                let mut parts = head.split_whitespace();
+                let server = parts.next().unwrap_or("").to_string();
+                let tool = parts.next().unwrap_or("").to_string();
+                let args: serde_json::Value =
+                    serde_json::from_str(args_str.trim()).unwrap_or_else(|_| serde_json::json!({}));
+                let executor = self.tool_executor.read().clone();
+                let result = match executor {
+                    Some(ex) => ex
+                        .call_tool(&server, &tool, args)
+                        .await
+                        .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+                    None => serde_json::json!({ "error": "no tool executor configured" }),
+                };
+                self.run_log_step(
+                    run_id,
+                    tenant,
+                    "tool_call",
+                    serde_json::json!({ "tool": format!("{server}/{tool}"), "result": result }),
+                )
+                .await?;
+                transcript.push_str(&format!(
+                    "Assistant: TOOL call {server} {tool}\nObservation: {result}\n"
                 ));
             } else if let Some(prompt) = trimmed.strip_prefix("TOOL approve:") {
                 // Pause for human-in-the-loop approval; resume with run_resume after approval.
@@ -3885,6 +3938,61 @@ mod tests {
         let resumed = engine.run_resume(run.id, "default").await.unwrap();
         assert_eq!(resumed.status, RunStatus::Succeeded);
         assert_eq!(resumed.result["answer"], "deployed");
+    }
+
+    #[tokio::test]
+    async fn run_agent_calls_external_tool_via_executor() {
+        use crate::llm::CompletionProvider;
+        use crate::runtime::{RunStatus, ToolExecutor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Scripted {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl CompletionProvider for Scripted {
+            async fn complete(&self, _s: &str, _u: &str) -> crate::Result<String> {
+                Ok(match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => "TOOL call gh create_issue: {\"title\":\"bug\"}".to_string(),
+                    _ => "issue created".to_string(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+        }
+
+        struct MockTool;
+        #[async_trait::async_trait]
+        impl ToolExecutor for MockTool {
+            async fn call_tool(
+                &self,
+                server: &str,
+                tool: &str,
+                args: serde_json::Value,
+            ) -> crate::Result<serde_json::Value> {
+                Ok(serde_json::json!({ "server": server, "tool": tool, "args": args, "ok": true }))
+            }
+        }
+
+        let mut engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine.completion = Some(std::sync::Arc::new(Scripted {
+            calls: AtomicUsize::new(0),
+        }));
+        engine.set_tool_executor(std::sync::Arc::new(MockTool));
+
+        let run = engine
+            .run_agent("default", "a", "make an issue", 5)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Succeeded);
+        assert_eq!(run.result["answer"], "issue created");
+
+        // The downstream tool call was executed and journaled.
+        let steps = engine.run_trace(run.id).await.unwrap();
+        assert!(steps
+            .iter()
+            .any(|s| s["event_type"] == "tool_call" && s["payload"]["tool"] == "gh/create_issue"));
     }
 
     #[test]
