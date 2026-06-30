@@ -342,6 +342,76 @@ impl StrataEngine {
         self.session_recall(&id.to_string()).await
     }
 
+    // ── Event triggers (event-driven agent runs) ─────────────────────
+
+    /// Register an event trigger: when an event matching `source` + `event_type` (each `*` = any)
+    /// is observed, [`Self::fire_triggers`] starts a run of `agent_id`. Persisted in the state store
+    /// (so it replicates via `StateSet`).
+    pub async fn trigger_register(
+        &self,
+        name: &str,
+        source: &str,
+        event_type: &str,
+        agent_id: &str,
+    ) -> Result<()> {
+        self.state_set(
+            "__trigger",
+            name,
+            serde_json::json!({ "source": source, "event_type": event_type, "agent_id": agent_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// List the registered event triggers.
+    pub async fn trigger_list(&self) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        for name in self.state_list_keys("__trigger").await? {
+            if let Some(entry) = self.state_get("__trigger", &name).await? {
+                let mut v = entry.value;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("name".into(), name.clone().into());
+                }
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fire all triggers matching an event, starting a run per match. Returns the new run ids. The
+    /// hook for event-driven agents (e.g. call this after a webhook ingest).
+    pub async fn fire_triggers(
+        &self,
+        tenant: &str,
+        source: &str,
+        event_type: &str,
+        input: serde_json::Value,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let mut fired = Vec::new();
+        for name in self.state_list_keys("__trigger").await.unwrap_or_default() {
+            let Ok(Some(entry)) = self.state_get("__trigger", &name).await else {
+                continue;
+            };
+            let v = entry.value;
+            let want_src = v.get("source").and_then(|x| x.as_str()).unwrap_or("*");
+            let want_evt = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("*");
+            if (want_src == "*" || want_src == source)
+                && (want_evt == "*" || want_evt == event_type)
+            {
+                let agent = v
+                    .get("agent_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("trigger")
+                    .to_string();
+                let run = self
+                    .run_create(tenant, Some(agent), None, input.clone())
+                    .await?;
+                fired.push(run.id);
+            }
+        }
+        Ok(fired)
+    }
+
     /// Append one durable step to a run's trace: an episodic event tagged `_session_id = run_id`
     /// (so `run_trace` recalls it) and `_tenant_id`. The step is the unit of agent observability.
     pub async fn run_log_step(
@@ -3350,6 +3420,41 @@ mod tests {
         assert_eq!(steps.len(), 3);
         assert!(steps.iter().any(|s| s["event_type"] == "tool_call"));
         assert!(steps.iter().any(|s| s["event_type"] == "llm_answer"));
+    }
+
+    #[tokio::test]
+    async fn triggers_register_match_and_fire_runs() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        engine
+            .trigger_register("on_pr", "github", "pull_request.opened", "pr-agent")
+            .await
+            .unwrap();
+        engine
+            .trigger_register("on_any", "*", "*", "catch-all")
+            .await
+            .unwrap();
+        assert_eq!(engine.trigger_list().await.unwrap().len(), 2);
+
+        // A GitHub PR event matches both the exact and the wildcard trigger → 2 runs.
+        let fired = engine
+            .fire_triggers(
+                "default",
+                "github",
+                "pull_request.opened",
+                serde_json::json!({"pr": 42}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fired.len(), 2);
+
+        // A different source matches only the wildcard → 1 run.
+        let fired2 = engine
+            .fire_triggers("default", "sentry", "issue.created", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fired2.len(), 1);
+
+        assert_eq!(engine.run_list("default", None, 10).await.unwrap().len(), 3);
     }
 
     #[test]
