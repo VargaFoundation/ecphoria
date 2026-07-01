@@ -1,11 +1,13 @@
 //! HTTP client wrapper for communicating with strata-server.
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 
-/// HTTP client for the Strata REST API.
+/// HTTP client for the Strata REST API. Attaches a `Bearer` token (from `STRATA_TOKEN`) when set —
+/// required for admin routes on an auth-enabled server.
 pub struct StrataClient {
     http: Client,
     base_url: String,
+    token: Option<String>,
 }
 
 impl StrataClient {
@@ -13,82 +15,97 @@ impl StrataClient {
         Self {
             http: Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            token: std::env::var("STRATA_TOKEN").ok().filter(|s| !s.is_empty()),
         }
     }
 
-    /// GET /health
+    fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
+        match &self.token {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        }
+    }
+
+    /// GET `<path>` → JSON.
+    pub async fn get_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        Ok(self.auth(self.http.get(url)).send().await?.json().await?)
+    }
+
+    /// POST `<path>` with a JSON body → JSON.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        Ok(self
+            .auth(self.http.post(url).json(&body))
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// PUT `<path>` with a JSON body → JSON.
+    pub async fn put_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        Ok(self
+            .auth(self.http.put(url).json(&body))
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// DELETE `<path>` → JSON.
+    pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        Ok(self
+            .auth(self.http.delete(url))
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    // ── Convenience wrappers (token-aware via the helpers above) ──────────────
+
     pub async fn health(&self) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(format!("{}/health", self.base_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.get_json("/health").await
     }
 
-    /// POST /api/v1/query
     pub async fn query(&self, sql: &str) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(format!("{}/api/v1/query", self.base_url))
-            .json(&serde_json::json!({ "sql": sql }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.post_json("/api/v1/query", serde_json::json!({ "sql": sql }))
+            .await
     }
 
-    /// POST /api/v1/ingest
     pub async fn ingest(&self, source: &str, file: &str) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(format!("{}/api/v1/ingest", self.base_url))
-            .json(&serde_json::json!({ "source": source, "file": file }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.post_json(
+            "/api/v1/ingest",
+            serde_json::json!({ "source": source, "file": file }),
+        )
+        .await
     }
 
-    /// GET /api/v1/schema/sources
     pub async fn schema_sources(&self) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(format!("{}/api/v1/schema/sources", self.base_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.get_json("/api/v1/schema/sources").await
     }
 
-    /// GET /api/v1/schema/agents
     pub async fn schema_agents(&self) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(format!("{}/api/v1/schema/agents", self.base_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.get_json("/api/v1/schema/agents").await
     }
 
-    /// POST /api/v1/embed-and-search
     pub async fn search(&self, text: &str, k: usize) -> anyhow::Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(format!("{}/api/v1/embed-and-search", self.base_url))
-            .json(&serde_json::json!({ "text": text, "k": k }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
+        self.post_json(
+            "/api/v1/embed-and-search",
+            serde_json::json!({ "text": text, "k": k }),
+        )
+        .await
     }
 
     /// Return the base URL (for testing/display).

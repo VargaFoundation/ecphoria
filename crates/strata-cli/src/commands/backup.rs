@@ -1,22 +1,11 @@
 use crate::client::StrataClient;
 
-pub async fn run(url: &str, target: &str) -> anyhow::Result<()> {
+/// Trigger a server-side backup of all stores (POST /api/v1/admin/backup).
+pub async fn run(url: &str) -> anyhow::Result<()> {
     let client = StrataClient::new(url);
-
-    // Get event count as a simple backup verification
-    let result = client
-        .query("SELECT count(*)::VARCHAR as cnt FROM episodic")
+    let res = client
+        .post_json("/api/v1/admin/backup", serde_json::json!({}))
         .await?;
-    let count = result["rows"]
-        .as_array()
-        .and_then(|rows| rows.first())
-        .and_then(|row| row["cnt"].as_str())
-        .unwrap_or("0");
-
-    println!("Backup target: {target}");
-    println!("Events to backup: {count}");
-    println!("Note: full backup requires S3 storage configuration");
-    println!("      Use 'docker compose exec strata strata-server backup' for production backups");
-
+    println!("{}", serde_json::to_string_pretty(&res)?);
     Ok(())
 }

@@ -13,6 +13,10 @@ struct Cli {
     /// Server URL
     #[arg(long, env = "STRATA_URL", default_value = "http://localhost:8432")]
     url: String,
+
+    /// Bearer token / API key for authenticated servers (admin commands require it).
+    #[arg(long, env = "STRATA_TOKEN")]
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -25,5 +29,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Propagate a `--token` flag to the env the client reads (so both flag and env work).
+    if let Some(t) = &cli.token {
+        std::env::set_var("STRATA_TOKEN", t);
+    }
     commands::execute(cli.command, &cli.url).await
 }

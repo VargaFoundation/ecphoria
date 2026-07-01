@@ -1,9 +1,11 @@
-pub async fn run(_url: &str, from: &str) -> anyhow::Result<()> {
-    println!("Restore source: {from}");
-    println!("Note: restore requires direct access to the Strata data directory");
-    println!(
-        "      Use 'docker compose exec strata strata-server restore' for production restores"
-    );
+use crate::client::StrataClient;
 
+/// Restore all stores from a backup directory (POST /api/v1/admin/restore). DESTRUCTIVE.
+pub async fn run(url: &str, path: &str) -> anyhow::Result<()> {
+    let client = StrataClient::new(url);
+    let res = client
+        .post_json("/api/v1/admin/restore", serde_json::json!({ "path": path }))
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
     Ok(())
 }
