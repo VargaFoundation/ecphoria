@@ -6,5 +6,7 @@ pub mod cross_encoder;
 pub mod llm;
 pub mod provider;
 
+#[cfg(feature = "rerank-local")]
+pub use cross_encoder::CrossEncoderReranker;
 pub use llm::LlmReranker;
 pub use provider::Reranker;
