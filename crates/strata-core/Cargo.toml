@@ -7,10 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Core engine for the Strata context lake"
 
+[features]
+# Local ONNX cross-encoder reranker (bge-reranker via fastembed/ort). Off by default — pulls a heavy
+# native onnxruntime dependency and downloads model weights on first use.
+rerank-local = ["dep:fastembed"]
+
 [dependencies]
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+
+# Optional: local cross-encoder reranker backend (feature `rerank-local`).
+fastembed = { version = "4", optional = true }
 
 duckdb.workspace = true
 rusqlite.workspace = true
