@@ -204,6 +204,13 @@ pub struct RunAgentRequest {
     pub max_turns: Option<usize>,
 }
 
+/// Restore all stores from a backup directory (destructive; admin-only).
+#[derive(Debug, Deserialize)]
+pub struct RestoreRequest {
+    /// Server-local path of a backup directory produced by `POST /admin/backup`.
+    pub path: String,
+}
+
 /// Register an event trigger.
 #[derive(Debug, Deserialize)]
 pub struct RegisterTriggerRequest {

@@ -111,6 +111,7 @@ pub fn router_with_engine_and_auth(
             axum::routing::get(handlers::retention_policies).put(handlers::retention_policies),
         )
         .route("/admin/backup", axum::routing::post(handlers::backup))
+        .route("/admin/restore", axum::routing::post(handlers::restore))
         .route("/admin/reindex", axum::routing::post(handlers::reindex))
         .route(
             "/admin/tenants/{tenant}/export",

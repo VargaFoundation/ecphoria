@@ -802,6 +802,24 @@ pub async fn backup(State(engine): State<Arc<StrataEngine>>) -> Response {
     }
 }
 
+/// Restore all stores from a backup directory. **Destructive** — overwrites current data. Admin-only
+/// (the `/admin/` middleware check), and a cluster should be quiesced first (restore is node-local).
+pub async fn restore(
+    State(engine): State<Arc<StrataEngine>>,
+    Json(req): Json<RestoreRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "restore").increment(1);
+    let dir = std::path::PathBuf::from(&req.path);
+    match engine.restore_from_backup(&dir).await {
+        Ok(()) => api_ok(serde_json::json!({ "status": "ok", "restored_from": req.path })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RESTORE_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// Query audit log entries.
 ///
 /// GET /api/v1/admin/audit?since=2026-01-01

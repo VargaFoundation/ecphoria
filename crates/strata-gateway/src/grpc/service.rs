@@ -510,10 +510,6 @@ mod tests {
 
     const SECRET: &str = "test-secret-key-256-bits-long!!!";
 
-    fn jwt(tenant: &str) -> String {
-        jwt_role(tenant, "writer")
-    }
-
     fn jwt_role(tenant: &str, role: &str) -> String {
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
