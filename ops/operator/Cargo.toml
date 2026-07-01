@@ -1,0 +1,24 @@
+# NOTE: This operator is intentionally NOT part of the Cargo workspace and is NOT committed to the
+# repo's build — it cannot be integration-tested without a live Kubernetes cluster. Its decision
+# logic mirrors the workspace's `strata_cluster::reconcile_plan` (which IS unit-tested + committed).
+# Build/run it in an environment that has a cluster (kind/k3d/minikube or real).
+# Standalone (not a workspace member) — its own empty workspace table detaches it from the repo root.
+[workspace]
+
+[package]
+name = "strata-operator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kube = { version = "0.95", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.23", features = ["latest"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
