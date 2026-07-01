@@ -211,6 +211,9 @@ fn build_answerer() -> Option<Arc<dyn CompletionProvider>> {
                 strata_core::llm::anthropic::AnthropicCompletion::new(key, model),
             ))
         }
+        "claude-cli" => Some(Arc::new(
+            strata_core::llm::claude_cli::ClaudeCliCompletion::new(model),
+        )),
         other => {
             eprintln!("unknown STRATA_EVAL__PROVIDER={other:?} — QA mode off");
             None

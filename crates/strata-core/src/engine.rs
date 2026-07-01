@@ -185,6 +185,15 @@ impl StrataEngine {
                         config.memory.cognition.extraction_model.clone(),
                     )))
                 }
+                "claude-cli" => {
+                    tracing::info!(
+                        model = %config.memory.cognition.extraction_model,
+                        "cognition extraction provider: claude CLI"
+                    );
+                    Some(Arc::new(crate::llm::claude_cli::ClaudeCliCompletion::new(
+                        config.memory.cognition.extraction_model.clone(),
+                    )))
+                }
                 _ => None,
             };
 
@@ -207,6 +216,11 @@ impl StrataEngine {
                         "anthropic" if !config.embedding.anthropic_api_key.is_empty() => {
                             Some(Arc::new(crate::llm::anthropic::AnthropicCompletion::new(
                                 config.embedding.anthropic_api_key.clone(),
+                                config.rerank.model.clone(),
+                            )))
+                        }
+                        "claude-cli" => {
+                            Some(Arc::new(crate::llm::claude_cli::ClaudeCliCompletion::new(
                                 config.rerank.model.clone(),
                             )))
                         }
