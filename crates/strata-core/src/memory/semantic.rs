@@ -504,6 +504,108 @@ impl MultiModalStore {
     }
 }
 
+/// A vector index **partitioned by an opaque string key** (in Strata: an exact memory scope).
+///
+/// A single shared HNSW index with *post-filtering* has a recall ceiling: a top-K over the whole
+/// index can be entirely filled by other partitions' vectors before the caller's scope filter runs,
+/// so the caller's true neighbours are dropped before they're ever seen (the more tenants/users
+/// share the index, the worse it gets). Here every partition is an independent HNSW index, so a
+/// search only ever traverses vectors that already belong to the caller's partition — no
+/// oversample, no starvation. Partitions are created lazily and share one dimension.
+pub struct ScopedVectorIndex {
+    dimension: usize,
+    partitions: DashMap<String, std::sync::Arc<SemanticStore>>,
+    /// id → partition key, so `delete(id)` can route without the caller knowing the scope, and a
+    /// re-scoped upsert can evict the stale copy from its old partition.
+    id_partition: DashMap<Uuid, String>,
+}
+
+impl std::fmt::Debug for ScopedVectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedVectorIndex")
+            .field("dimension", &self.dimension)
+            .field("partitions", &self.partitions.len())
+            .field("entries", &self.id_partition.len())
+            .finish()
+    }
+}
+
+impl ScopedVectorIndex {
+    /// Create an empty partitioned index; every partition is created with `dimension`.
+    pub fn with_dimension(dimension: usize) -> Self {
+        Self {
+            dimension,
+            partitions: DashMap::new(),
+            id_partition: DashMap::new(),
+        }
+    }
+
+    fn partition(&self, key: &str) -> std::sync::Arc<SemanticStore> {
+        self.partitions
+            .entry(key.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(
+                    SemanticStore::with_dimension(self.dimension)
+                        .unwrap_or_else(|_| SemanticStore::new()),
+                )
+            })
+            .clone()
+    }
+
+    /// Upsert `entry` into partition `key`. If the id previously lived in another partition (its
+    /// scope changed), it is removed from the old partition first so it can't be found there.
+    pub async fn upsert(&self, key: &str, entry: &SemanticEntry) -> crate::Result<()> {
+        if let Some(prev) = self.id_partition.get(&entry.id) {
+            if prev.value() != key {
+                if let Some(store) = self.partitions.get(prev.value()) {
+                    let _ = store.delete(entry.id).await;
+                }
+            }
+        }
+        self.partition(key).upsert(entry).await?;
+        self.id_partition.insert(entry.id, key.to_string());
+        Ok(())
+    }
+
+    /// k-NN search within a single partition. Empty when the partition has no entries yet.
+    pub async fn search(
+        &self,
+        key: &str,
+        vector: &[f32],
+        k: usize,
+    ) -> crate::Result<Vec<SearchResult>> {
+        match self.partitions.get(key) {
+            Some(store) => store.search(vector, k).await,
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Delete an entry by id, routing to its partition via the id→partition map.
+    pub async fn delete(&self, id: Uuid) -> crate::Result<()> {
+        if let Some((_, key)) = self.id_partition.remove(&id) {
+            if let Some(store) = self.partitions.get(&key) {
+                store.delete(id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the index holds no entries in any partition.
+    pub fn is_empty(&self) -> bool {
+        self.id_partition.is_empty()
+    }
+
+    /// Total entries across all partitions.
+    pub fn len(&self) -> usize {
+        self.id_partition.len()
+    }
+
+    /// Number of live partitions (distinct scopes seen).
+    pub fn partition_count(&self) -> usize {
+        self.partitions.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +809,78 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].entry.content, "cat");
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_index_isolates_partitions() {
+        let idx = ScopedVectorIndex::with_dimension(4);
+        idx.upsert("alice", &make_entry("a", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        idx.upsert("bob", &make_entry("b", vec![1.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.partition_count(), 2);
+        // A query in alice's partition never returns bob's vector, even with identical embeddings.
+        let hits = idx
+            .search("alice", &[1.0, 0.0, 0.0, 0.0], 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.content, "a");
+        // Unknown partition → empty, not an error.
+        assert!(idx
+            .search("carol", &[1.0, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_index_no_starvation_under_load() {
+        // The shared-index failure mode: many same-direction vectors in a big "other" partition must
+        // NOT crowd out a small partition's own neighbour. With a single post-filtered index the
+        // needle would be pushed out of any bounded top-K; here it is always found.
+        let idx = ScopedVectorIndex::with_dimension(4);
+        for i in 0..500 {
+            let v = vec![1.0, i as f32 * 1e-4, 0.0, 0.0];
+            idx.upsert("big", &make_entry(&format!("big-{i}"), v))
+                .await
+                .unwrap();
+        }
+        idx.upsert("small", &make_entry("needle", vec![0.0, 0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        let hits = idx.search("small", &[0.0, 0.0, 1.0, 0.0], 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.content, "needle");
+    }
+
+    #[tokio::test]
+    async fn scoped_index_delete_and_rescope() {
+        let idx = ScopedVectorIndex::with_dimension(4);
+        let e = make_entry("x", vec![1.0, 0.0, 0.0, 0.0]);
+        let id = e.id;
+        idx.upsert("p1", &e).await.unwrap();
+        // Re-upsert the same id under a new partition → it must vanish from the old one.
+        let mut e2 = e.clone();
+        e2.content = "x2".into();
+        idx.upsert("p2", &e2).await.unwrap();
+        assert!(idx
+            .search("p1", &[1.0, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            idx.search("p2", &[1.0, 0.0, 0.0, 0.0], 5).await.unwrap()[0]
+                .entry
+                .content,
+            "x2"
+        );
+        assert_eq!(idx.len(), 1);
+        // Delete-by-id routes to the current partition.
+        idx.delete(id).await.unwrap();
+        assert!(idx.is_empty());
     }
 }

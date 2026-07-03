@@ -71,7 +71,7 @@ pub async fn rewrite_hybrid_query(
 
             // Embed and search
             let results = if let Some(provider) = embedding {
-                let vectors = provider.embed(&[query_text.to_string()]).await?;
+                let vectors = provider.embed_query(&[query_text.to_string()]).await?;
                 if let Some(vector) = vectors.first() {
                     semantic.search(vector, k).await?
                 } else {

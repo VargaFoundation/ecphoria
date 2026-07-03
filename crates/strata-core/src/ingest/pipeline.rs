@@ -142,7 +142,7 @@ impl IngestPipeline {
         let mut succeeded: Vec<uuid::Uuid> = Vec::new();
         for chunk in paired.chunks(self.batch_size) {
             let chunk_texts: Vec<String> = chunk.iter().map(|(_, t)| (*t).clone()).collect();
-            match embedding.embed(&chunk_texts).await {
+            match embedding.embed_documents(&chunk_texts).await {
                 Ok(embeddings) => {
                     for ((event, text), emb) in chunk.iter().zip(embeddings) {
                         let entry = SemanticEntry {
