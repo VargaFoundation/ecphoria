@@ -1605,8 +1605,21 @@ impl StrataEngine {
         let cog = &self.config.memory.cognition;
         let importance = input.importance.unwrap_or(cog.default_importance);
         // Embedding is best-effort: the deterministic paths work without it. Memory content is an
-        // indexed *document*, so use the document task prefix (not the query one).
-        let embedding = self.embed_document_text(&input.content).await.ok();
+        // indexed *document*, so use the document task prefix (not the query one). A failure is not
+        // fatal, but it silently drops this memory out of vector search (BM25-only), so make it
+        // observable (metric + warn) rather than a silent degradation.
+        let embedding = match self.embedding.as_ref() {
+            Some(_) => match self.embed_document_text(&input.content).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    metrics::counter!("strata_memory_embed_failures_total", "op" => "ingest")
+                        .increment(1);
+                    tracing::warn!(error = %e, "memory embedding failed — stored without a vector (search degraded to BM25)");
+                    None
+                }
+            },
+            None => None,
+        };
 
         // 1. Subject-based contradiction resolution (authoritative, no embedding required).
         if let Some(subject) = input.subject.clone() {
@@ -1843,7 +1856,15 @@ impl StrataEngine {
         // Vector ranking — best-effort, only when embeddings are configured.
         let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
         if !self.memory_index.is_empty() {
-            if let Ok(vector) = self.embed_text(query).await {
+            let embedded = self.embed_text(query).await;
+            if let Err(e) = &embedded {
+                // The index has vectors but we couldn't embed the query → this search silently
+                // falls back to BM25-only. Surface it instead of degrading quietly.
+                metrics::counter!("strata_memory_embed_failures_total", "op" => "query")
+                    .increment(1);
+                tracing::warn!(error = %e, "query embedding failed — search degraded to BM25-only");
+            }
+            if let Ok(vector) = embedded {
                 // Fetch enough vector candidates to fill the fused pool (feeds the reranker) without
                 // the cost of scanning the whole scope — measured neutral on recall@5 beyond this.
                 if let Ok(hits) = self
