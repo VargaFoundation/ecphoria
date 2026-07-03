@@ -69,9 +69,13 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
   loosely-related memories that compete in the fused ranking. Off by default in the product; the
   published `benchmarks-locomo.md` run had it *on* (`AUTO_GRAPH=1`), which is part of why that number
   (21.7%) is mediocre.
-- **RRF + importance/recency blend dilute relevance.** Equal-weight RRF (`engine.rs:1894`) fuses a
-  noisy BM25 arm 50/50 with vector; the post-blend `rrf·(1+0.3·importance+0.2·recency)`
-  (`engine.rs:1908`) reorders by uniform importance (0.5) and a recency bias unrelated to the query.
+- **Importance/recency blend — tested, neutral here.** The post-fusion `rrf·(1 + w_imp·importance +
+  w_rec·recency)` re-rank was suspected of diluting relevance. Making the weights configurable and
+  A/B-ing them (0/0 vs 0.1/0.05 vs the 0.3/0.2 default) gave **identical** recall@5 (23.6%) / MRR
+  (0.176): on LoCoMo importance is uniform (0.5) and every turn shares an ingest time, so the
+  multiplier is ~constant and doesn't reorder. Kept the default; the knob matters only for
+  varied-age/importance production workloads. The RRF *arm* weighting (vector vs BM25) is still
+  equal-weight and untested — a candidate lever.
 - **Latency.** The wide-pool config is 586 ms/query (BM25 scans up to `retrieval_scan_cap`=6000
   in-memory per query — not an inverted index). Quality-positive but 14× slower than naive; the
   durable fix is a real BM25 index + partitioned vectors, not a bigger linear scan.
@@ -86,12 +90,18 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
    113 ms, no starvation. Follow-up: a filtered-ANN option for genuinely cross-scope searches.
 2. **Don't fuse graph expansion by default on conversational recall** (confirmed −5 pts here,
    index-independent); make it query-type-gated.
-3. **Weight the RRF arms / make the importance-recency blend opt-in** so the vector arm isn't diluted
-   (and so the embedding-model quality actually shows up end-to-end).
+3. **Weight the RRF arms** (vector vs BM25) — untested lever. The importance/recency blend is now
+   configurable but was **neutral on LoCoMo** (see root cause); no default change needed.
 4. **Keep the embedding task-prefix fix** (shipped) and consider a stronger default model
    (`bge-m3`, `text-embedding-3-large`).
-5. **Turn on LLM fact extraction** for multi-hop/temporal (cat 1/2 stay ~5–7% — extraction is the
-   known lever there; not run at full scale in this pass).
+5. **LLM fact extraction must be measured with the LLM-judge, not substring recall.** Measured here
+   (claude-cli haiku, 1 conversation): extraction split 419 turns into 577 atomic facts but
+   substring recall@5 *dropped* 12.6% → 8.5% — because rewording ("Their favorite color is blue")
+   destroys the verbatim gold substring the metric checks for, and adds competing candidates.
+   Extraction is the published "biggest lever" for **end-to-end QA accuracy** (LLM answerer +
+   LLM-judge, `JUDGE=1`), which is lenient to rewording; it is *counter-productive* for raw
+   substring recall. (Also: this run first exposed a `claude-cli` provider bug where the system
+   prompt was ignored — extraction was a silent no-op until fixed.)
 6. **Surface embedding failures** (warn/metric) instead of silently degrading to BM25.
 
 ## Reproduce
