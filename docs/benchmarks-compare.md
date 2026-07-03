@@ -38,6 +38,27 @@ recovers the recall that the `wide-pool` hack recovered (23.6% vs 24.2%) but at 
 per-query scan. Graph expansion is a clean **−5 pt** regression on this workload, independent of the
 index (23.6% → 18.3%).
 
+### End-to-end QA accuracy — the leaderboard-comparable metric (LLM-judge)
+
+The retrieval table above uses substring recall. The number Mem0/Zep publish (~66/68%) is an
+**LLM-judge over a generated answer**. Ran that here (`JUDGE=1`, claude-cli `haiku` as answerer +
+judge, 1 conversation / 199 QA, partitioned index + graph-off) to test whether LLM fact **extraction**
+— the documented "biggest lever" — pays off on the lenient metric even though it loses on substring
+recall:
+
+| ingest | retrieval R@5 | QA-F1 | **QA-judge** |
+|---|---|---|---|
+| extraction=none (raw turns) | 12.6% | 23.0% | **22.1%** |
+| extraction=llm (haiku, 419→591 facts) | 9.5% | 16.8% | **15.1%** |
+
+**Extraction was net-negative on all three metrics — including the LLM-judge.** It degrades
+*retrieval* first (the answerer then gets worse context), and a weak extractor (haiku) drops detail;
+reworded atomic facts also retrieve worse against the query terms. This **contradicts** the repo's
+"extraction is the biggest lever" framing at this operating point: that assumes a strong extractor +
+retrieval tuned for atomic facts + a GPT-4o-class answerer. Caveats: 1 conversation is high-variance
+(cat 1/2/3 have n=32/37/13), and haiku-grading-haiku is a lenient self-judge — treat **22%** as an
+honest floor for a nomic-768d + haiku pipeline, far below the GPT-4o-class published numbers.
+
 ## What the numbers say
 
 **1. The embedding task-prefix fix is real (+~12% relative recall).** On pure vector, adding the
@@ -94,14 +115,14 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
    configurable but was **neutral on LoCoMo** (see root cause); no default change needed.
 4. **Keep the embedding task-prefix fix** (shipped) and consider a stronger default model
    (`bge-m3`, `text-embedding-3-large`).
-5. **LLM fact extraction must be measured with the LLM-judge, not substring recall.** Measured here
-   (claude-cli haiku, 1 conversation): extraction split 419 turns into 577 atomic facts but
-   substring recall@5 *dropped* 12.6% → 8.5% — because rewording ("Their favorite color is blue")
-   destroys the verbatim gold substring the metric checks for, and adds competing candidates.
-   Extraction is the published "biggest lever" for **end-to-end QA accuracy** (LLM answerer +
-   LLM-judge, `JUDGE=1`), which is lenient to rewording; it is *counter-productive* for raw
-   substring recall. (Also: this run first exposed a `claude-cli` provider bug where the system
-   prompt was ignored — extraction was a silent no-op until fixed.)
+5. **LLM fact extraction is not a free lever — measured net-negative here.** Tested end-to-end with
+   the LLM-judge (`JUDGE=1`, claude-cli haiku): extraction dropped QA-judge 22.1% → 15.1% (and QA-F1
+   23.0% → 16.8%, recall@5 12.6% → 9.5%) — see the QA table above. The published "biggest lever"
+   result assumes a strong extractor + retrieval tuned for atomic facts + a GPT-4o-class answerer; on
+   a nomic-768d + haiku pipeline it adds noise. Revisit only with a stronger extractor and
+   fact-tuned retrieval, and measure on more than one conversation. (This work also exposed and fixed
+   a `claude-cli` provider bug where the system prompt was ignored — extraction/rerank/judge via the
+   CLI were silently broken.)
 6. **Surface embedding failures** (warn/metric) instead of silently degrading to BM25.
 
 ## Reproduce
