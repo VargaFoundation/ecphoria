@@ -118,9 +118,14 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
    → 17.7%, and 3× the query latency) — via Ollama bge-m3 is dense-only (loses its sparse+ColBERT
    edge) and is tuned for multilingual/long-doc, whereas LoCoMo is short English turns where nomic +
    its task prefixes fit better. nomic-with-prefixes is the best *local* option here; a hosted
-   `text-embedding-3-large` is the untested candidate. **The bigger remaining lever is a
-   cross-encoder reranker** (`--features rerank-local`, bge-reranker) over the fused candidates.
-5. **LLM fact extraction is not a free lever — measured net-negative here.** Tested end-to-end with
+   `text-embedding-3-large` is the untested candidate.
+5. **Cross-encoder reranker — measured positive; the biggest quality lever after the index fix.**
+   bge-reranker (`--features rerank-local`) over the top-50 fused candidates: recall@5 **19.7% →
+   23.9%** (+4.2 pts / +21%), R@1 13.1% → 15.9%, MRR 0.160 → 0.190 (nomic, strata, 3 conv). Cost:
+   query p50 119 ms → **~1.1 s** (CPU cross-encoder over 50 pairs) — the latency/quality trade the
+   docs predicted; gate it behind an SLA. Also fixed the feature's build (it pulled system OpenSSL
+   via hf-hub's native-tls → switched to rustls) so it works in lean/rootless environments.
+6. **LLM fact extraction is not a free lever — measured net-negative here.** Tested end-to-end with
    the LLM-judge (`JUDGE=1`, claude-cli haiku): extraction dropped QA-judge 22.1% → 15.1% (and QA-F1
    23.0% → 16.8%, recall@5 12.6% → 9.5%) — see the QA table above. The published "biggest lever"
    result assumes a strong extractor + retrieval tuned for atomic facts + a GPT-4o-class answerer; on
@@ -128,7 +133,7 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
    fact-tuned retrieval, and measure on more than one conversation. (This work also exposed and fixed
    a `claude-cli` provider bug where the system prompt was ignored — extraction/rerank/judge via the
    CLI were silently broken.)
-6. **Surface embedding failures** (warn/metric) instead of silently degrading to BM25.
+7. **Surface embedding failures** (warn/metric) instead of silently degrading to BM25 *(shipped)*.
 
 ## Reproduce
 
