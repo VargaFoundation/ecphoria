@@ -150,6 +150,15 @@ pub struct CognitionConfig {
     /// derived from the memory id, applied identically on every node). Off by default.
     #[serde(default)]
     pub auto_graph: bool,
+    /// Weight of a memory's importance in the retrieval blend `rrf·(1 + w_imp·importance +
+    /// w_rec·recency)` (read-path re-rank). 0 = pure relevance (no importance nudge). Default 0.3.
+    #[serde(default = "default_importance_weight")]
+    pub retrieval_importance_weight: f32,
+    /// Weight of recency (30-day half-life) in the retrieval blend. 0 = no recency bias.
+    /// Default 0.2. On recall benchmarks where any turn can hold the answer, lowering these two
+    /// toward 0 lets pure relevance rank; raise them for assistants that should prefer fresh facts.
+    #[serde(default = "default_recency_weight")]
+    pub retrieval_recency_weight: f32,
 }
 
 impl Default for CognitionConfig {
@@ -169,8 +178,20 @@ impl Default for CognitionConfig {
             retrieval_pool: default_retrieval_pool(),
             graph_expansion: false,
             auto_graph: false,
+            retrieval_importance_weight: default_importance_weight(),
+            retrieval_recency_weight: default_recency_weight(),
         }
     }
+}
+
+/// Default weight of importance in the retrieval blend.
+fn default_importance_weight() -> f32 {
+    0.3
+}
+
+/// Default weight of recency in the retrieval blend.
+fn default_recency_weight() -> f32 {
+    0.2
 }
 
 #[derive(Debug, Clone, Deserialize)]

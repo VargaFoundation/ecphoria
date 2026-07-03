@@ -1917,7 +1917,11 @@ impl StrataEngine {
         }
 
         // Over-fetch, then re-rank by relevance blended with importance + recency, so a recent or
-        // important memory can outrank a marginally-more-relevant stale one.
+        // important memory can outrank a marginally-more-relevant stale one. Weights are
+        // configurable (0/0 = pure relevance): recall benchmarks want them low, "prefer fresh
+        // facts" assistants want them higher.
+        let w_imp = cog.retrieval_importance_weight;
+        let w_rec = cog.retrieval_recency_weight;
         let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, pool);
         let now = chrono::Utc::now();
         let mut scored: Vec<MemoryHit> = Vec::with_capacity(fused.len());
@@ -1932,7 +1936,7 @@ impl StrataEngine {
             // Recency in [0,1] with a 30-day half-life; importance in [0,1].
             let age_days = (now - memory.updated_at).num_seconds().max(0) as f32 / 86_400.0;
             let recency = 0.5_f32.powf(age_days / 30.0);
-            let score = rrf * (1.0 + 0.3 * memory.importance + 0.2 * recency);
+            let score = rrf * (1.0 + w_imp * memory.importance + w_rec * recency);
             scored.push(MemoryHit { memory, score });
         }
         scored.sort_by(|a, b| {

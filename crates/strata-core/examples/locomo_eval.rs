@@ -185,6 +185,22 @@ fn apply_env(config: &mut CoreConfig) {
         &mut config.memory.cognition.retrieval_pool,
         "STRATA_COGNITION__RETRIEVAL_POOL",
     );
+    // Retrieval blend weights (for A/B: 0/0 = pure relevance vs the 0.3/0.2 default).
+    let set_f32 = |dst: &mut f32, key: &str| {
+        if let Ok(v) = std::env::var(key) {
+            if let Ok(n) = v.parse() {
+                *dst = n;
+            }
+        }
+    };
+    set_f32(
+        &mut config.memory.cognition.retrieval_importance_weight,
+        "STRATA_COGNITION__RETRIEVAL_IMPORTANCE_WEIGHT",
+    );
+    set_f32(
+        &mut config.memory.cognition.retrieval_recency_weight,
+        "STRATA_COGNITION__RETRIEVAL_RECENCY_WEIGHT",
+    );
 }
 
 fn load_dataset() -> Vec<Conversation> {
