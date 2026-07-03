@@ -533,6 +533,25 @@ pub fn scope_matches_metadata(scope: &MemoryScope, metadata: &serde_json::Value)
     true
 }
 
+/// Stable partition key for a memory scope — the key under which its vector lives in the
+/// [`super::semantic::ScopedVectorIndex`]. Injective on `(tenant, user, agent, session)` with the
+/// same normalization as [`scope_matches_metadata`] (empty tenant → `default`, `None` → empty), so a
+/// memory and a search for its exact scope always resolve to the same partition. Uses the ASCII unit
+/// separator (0x1f), which can't occur in the id/name fields.
+pub fn scope_partition_key(scope: &MemoryScope) -> String {
+    let tenant = if scope.tenant_id.is_empty() {
+        "default"
+    } else {
+        scope.tenant_id.as_str()
+    };
+    format!(
+        "{tenant}\u{1f}{}\u{1f}{}\u{1f}{}",
+        scope.user_id.as_deref().unwrap_or(""),
+        scope.agent_id.as_deref().unwrap_or(""),
+        scope.session_id.as_deref().unwrap_or(""),
+    )
+}
+
 /// A fully-materialized memory row plus its embedding — the unit replicated through Raft so a
 /// follower can persist the row AND (re)index its vector without re-running cognition. The leader
 /// computes these via [`crate::StrataEngine::memory_plan`]; every node applies them identically.

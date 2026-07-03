@@ -9,6 +9,8 @@ pub struct OpenAiProvider {
     api_key: String,
     model: String,
     dimension: usize,
+    query_prefix: String,
+    document_prefix: String,
 }
 
 #[derive(Serialize)]
@@ -34,7 +36,17 @@ impl OpenAiProvider {
             api_key,
             model,
             dimension,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         }
+    }
+
+    /// Set the asymmetric retrieval task prefixes (query / document). OpenAI `text-embedding-3-*`
+    /// needs none, but this stays configurable for prefix-trained models served OpenAI-style.
+    pub fn with_prefixes(mut self, query_prefix: String, document_prefix: String) -> Self {
+        self.query_prefix = query_prefix;
+        self.document_prefix = document_prefix;
+        self
     }
 }
 
@@ -85,6 +97,14 @@ impl super::EmbeddingProvider for OpenAiProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn query_prefix(&self) -> &str {
+        &self.query_prefix
+    }
+
+    fn document_prefix(&self) -> &str {
+        &self.document_prefix
     }
 }
 

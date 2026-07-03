@@ -97,7 +97,7 @@ impl QueryExecutor {
             )
         })?;
 
-        let vectors = provider.embed(&[query_text.to_string()]).await?;
+        let vectors = provider.embed_query(&[query_text.to_string()]).await?;
         let vector = vectors
             .into_iter()
             .next()
