@@ -81,6 +81,18 @@ fn cluster_write_error(e: strata_cluster::Error) -> Response {
     }
 }
 
+// ── Admin UI (static, self-contained) ───────────────────────────────
+
+/// Serve the embedded single-page admin console (no auth — it talks to the API with the key the
+/// operator enters). Bundled into the binary via `include_str!`, so it ships with the server.
+pub async fn admin_ui() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("admin_ui.html"),
+    )
+        .into_response()
+}
+
 // ── Health (liveness) ───────────────────────────────────────────────
 
 /// Health check endpoint — probes DuckDB, SQLite, and Raft (if cluster mode).

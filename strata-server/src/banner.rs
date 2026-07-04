@@ -32,6 +32,7 @@ pub fn print_ready(gateway: &GatewayConfig, core: &CoreConfig) {
     eprintln!("  ├─ PostgreSQL: psql -h {} -p {}", host(pg), port(pg));
     eprintln!("  ├─ gRPC:       {grpc}");
     eprintln!("  ├─ MCP:        http://{http}/mcp");
+    eprintln!("  ├─ Admin UI:   http://{http}/ui");
     eprintln!("  ├─ Health:     http://{http}/health");
     eprintln!("  ├─ Metrics:    http://{http}/metrics");
 

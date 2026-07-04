@@ -1,8 +1,14 @@
 # Strata Explorer (web UI)
 
-A single-file, dependency-free web UI for exploring a running Strata instance — SQL queries over
-episodic memory, hybrid memory search, agent **runs** + their step **traces**, and a one-click
-"run agent" form.
+> **Looking for the admin console?** The server now ships a full **Admin UI** built in — just open
+> **`http://localhost:8432/ui`** (or `/`). It covers overview/cluster status, memory search+add,
+> agent runs with **HITL approvals**, SQL, sessions, triggers/tools, and admin ops (backup/restore/
+> reindex/rebalance/retention/decay/consolidate/tenant export-import/audit). No file to serve — it's
+> embedded in the binary and served publicly (it authenticates to the API with the key you enter).
+
+This folder is the older **standalone** single-file explorer — a lighter, dependency-free playground
+for SQL queries over episodic memory, hybrid memory search, agent **runs** + step **traces**, and a
+one-click "run agent" form. Prefer `/ui` for operations; keep this for quick offline poking.
 
 ## Use
 
