@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: strata-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata-operator
+  namespace: strata-system
+  labels:
+    app: strata-operator
+spec:
+  replicas: 1
+  # Single active controller (no leader election yet) — never run two at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: strata-operator
+  template:
+    metadata:
+      labels:
+        app: strata-operator
+    spec:
+      serviceAccountName: strata-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/vargafoundation/strata-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: "info,strata_operator=debug"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

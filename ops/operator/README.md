@@ -53,9 +53,30 @@ spec:
   adminToken: "<bearer>"   # use a Secret ref in a production build
 ```
 
+## Deploy to Kubernetes
+
+Manifests live in [`deploy/`](deploy/): the CRD, a `strata-system` Namespace, a least-privilege
+ServiceAccount + ClusterRole + binding (watch `StrataShardPlan`; create/patch/delete shard
+StatefulSets; emit events), and the controller Deployment (single replica, `Recreate`, hardened
+securityContext).
+
+```bash
+# 1) Build + push the operator image (standalone crate; build context is ops/operator):
+docker build -t ghcr.io/vargafoundation/strata-operator:latest ops/operator
+docker push ghcr.io/vargafoundation/strata-operator:latest
+
+# 2) Apply the CRD + RBAC + controller in one shot:
+kubectl apply -k ops/operator/deploy
+
+# 3) Apply a StrataShardPlan (see the sketch above) into the namespace with your shard StatefulSets.
+```
+
+The CRD in `deploy/crd.yaml` is the static equivalent of `strata-operator --crd`; regenerate it from
+the binary if `ShardPlanSpec` changes.
+
 ## Remaining work for production
 
-- Render + server-side-apply the shard StatefulSets/Services on scale-up (reuse the Helm template),
-  and delete drained shards on scale-down.
 - Discover tenants from the cluster (`SELECT DISTINCT tenant_id`) instead of an annotation.
-- Read `adminToken` from a Secret; add RBAC + leader election.
+- Read `adminToken` from a `Secret` (env `valueFrom.secretKeyRef`) instead of the plan spec.
+- Leader election (a `coordination.k8s.io/Lease`) so >1 replica can run safely — the Deployment
+  currently pins a single active controller (`replicas: 1`, `Recreate`).
