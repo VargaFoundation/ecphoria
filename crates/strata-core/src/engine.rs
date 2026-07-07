@@ -42,6 +42,8 @@ pub struct StrataEngine {
     reranker: Option<Arc<dyn Reranker>>,
     /// Durable agent-run ledger (agentic-platform substrate).
     runs: Arc<RunStore>,
+    /// Unique id for THIS engine instance — the owner of agent-run driver leases (concurrency guard).
+    driver_id: String,
     /// Optional executor for external tools (e.g. downstream MCP servers), injected by the gateway.
     tool_executor: parking_lot::RwLock<Option<Arc<dyn ToolExecutor>>>,
     /// Optional replicator routing run-ledger writes through Raft (cluster mode), injected by the
@@ -342,6 +344,7 @@ impl StrataEngine {
             completion,
             reranker,
             runs,
+            driver_id: uuid::Uuid::new_v4().to_string(),
             tool_executor: parking_lot::RwLock::new(None),
             run_replicator: parking_lot::RwLock::new(None),
         })
@@ -892,10 +895,21 @@ impl StrataEngine {
         transcript: String,
         max_turns: usize,
     ) -> Result<Run> {
-        match self
+        // Claim the driver lease so two concurrent drivers (a duplicate resume, or the dispatcher and
+        // a manual resume) don't both execute this run. If another worker holds a valid lease, don't
+        // drive — return the run's current state (not an error; don't mark it failed).
+        if !self.run_try_claim(run_id).await? {
+            tracing::debug!(%run_id, "run already leased by another worker — not driving");
+            return self
+                .run_get(run_id)
+                .await?
+                .ok_or_else(|| crate::Error::State("run vanished".into()));
+        }
+        let result = self
             .drive_agent_loop_inner(run_id, tenant, agent_id, transcript, max_turns)
-            .await
-        {
+            .await;
+        self.run_release_lease(run_id).await;
+        match result {
             Ok(run) => Ok(run),
             Err(e) => {
                 let now = chrono::Utc::now();
@@ -913,6 +927,24 @@ impl StrataEngine {
                 Err(e)
             }
         }
+    }
+
+    /// Agent-run driver lease TTL. Renewed each turn; a run whose lease is older than this is
+    /// considered orphaned and may be re-claimed by another worker.
+    const LEASE_TTL_SECS: i64 = 300;
+
+    /// Try to claim (or renew) this instance's driver lease on a run. `false` → another worker holds it.
+    async fn run_try_claim(&self, run_id: uuid::Uuid) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::seconds(Self::LEASE_TTL_SECS);
+        self.runs
+            .try_claim_lease(run_id, &self.driver_id, now, expires)
+            .await
+    }
+
+    /// Release this instance's driver lease on a run (best-effort; a no-op if it isn't ours).
+    async fn run_release_lease(&self, run_id: uuid::Uuid) {
+        let _ = self.runs.release_lease(run_id, &self.driver_id).await;
     }
 
     /// The agent loop over an **existing** run: LLM↔tool turns until a final answer, a pause for
@@ -950,6 +982,15 @@ impl StrataEngine {
         let mut tool_seq = transcript.matches("TOOL call ").count();
         let mut final_answer = None;
         for _turn in 0..max_turns.max(1) {
+            // Renew the lease each turn; if we've lost it (a stale lease re-claimed by another
+            // worker), stop driving to avoid concurrent execution — return the current run state.
+            if !self.run_try_claim(run_id).await? {
+                tracing::warn!(%run_id, "lost the run lease mid-loop — another worker took over");
+                return self
+                    .run_get(run_id)
+                    .await?
+                    .ok_or_else(|| crate::Error::State("run vanished".into()));
+            }
             let reply = completion.complete(system, &transcript).await?;
             let trimmed = reply.trim().to_string();
             if let Some(q) = trimmed.strip_prefix("TOOL search:") {
