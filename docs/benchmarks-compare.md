@@ -111,8 +111,11 @@ workaround (586 ms). The search machinery is fine; its defaults sabotaged it.
    113 ms, no starvation. Follow-up: a filtered-ANN option for genuinely cross-scope searches.
 2. **Don't fuse graph expansion by default on conversational recall** (confirmed −5 pts here,
    index-independent); make it query-type-gated.
-3. **Weight the RRF arms** (vector vs BM25) — untested lever. The importance/recency blend is now
-   configurable but was **neutral on LoCoMo** (see root cause); no default change needed.
+3. **Weight the RRF arms** — measured small positive. Favouring the vector arm over BM25
+   (`retrieval_vector_weight`) rises recall@5 monotonically: 1/1 → 19.7%, 2/1 → 20.3%, **3/1 →
+   20.9%** (3 conv), confirming BM25 is the noisier arm on semantic recall. Shipped as configurable
+   weights; **default kept 1/1** (equal) since the best ratio is workload-dependent (keyword-heavy
+   corpora want BM25 back). The importance/recency blend, by contrast, was **neutral** (see root cause).
 4. **Keep the embedding task-prefix fix** (shipped). A "stronger" model isn't automatically better:
    **bge-m3 (1024d) tested *worse* than nomic-embed-text** on LoCoMo (strata, 3 conv: recall@5 19.7%
    → 17.7%, and 3× the query latency) — via Ollama bge-m3 is dense-only (loses its sparse+ColBERT
