@@ -73,11 +73,30 @@ impl StrataEngine {
             tracing::info!(path = %config.memory.episodic.db_path, "episodic store: file-backed");
         }
 
-        // Initialize semantic store
-        let semantic = Arc::new(
-            SemanticStore::with_dimension(config.embedding.dimension)
-                .unwrap_or_else(|_| SemanticStore::new()),
-        );
+        // Initialize the event vector index. In file-backed (persistent) mode, reload the index that
+        // was saved on the last shutdown/backup so semantic search over pre-restart events survives a
+        // restart. Previously it was created empty and never reloaded, and because indexed events are
+        // flagged `embedded=true` the reindex path skipped them — so every pre-restart event silently
+        // dropped out of semantic/RAG search until re-ingested.
+        let semantic = Arc::new({
+            let index_dir = &config.memory.semantic.index_dir;
+            let reloaded = if config.memory.episodic.db_path != ":memory:"
+                && !index_dir.is_empty()
+                && index_dir != ":memory:"
+            {
+                SemanticStore::load(std::path::Path::new(index_dir)).ok()
+            } else {
+                None
+            };
+            match reloaded {
+                Some(s) => {
+                    tracing::info!(entries = s.len(), dir = %index_dir, "reloaded event vector index from disk");
+                    s
+                }
+                None => SemanticStore::with_dimension(config.embedding.dimension)
+                    .unwrap_or_else(|_| SemanticStore::new()),
+            }
+        });
 
         // Initialize state store
         let state_path = Path::new(&config.memory.state.db_path);
@@ -4314,6 +4333,41 @@ mod tests {
             .run_resolve_approval(run.id, "default", false)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn event_vector_index_reloads_on_startup() {
+        use crate::memory::semantic::{SemanticEntry, SemanticStore};
+        let dir = tempfile::tempdir().unwrap();
+        let idx_dir = dir.path().join("vectors");
+        // Pre-populate + persist an event vector index to disk.
+        {
+            let store = SemanticStore::with_dimension(4).unwrap();
+            store
+                .upsert(&SemanticEntry {
+                    id: uuid::Uuid::new_v4(),
+                    content: "hello".into(),
+                    embedding: vec![0.1, 0.2, 0.3, 0.4],
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            store.save(&idx_dir).unwrap();
+        }
+        // A file-backed engine pointed at that index_dir must RELOAD it (not start empty).
+        let mut c = CoreConfig::default();
+        c.embedding.dimension = 4;
+        c.memory.episodic.db_path = dir.path().join("ep.duckdb").to_string_lossy().into_owned();
+        c.memory.state.db_path = dir.path().join("st.db").to_string_lossy().into_owned();
+        c.memory.cognition.db_path = dir.path().join("cog.duckdb").to_string_lossy().into_owned();
+        c.runtime.db_path = ":memory:".into();
+        c.memory.semantic.index_dir = idx_dir.to_string_lossy().into_owned();
+        let engine = StrataEngine::new(c).await.unwrap();
+        assert_eq!(
+            engine.semantic_count(),
+            1,
+            "event vector index must be reloaded from disk on startup"
+        );
     }
 
     #[tokio::test]
