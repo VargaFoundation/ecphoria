@@ -110,6 +110,12 @@ impl GatewayServer {
     ) -> Result<Self> {
         let listen_addr = config.listen.clone();
 
+        // Fleet-shared cluster secret — authenticates the internal shard-forward rate-limit marker.
+        let cluster_secret = match coordinator.as_ref() {
+            Some(coord) => coord.read().await.secret(),
+            None => None,
+        };
+
         // Build REST router with engine state and optional auth
         let auth_state = if config.auth_enabled {
             let state = if config.oidc.enabled {
@@ -129,7 +135,8 @@ impl GatewayServer {
             // Make the audit log durable (file-backed) for compliance; apply the tenant policy.
             let state = state
                 .with_audit_path(&config.audit_db_path)
-                .with_require_tenant(config.require_tenant);
+                .with_require_tenant(config.require_tenant)
+                .with_shard_forward_secret(cluster_secret.clone());
             // Reject a weak JWT secret (HS256 needs ≥32 bytes of entropy).
             if let Some(secret) = &config.jwt_secret {
                 if secret.len() < 32 {
@@ -177,6 +184,7 @@ impl GatewayServer {
                     my_shard: c.shard_index(),
                     base_urls: std::sync::Arc::new(c.shard_base_urls()),
                     http: reqwest::Client::new(),
+                    forward_secret: cluster_secret.clone().map(std::sync::Arc::new),
                 })
             }
             None => None,

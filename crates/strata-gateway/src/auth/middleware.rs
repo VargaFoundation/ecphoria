@@ -115,6 +115,9 @@ pub struct AuthState {
     /// When true, reject any non-Admin credential that carries no tenant (a "bare" API key, or a
     /// JWT/OIDC token with no `tenant_id`) so multi-tenant deployments can forbid unscoped access.
     require_tenant: bool,
+    /// Shared cluster secret used to authenticate the `x-strata-shard-forwarded` marker, so a client
+    /// can't forge it to bypass rate-limiting. `None` → no forwarded request is trusted to skip.
+    shard_forward_secret: Option<Arc<String>>,
 }
 
 impl std::fmt::Debug for AuthState {
@@ -164,12 +167,19 @@ impl AuthState {
             rate_limiter,
             audit_log,
             require_tenant: false,
+            shard_forward_secret: None,
         }
     }
 
     /// Opt-in: reject non-Admin credentials that carry no tenant (for multi-tenant deployments).
     pub fn with_require_tenant(mut self, require: bool) -> Self {
         self.require_tenant = require;
+        self
+    }
+
+    /// Set the shared cluster secret used to authenticate the internal shard-forward marker.
+    pub fn with_shard_forward_secret(mut self, secret: Option<String>) -> Self {
+        self.shard_forward_secret = secret.map(Arc::new);
         self
     }
 
@@ -403,9 +413,16 @@ pub async fn require_auth(
     }
 
     // ── Rate limiting ────────────────────────────────────────────
-    // A request reverse-proxied from another shard was already rate-limited on the origin pod
-    // (it carries `x-strata-shard-forwarded`); don't double-count it on the destination shard.
-    let is_shard_forwarded = req.headers().contains_key("x-strata-shard-forwarded");
+    // A request reverse-proxied from another shard was already rate-limited on the origin pod; don't
+    // double-count it. But only trust the `x-strata-shard-forwarded` marker when it carries the
+    // shared cluster secret (constant-time checked) — otherwise a client could set the header to
+    // bypass rate-limiting. With no secret configured, the marker is never trusted (re-count).
+    let is_shard_forwarded = state.shard_forward_secret.as_ref().is_some_and(|secret| {
+        req.headers()
+            .get("x-strata-shard-forwarded")
+            .map(|v| ct_eq(v.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false)
+    });
     // Bucket per (identity, tenant) so a noisy tenant on a shared key can't exhaust others' budget.
     let rl_key = match &auth_ctx.tenant_id {
         Some(t) => format!("{}\u{1f}{}", auth_ctx.identity, t),
@@ -470,6 +487,19 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// Constant-time byte-slice equality (the length is not secret). Prevents a timing side-channel when
+/// comparing the shard-forward marker against the cluster secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Best-effort client IP from proxy headers (`X-Forwarded-For` first hop, else `X-Real-IP`).
@@ -655,6 +685,15 @@ mod tests {
         // Default (off) preserves the legacy behaviour: a bare key authenticates.
         let state = AuthState::new(vec!["bare".into()], None, 0);
         assert!(state.authenticate("bare").await.is_some());
+    }
+
+    #[test]
+    fn ct_eq_matches_only_equal_slices() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secreT"));
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]
