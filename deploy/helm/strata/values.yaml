@@ -132,6 +132,13 @@ serviceMonitor:
   interval: 15s
   path: /metrics
 
+# -- PrometheusRule with alerts (no-leader, embedding failures, replication lag, leader flapping,
+# p99 latency, agent-run failures). Requires the Prometheus Operator CRDs.
+prometheusRule:
+  enabled: false
+  # Extra labels so your Prometheus Operator's ruleSelector picks it up, e.g. { release: kube-prometheus-stack }.
+  labels: {}
+
 # -- Node affinity / tolerations
 nodeSelector: {}
 tolerations: []
