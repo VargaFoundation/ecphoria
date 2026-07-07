@@ -9,6 +9,8 @@ pub struct OllamaProvider {
     url: String,
     model: String,
     dimension: usize,
+    query_prefix: String,
+    document_prefix: String,
 }
 
 #[derive(Serialize)]
@@ -29,7 +31,17 @@ impl OllamaProvider {
             url: url.trim_end_matches('/').to_string(),
             model,
             dimension,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         }
+    }
+
+    /// Set the asymmetric retrieval task prefixes (query / document). See
+    /// [`super::EmbeddingProvider`] for why these matter (nomic-embed-text etc.).
+    pub fn with_prefixes(mut self, query_prefix: String, document_prefix: String) -> Self {
+        self.query_prefix = query_prefix;
+        self.document_prefix = document_prefix;
+        self
     }
 }
 
@@ -75,6 +87,14 @@ impl super::EmbeddingProvider for OllamaProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn query_prefix(&self) -> &str {
+        &self.query_prefix
+    }
+
+    fn document_prefix(&self) -> &str {
+        &self.document_prefix
     }
 }
 

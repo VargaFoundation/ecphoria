@@ -73,6 +73,41 @@ jobs:
       - run: go vet ./...
         working-directory: sdk/go
 
+  operator:
+    name: Operator (fmt + clippy + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The operator is a standalone crate (own [workspace] table) — `cargo --workspace` above does
+      # NOT cover it, so it gets its own gate. (cmake is preinstalled on the runner for aws-lc-sys.)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ops/operator
+      - run: cargo fmt --check
+        working-directory: ops/operator
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: ops/operator
+      - run: cargo build --release
+        working-directory: ops/operator
+
+  helm:
+    name: Helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/strata
+      # Render with defaults, and with the optional features on, to catch template errors.
+      - run: helm template strata deploy/helm/strata >/dev/null
+      - run: >-
+          helm template strata deploy/helm/strata
+          --set ingress.enabled=true --set autoscaling.enabled=true
+          --set serviceMonitor.enabled=true --set prometheusRule.enabled=true
+          --set sharding.enabled=true >/dev/null
+
   build:
     name: Build
     runs-on: ubuntu-latest

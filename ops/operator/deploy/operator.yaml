@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: strata-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata-operator
+  namespace: strata-system
+  labels:
+    app: strata-operator
+spec:
+  # Leader election (a coordination.k8s.io Lease) makes >1 replica safe — only the lease holder
+  # reconciles. Bump replicas for HA; RollingUpdate then gives zero-downtime handover.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: strata-operator
+  template:
+    metadata:
+      labels:
+        app: strata-operator
+    spec:
+      serviceAccountName: strata-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/vargafoundation/strata-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: "info,strata_operator=debug"
+            # Downward API → the leader-election Lease identity + namespace.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

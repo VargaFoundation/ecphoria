@@ -150,6 +150,23 @@ pub struct CognitionConfig {
     /// derived from the memory id, applied identically on every node). Off by default.
     #[serde(default)]
     pub auto_graph: bool,
+    /// Weight of a memory's importance in the retrieval blend `rrf·(1 + w_imp·importance +
+    /// w_rec·recency)` (read-path re-rank). 0 = pure relevance (no importance nudge). Default 0.3.
+    #[serde(default = "default_importance_weight")]
+    pub retrieval_importance_weight: f32,
+    /// Weight of recency (30-day half-life) in the retrieval blend. 0 = no recency bias.
+    /// Default 0.2. On recall benchmarks where any turn can hold the answer, lowering these two
+    /// toward 0 lets pure relevance rank; raise them for assistants that should prefer fresh facts.
+    #[serde(default = "default_recency_weight")]
+    pub retrieval_recency_weight: f32,
+    /// Weighted-RRF fusion weight of the **vector** arm in hybrid retrieval. Default 1.0 (equal to
+    /// the lexical arm = plain RRF). Raise it when the embedding model is strong and BM25 is noisy.
+    #[serde(default = "default_arm_weight")]
+    pub retrieval_vector_weight: f32,
+    /// Weighted-RRF fusion weight of the **lexical** (BM25) arm — also applied to the
+    /// graph-expansion arm (both keyword-derived). Default 1.0.
+    #[serde(default = "default_arm_weight")]
+    pub retrieval_lexical_weight: f32,
 }
 
 impl Default for CognitionConfig {
@@ -169,8 +186,27 @@ impl Default for CognitionConfig {
             retrieval_pool: default_retrieval_pool(),
             graph_expansion: false,
             auto_graph: false,
+            retrieval_importance_weight: default_importance_weight(),
+            retrieval_recency_weight: default_recency_weight(),
+            retrieval_vector_weight: default_arm_weight(),
+            retrieval_lexical_weight: default_arm_weight(),
         }
     }
+}
+
+/// Default weight of importance in the retrieval blend.
+fn default_importance_weight() -> f32 {
+    0.3
+}
+
+/// Default weight of recency in the retrieval blend.
+fn default_recency_weight() -> f32 {
+    0.2
+}
+
+/// Default weighted-RRF weight for a retrieval arm (1.0 = equal weight = plain RRF).
+fn default_arm_weight() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +290,29 @@ pub struct EmbeddingConfig {
     pub openai_api_key: String,
     /// Anthropic API key — used by the Claude completion provider (extraction / rerank / eval).
     pub anthropic_api_key: String,
+    /// Task-instruction prefix for **search queries** (asymmetric retrieval). `None` → auto-derive
+    /// from `model` (see [`crate::embedding::default_prefixes`]); set explicitly (incl. `""`) to
+    /// override. e.g. nomic → `"search_query: "`.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+    /// Task-instruction prefix for **indexed documents** (asymmetric retrieval). `None` →
+    /// auto-derive from `model`. e.g. nomic → `"search_document: "`.
+    #[serde(default)]
+    pub document_prefix: Option<String>,
+}
+
+impl EmbeddingConfig {
+    /// Resolve the `(query_prefix, document_prefix)` to apply: explicit config when set, else the
+    /// model-derived defaults. Empty strings mean "no prefix".
+    pub fn resolved_prefixes(&self) -> (String, String) {
+        let (dq, dd) = crate::embedding::default_prefixes(&self.model);
+        (
+            self.query_prefix.clone().unwrap_or_else(|| dq.to_string()),
+            self.document_prefix
+                .clone()
+                .unwrap_or_else(|| dd.to_string()),
+        )
+    }
 }
 
 impl std::fmt::Debug for EmbeddingConfig {
@@ -266,6 +325,8 @@ impl std::fmt::Debug for EmbeddingConfig {
             .field("ollama_url", &self.ollama_url)
             .field("openai_api_key", &redact(&self.openai_api_key))
             .field("anthropic_api_key", &redact(&self.anthropic_api_key))
+            .field("query_prefix", &self.query_prefix)
+            .field("document_prefix", &self.document_prefix)
             .finish()
     }
 }
@@ -280,6 +341,8 @@ impl Default for EmbeddingConfig {
             ollama_url: "http://localhost:11434".into(),
             openai_api_key: String::new(),
             anthropic_api_key: String::new(),
+            query_prefix: None,
+            document_prefix: None,
         }
     }
 }

@@ -1,0 +1,72 @@
+# StrataShardPlan CRD — the static equivalent of `strata-operator --crd`. Regenerate from the binary
+# if `ShardPlanSpec` changes: `strata-operator --crd | kubectl apply -f -`.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: stratashardplans.strata.io
+spec:
+  group: strata.io
+  scope: Namespaced
+  names:
+    kind: StrataShardPlan
+    plural: stratashardplans
+    singular: stratashardplan
+    shortNames: [ssp]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Shards
+          type: integer
+          jsonPath: .spec.shards
+        - name: Current
+          type: integer
+          jsonPath: .status.current_shards
+        - name: Release
+          type: string
+          jsonPath: .spec.release
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [shards, release, shard_base_urls]
+              properties:
+                shards:
+                  type: integer
+                  minimum: 1
+                  description: Desired number of shards (independent Raft groups).
+                release:
+                  type: string
+                  description: Helm release name (StatefulSets are <release>-shard-<i>).
+                shard_base_urls:
+                  type: array
+                  items:
+                    type: string
+                  description: Per-shard HTTP base URLs, indexed by shard, for the rebalance admin API.
+                admin_token:
+                  type: string
+                  description: Admin bearer token for the rebalance/admin endpoints, inline (dev only).
+                admin_token_secret:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                      description: Secret name (same namespace as the plan).
+                    key:
+                      type: string
+                      description: Key within the Secret's data (default "admin-token").
+                  description: Read the admin bearer token from a Secret (preferred over admin_token).
+            status:
+              type: object
+              properties:
+                current_shards:
+                  type: integer
+                last_moves:
+                  type: integer

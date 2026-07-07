@@ -39,14 +39,21 @@ impl super::CompletionProvider for ClaudeCliCompletion {
             .spawn()
             .map_err(|e| crate::Error::Llm(format!("claude CLI spawn failed: {e}")))?;
 
-        // Feed the user prompt on stdin (avoids ARG_MAX for large RAG contexts), then close it (EOF).
+        // Feed the prompt on stdin (avoids ARG_MAX for large RAG contexts), then close it (EOF).
+        // The Claude Code CLI already ships a large *agent* system prompt; `--append-system-prompt`
+        // only appends to it, so a strict instruction there (e.g. "output ONLY a JSON array") is
+        // reliably overridden by the agent persona — the CLI answers conversationally instead, and
+        // structured callers (extraction/rerank/judge) silently get unparseable prose. Inlining the
+        // system prompt into the user turn is honoured, so we prepend it here (belt-and-suspenders
+        // with the flag above).
         {
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| crate::Error::Llm("claude CLI: no stdin handle".into()))?;
+            let payload = compose_prompt(system, user);
             stdin
-                .write_all(user.as_bytes())
+                .write_all(payload.as_bytes())
                 .await
                 .map_err(|e| crate::Error::Llm(format!("claude CLI stdin write: {e}")))?;
         }
@@ -67,5 +74,35 @@ impl super::CompletionProvider for ClaudeCliCompletion {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+}
+
+/// Compose the stdin prompt for `claude -p`: the system instruction inlined ahead of the user text.
+/// The CLI's built-in agent system prompt overrides `--append-system-prompt`, so structured
+/// instructions must live in the turn itself to be honoured. Empty system → user text unchanged.
+fn compose_prompt(system: &str, user: &str) -> String {
+    if system.trim().is_empty() {
+        user.to_string()
+    } else {
+        format!("{system}\n\n{user}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_prompt;
+
+    #[test]
+    fn compose_inlines_system_before_user() {
+        assert_eq!(
+            compose_prompt("Return ONLY JSON.", "Alice likes tea."),
+            "Return ONLY JSON.\n\nAlice likes tea."
+        );
+    }
+
+    #[test]
+    fn compose_passes_user_through_when_system_blank() {
+        assert_eq!(compose_prompt("", "hello"), "hello");
+        assert_eq!(compose_prompt("   ", "hello"), "hello");
     }
 }

@@ -1,11 +1,14 @@
 {
   "uid": "strata-ai-agents",
-  "title": "Strata — AI Agent Observatory",
+  "title": "Strata \u2014 AI Agent Observatory",
   "description": "Real-time monitoring of AI agent activity, events, and performance via Strata",
-  "tags": ["strata", "ai-agents"],
+  "tags": [
+    "strata",
+    "ai-agents"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": {
     "from": "now-24h",
@@ -18,20 +21,36 @@
       "id": 1,
       "title": "Events Ingested",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT COUNT(*) as total FROM episodic",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) as total FROM episodic",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "blue", "value": null },
-              { "color": "green", "value": 100 }
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
             ]
           },
           "unit": "short"
@@ -39,7 +58,11 @@
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value"
@@ -49,19 +72,32 @@
       "id": 2,
       "title": "Active Sources",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT COUNT(DISTINCT source) as sources FROM episodic",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(DISTINCT source) as sources FROM episodic",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "purple", "value": null }
+              {
+                "color": "purple",
+                "value": null
+              }
             ]
           },
           "unit": "short"
@@ -69,7 +105,11 @@
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value"
@@ -79,20 +119,36 @@
       "id": 3,
       "title": "Events Today",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT COUNT(*) as today FROM episodic WHERE ts >= CURRENT_DATE",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) as today FROM episodic WHERE ts >= CURRENT_DATE",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "orange", "value": null },
-              { "color": "green", "value": 10 }
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 10
+              }
             ]
           },
           "unit": "short"
@@ -100,7 +156,11 @@
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value"
@@ -110,19 +170,32 @@
       "id": 4,
       "title": "Avg Events / Hour",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT COUNT(*) / GREATEST(EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 3600, 1) as avg_per_hour FROM episodic",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) / GREATEST(EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 3600, 1) as avg_per_hour FROM episodic",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "cyan", "value": null }
+              {
+                "color": "cyan",
+                "value": null
+              }
             ]
           },
           "unit": "short",
@@ -131,7 +204,11 @@
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "textMode": "value"
@@ -141,7 +218,12 @@
       "id": 10,
       "title": "Event Timeline",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
       "collapsed": false,
       "panels": []
     },
@@ -149,19 +231,31 @@
       "id": 5,
       "title": "Events Over Time",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 5 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT date_trunc('hour', ts) as time, source, COUNT(*) as count FROM episodic WHERE ts >= NOW() - INTERVAL '24 hours' GROUP BY 1, 2 ORDER BY 1",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('hour', ts) as time, source, COUNT(*) as count FROM episodic WHERE ts >= NOW() - INTERVAL '24 hours' GROUP BY 1, 2 ORDER BY 1",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": { "mode": "normal" },
+            "stacking": {
+              "mode": "normal"
+            },
             "lineWidth": 1
           },
           "unit": "short"
@@ -169,32 +263,63 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     },
     {
       "id": 6,
       "title": "Events by Source",
       "type": "piechart",
-      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 5 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT source, COUNT(*) as count FROM episodic GROUP BY source ORDER BY count DESC LIMIT 10",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 5
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT source, COUNT(*) as count FROM episodic GROUP BY source ORDER BY count DESC LIMIT 10",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "options": {
-        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
         "pieType": "donut",
-        "reduceOptions": { "calcs": ["lastNotNull"] }
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
       }
     },
     {
       "id": 11,
       "title": "Agent Activity",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
       "collapsed": false,
       "panels": []
     },
@@ -202,60 +327,100 @@
       "id": 7,
       "title": "Top Event Types",
       "type": "barchart",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT event_type, COUNT(*) as count FROM episodic GROUP BY event_type ORDER BY count DESC LIMIT 15",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT event_type, COUNT(*) as count FROM episodic GROUP BY event_type ORDER BY count DESC LIMIT 15",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "custom": {
             "fillOpacity": 80
           },
-          "color": { "mode": "palette-classic" }
+          "color": {
+            "mode": "palette-classic"
+          }
         },
         "overrides": []
       },
       "options": {
         "orientation": "horizontal",
         "xTickLabelRotation": 0,
-        "legend": { "displayMode": "hidden" }
+        "legend": {
+          "displayMode": "hidden"
+        }
       }
     },
     {
       "id": 8,
       "title": "Recent Events",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-      "datasource": { "type": "postgres", "uid": "strata-pg" },
-      "targets": [{
-        "rawSql": "SELECT ts, source, event_type, payload FROM episodic ORDER BY ts DESC LIMIT 20",
-        "format": "table",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "strata-pg"
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ts, source, event_type, payload FROM episodic ORDER BY ts DESC LIMIT 20",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {},
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "payload" },
+            "matcher": {
+              "id": "byName",
+              "options": "payload"
+            },
             "properties": [
-              { "id": "custom.width", "value": 300 }
+              {
+                "id": "custom.width",
+                "value": 300
+              }
             ]
           }
         ]
       },
       "options": {
         "showHeader": true,
-        "sortBy": [{ "displayName": "ts", "desc": true }]
+        "sortBy": [
+          {
+            "displayName": "ts",
+            "desc": true
+          }
+        ]
       }
     },
     {
       "id": 12,
       "title": "Performance (Prometheus)",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
       "collapsed": false,
       "panels": []
     },
@@ -263,13 +428,23 @@
       "id": 9,
       "title": "Request Rate by Endpoint",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "strata-prom" },
-      "targets": [{
-        "expr": "rate(strata_rest_requests_total[5m])",
-        "legendFormat": "{{ endpoint }}",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "targets": [
+        {
+          "expr": "rate(strata_rest_requests_total[5m])",
+          "legendFormat": "{{ endpoint }}",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -282,21 +457,36 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     },
     {
       "id": 13,
       "title": "Request Duration p99",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "strata-prom" },
-      "targets": [{
-        "expr": "histogram_quantile(0.99, rate(strata_rest_request_duration_seconds_bucket[5m]))",
-        "legendFormat": "{{ endpoint }} p99",
-        "refId": "A"
-      }],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(strata_rest_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "{{ endpoint }} p99",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -309,11 +499,312 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Agent runtime & reliability",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Agent runs / min",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(strata_runs_created_total[5m]) * 60",
+          "legendFormat": "created",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (status) (rate(strata_runs_completed_total[5m])) * 60",
+          "legendFormat": "completed {{status}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Run steps / min by type",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(strata_run_steps_total[5m])) * 60",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Embedding failures / s (degrades search to BM25)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_memory_embed_failures_total[5m]))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "LLM cache hit ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(strata_llm_cache_hits_total[5m])) / clamp_min(sum(rate(strata_llm_cache_hits_total[5m])) + sum(rate(strata_llm_cache_misses_total[5m])), 1)",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Raft leader (1 = leader)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "strata_raft_is_leader",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Raft term & replication lag",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "strata-prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "strata_raft_term",
+          "legendFormat": "term {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "strata_raft_replication_lag",
+          "legendFormat": "lag {{instance}}",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(strata_raft_leader_changes_total[15m])",
+          "legendFormat": "leader changes/s {{instance}}",
+          "refId": "C"
+        }
+      ]
     }
   ],
-  "templating": { "list": [] },
-  "annotations": { "list": [] }
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  }
 }

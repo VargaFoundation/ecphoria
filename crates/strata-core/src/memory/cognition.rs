@@ -507,6 +507,27 @@ pub fn rrf_fuse(rankings: &[Vec<Uuid>], k_rrf: f32, top_k: usize) -> Vec<(Uuid, 
     fused
 }
 
+/// Weighted Reciprocal Rank Fusion: each ranked list contributes `weight / (k_rrf + rank)` instead
+/// of the plain `1 / (k_rrf + rank)`. This lets a stronger arm (e.g. vector on semantic recall)
+/// outweigh a noisier one (BM25) without dropping it. Equal weights reduce to [`rrf_fuse`].
+pub fn rrf_fuse_weighted(
+    rankings: &[(Vec<Uuid>, f32)],
+    k_rrf: f32,
+    top_k: usize,
+) -> Vec<(Uuid, f32)> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<Uuid, f32> = HashMap::new();
+    for (ranking, weight) in rankings {
+        for (rank, id) in ranking.iter().enumerate() {
+            *scores.entry(*id).or_insert(0.0) += weight / (k_rrf + (rank as f32 + 1.0));
+        }
+    }
+    let mut fused: Vec<(Uuid, f32)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(top_k);
+    fused
+}
+
 /// Whether a stored vector entry's metadata matches the requested scope (exact match,
 /// `None`/null fields included). Used to keep dedup/search scoped to the right owner.
 pub fn scope_matches_metadata(scope: &MemoryScope, metadata: &serde_json::Value) -> bool {
@@ -531,6 +552,25 @@ pub fn scope_matches_metadata(scope: &MemoryScope, metadata: &serde_json::Value)
         }
     }
     true
+}
+
+/// Stable partition key for a memory scope — the key under which its vector lives in the
+/// [`super::semantic::ScopedVectorIndex`]. Injective on `(tenant, user, agent, session)` with the
+/// same normalization as [`scope_matches_metadata`] (empty tenant → `default`, `None` → empty), so a
+/// memory and a search for its exact scope always resolve to the same partition. Uses the ASCII unit
+/// separator (0x1f), which can't occur in the id/name fields.
+pub fn scope_partition_key(scope: &MemoryScope) -> String {
+    let tenant = if scope.tenant_id.is_empty() {
+        "default"
+    } else {
+        scope.tenant_id.as_str()
+    };
+    format!(
+        "{tenant}\u{1f}{}\u{1f}{}\u{1f}{}",
+        scope.user_id.as_deref().unwrap_or(""),
+        scope.agent_id.as_deref().unwrap_or(""),
+        scope.session_id.as_deref().unwrap_or(""),
+    )
 }
 
 /// A fully-materialized memory row plus its embedding — the unit replicated through Raft so a
@@ -1705,6 +1745,21 @@ mod tests {
         let fused = rrf_fuse(&[vec![a, b], vec![a, c]], 60.0, 3);
         assert_eq!(fused[0].0, a);
         assert_eq!(fused.len(), 3);
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_lets_the_heavier_arm_win() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // The two arms disagree on the top item (arm1 prefers a, arm2 prefers b).
+        let arm1 = vec![a, b];
+        let arm2 = vec![b, a];
+        // Heavily weighting arm2 makes its favourite (b) win.
+        let heavy = rrf_fuse_weighted(&[(arm1.clone(), 1.0), (arm2.clone(), 5.0)], 60.0, 2);
+        assert_eq!(heavy[0].0, b);
+        // Weight 0 on arm2 = arm1 alone → a wins.
+        let only1 = rrf_fuse_weighted(&[(arm1, 1.0), (arm2, 0.0)], 60.0, 2);
+        assert_eq!(only1[0].0, a);
     }
 
     #[tokio::test]

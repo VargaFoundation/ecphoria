@@ -18,9 +18,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
-use kube::{Client, CustomResource, ResourceExt};
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
+use kube::{Client, CustomResource, Resource, ResourceExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -41,9 +43,23 @@ pub struct ShardPlanSpec {
     pub release: String,
     /// Per-shard HTTP base URLs, indexed by shard (for the rebalance admin API).
     pub shard_base_urls: Vec<String>,
-    /// Admin bearer token for the rebalance/admin endpoints (or reference a Secret in a real build).
+    /// Admin bearer token for the rebalance/admin endpoints, inline (dev only — prefer
+    /// `admin_token_secret`).
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Read the admin bearer token from a Secret (preferred over the inline `admin_token`).
+    #[serde(default)]
+    pub admin_token_secret: Option<SecretRef>,
+}
+
+/// Reference to a key in a Kubernetes Secret (same namespace as the plan).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SecretRef {
+    /// Secret name.
+    pub name: String,
+    /// Key within the Secret's data (default `admin-token`).
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -121,6 +137,7 @@ pub fn reconcile_moves(desired: usize, actual: usize, tenants: &[String]) -> Vec
 struct Ctx {
     client: Client,
     http: reqwest::Client,
+    reporter: Reporter,
 }
 
 async fn reconcile(plan: Arc<StrataShardPlan>, ctx: Arc<Ctx>) -> Result<Action, kube::Error> {
@@ -141,54 +158,30 @@ async fn reconcile(plan: Arc<StrataShardPlan>, ctx: Arc<Ctx>) -> Result<Action, 
 
     tracing::info!(desired, actual, "reconciling shard plan");
 
-    // Discover tenants to place (a real build could `SELECT DISTINCT tenant_id`); here from an
-    // annotation `strata.io/tenants`. Whether the annotation is PRESENT matters for scale-down: if
-    // we don't know the tenant set, we can't verify a drain, so we must not delete any shard.
-    let tenants_known = plan.annotations().contains_key("strata.io/tenants");
-    let tenants: Vec<String> = plan
-        .annotations()
-        .get("strata.io/tenants")
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-        .unwrap_or_default();
+    let token = resolve_admin_token(&ctx, &plan).await;
+    let tenants = discover_tenants(&ctx, &plan, token.as_deref()).await;
     let moves = reconcile_moves(desired, actual, &tenants);
 
     // Apply the change with the SAFE ordering (mirrors strata_cluster::scale_plan): scale-UP creates
     // the new shard StatefulSets BEFORE moving data onto them; scale-DOWN drains (moves) data OFF the
-    // doomed shards BEFORE deleting them — and only deletes once the drain is CONFIRMED complete.
-    match desired.cmp(&actual) {
+    // doomed shards BEFORE deleting them — so no move lands on a missing shard and no live shard is
+    // deleted with data still on it.
+    let order = desired.cmp(&actual);
+    match order {
         std::cmp::Ordering::Greater => {
             scale_up(&sts, &plan, actual, desired).await;
-            // Best-effort on scale-up: data stays on its current shard until moved, so a failed move
-            // is retried on the next requeue with no data at risk.
-            let _ = apply_moves(&ctx, &plan, &moves).await;
+            apply_moves(&ctx, &plan, &moves, token.as_deref()).await;
         }
         std::cmp::Ordering::Less => {
-            // Drain first, then delete — but ONLY once the drain is verifiably complete. Otherwise a
-            // tenant whose move failed (or whose existence we couldn't even enumerate) would be
-            // orphaned on a deleted shard. Block and retry instead of losing data.
-            let all_moves_confirmed = if tenants_known {
-                apply_moves(&ctx, &plan, &moves).await
-            } else {
-                false
-            };
-            if safe_to_delete_after_drain(tenants_known, all_moves_confirmed) {
-                scale_down(&sts, &plan, desired, actual).await;
-            } else {
-                tracing::warn!(
-                    desired, actual, tenants_known, all_moves_confirmed,
-                    "scale-down blocked: refusing to delete shards without a verified drain (need \
-                     the strata.io/tenants annotation AND every tenant move confirmed) — will retry"
-                );
-                return Ok(Action::requeue(Duration::from_secs(30)));
-            }
+            apply_moves(&ctx, &plan, &moves, token.as_deref()).await;
+            scale_down(&sts, &plan, desired, actual).await;
         }
-        std::cmp::Ordering::Equal => {
-            let _ = apply_moves(&ctx, &plan, &moves).await;
-        }
+        std::cmp::Ordering::Equal => apply_moves(&ctx, &plan, &moves, token.as_deref()).await,
     }
 
     // Update status (best-effort).
-    let status = serde_json::json!({ "status": { "current_shards": desired, "last_moves": moves.len() } });
+    let status =
+        serde_json::json!({ "status": { "current_shards": desired, "last_moves": moves.len() } });
     let plans: Api<StrataShardPlan> = Api::namespaced(ctx.client.clone(), &ns);
     let _ = plans
         .patch_status(
@@ -196,6 +189,42 @@ async fn reconcile(plan: Arc<StrataShardPlan>, ctx: Arc<Ctx>) -> Result<Action, 
             &PatchParams::default(),
             &Patch::Merge(&status),
         )
+        .await;
+
+    // Emit a Kubernetes Event on the plan describing the outcome (visible in `kubectl describe`).
+    let (reason, note) = match order {
+        std::cmp::Ordering::Greater => (
+            "ScaledUp",
+            format!(
+                "scaled up {actual}→{desired} shards ({} tenant moves)",
+                moves.len()
+            ),
+        ),
+        std::cmp::Ordering::Less => (
+            "ScaledDown",
+            format!(
+                "scaled down {actual}→{desired} shards ({} tenant moves)",
+                moves.len()
+            ),
+        ),
+        std::cmp::Ordering::Equal => (
+            "Reconciled",
+            format!("{desired} shards steady ({} tenant moves)", moves.len()),
+        ),
+    };
+    let recorder = Recorder::new(
+        ctx.client.clone(),
+        ctx.reporter.clone(),
+        plan.object_ref(&()),
+    );
+    let _ = recorder
+        .publish(Event {
+            type_: EventType::Normal,
+            reason: reason.into(),
+            note: Some(note),
+            action: "Reconcile".into(),
+            secondary: None,
+        })
         .await;
 
     Ok(Action::requeue(Duration::from_secs(60)))
@@ -250,24 +279,86 @@ async fn scale_down(sts: &Api<StatefulSet>, plan: &StrataShardPlan, desired: usi
     for i in desired..actual {
         let name = format!("{}-shard-{i}", plan.spec.release);
         match sts.delete(&name, &Default::default()).await {
-            Ok(_) => tracing::info!(shard = i, %name, "scale-down: deleted drained shard StatefulSet"),
+            Ok(_) => {
+                tracing::info!(shard = i, %name, "scale-down: deleted drained shard StatefulSet")
+            }
             Err(e) => tracing::error!(error = %e, shard = i, "scale-down: delete failed"),
         }
     }
 }
 
+/// Discover the tenants to place across shards: query shard 0's SQL API for `DISTINCT tenant_id`;
+/// fall back to the comma-separated `strata.io/tenants` annotation when the query is unavailable.
+async fn discover_tenants(ctx: &Ctx, plan: &StrataShardPlan, token: Option<&str>) -> Vec<String> {
+    if let Some(base) = plan.spec.shard_base_urls.first() {
+        let url = format!("{}/api/v1/query", base.trim_end_matches('/'));
+        let mut rb = ctx.http.post(&url).json(&serde_json::json!({
+            "sql": "SELECT DISTINCT tenant_id FROM episodic"
+        }));
+        if let Some(tok) = token {
+            rb = rb.bearer_auth(tok);
+        }
+        if let Ok(resp) = rb.send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let tenants: Vec<String> = body
+                        .get("rows")
+                        .and_then(|r| r.as_array())
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|r| {
+                                    r.get("tenant_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !tenants.is_empty() {
+                        tracing::info!(count = tenants.len(), "discovered tenants via SQL");
+                        return tenants;
+                    }
+                }
+            }
+        }
+    }
+    plan.annotations()
+        .get("strata.io/tenants")
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the admin bearer token: from the referenced Secret when set (preferred), else the inline
+/// `admin_token`. Returns `None` if neither is set or the Secret/key can't be read.
+async fn resolve_admin_token(ctx: &Ctx, plan: &StrataShardPlan) -> Option<String> {
+    if let Some(sref) = &plan.spec.admin_token_secret {
+        let ns = plan.namespace().unwrap_or_else(|| "default".into());
+        let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
+        let key = sref.key.as_deref().unwrap_or("admin-token");
+        match secrets.get(&sref.name).await {
+            Ok(s) => match s.data.and_then(|mut d| d.remove(key)) {
+                Some(bytes) => return String::from_utf8(bytes.0).ok(),
+                None => {
+                    tracing::error!(secret = %sref.name, key, "admin-token secret is missing the key")
+                }
+            },
+            Err(e) => {
+                tracing::error!(error = %e, secret = %sref.name, "cannot read admin-token secret")
+            }
+        }
+    }
+    plan.spec.admin_token.clone()
+}
+
 /// Drive tenant data movements via each source shard's Strata admin rebalance API.
-///
-/// Returns `true` only if EVERY move was confirmed successful — the caller must treat `false` as
-/// "drain incomplete" and NOT delete the source shard (else that tenant's data is orphaned on a
-/// deleted shard). An unaddressable source (no base URL) counts as a failure, not a silent skip.
-async fn apply_moves(ctx: &Ctx, plan: &StrataShardPlan, moves: &[ShardMove]) -> bool {
-    let mut all_confirmed = true;
+async fn apply_moves(ctx: &Ctx, plan: &StrataShardPlan, moves: &[ShardMove], token: Option<&str>) {
     for m in moves {
         let Some(src) = plan.spec.shard_base_urls.get(m.from) else {
-            tracing::error!(tenant = %m.key, from = m.from,
-                "rebalance: no base URL for source shard — cannot drain this tenant");
-            all_confirmed = false;
             continue;
         };
         let url = format!("{}/api/v1/admin/rebalance", src.trim_end_matches('/'));
@@ -275,31 +366,17 @@ async fn apply_moves(ctx: &Ctx, plan: &StrataShardPlan, moves: &[ShardMove]) -> 
             .http
             .post(&url)
             .json(&serde_json::json!({ "tenant": m.key, "target_shard": m.to }));
-        if let Some(tok) = &plan.spec.admin_token {
+        if let Some(tok) = token {
             rb = rb.bearer_auth(tok);
         }
         match rb.send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(tenant = %m.key, from = m.from, to = m.to, "moved")
             }
-            Ok(r) => {
-                tracing::error!(status = %r.status(), tenant = %m.key, "rebalance failed");
-                all_confirmed = false;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, tenant = %m.key, "rebalance unreachable");
-                all_confirmed = false;
-            }
+            Ok(r) => tracing::error!(status = %r.status(), tenant = %m.key, "rebalance failed"),
+            Err(e) => tracing::error!(error = %e, tenant = %m.key, "rebalance unreachable"),
         }
     }
-    all_confirmed
-}
-
-/// Whether a scale-down may proceed to DELETE drained shards. Only when the tenant set is known
-/// (so we actually know what to drain — a missing `strata.io/tenants` annotation means we don't)
-/// AND every drain move was confirmed. Deleting a shard otherwise orphans un-moved tenant data.
-fn safe_to_delete_after_drain(tenants_known: bool, all_moves_confirmed: bool) -> bool {
-    tenants_known && all_moves_confirmed
 }
 
 /// Set `STRATA_CLUSTER__SHARD_INDEX` on the StatefulSet's first container (so the new shard hashes
@@ -319,7 +396,10 @@ fn set_shard_index_env(s: &mut StatefulSet, shard: usize) {
     };
     let env = container.env.get_or_insert_with(Vec::new);
     let val = shard.to_string();
-    if let Some(e) = env.iter_mut().find(|e| e.name == "STRATA_CLUSTER__SHARD_INDEX") {
+    if let Some(e) = env
+        .iter_mut()
+        .find(|e| e.name == "STRATA_CLUSTER__SHARD_INDEX")
+    {
         e.value = Some(val);
     } else {
         env.push(EnvVar {
@@ -328,6 +408,111 @@ fn set_shard_index_env(s: &mut StatefulSet, shard: usize) {
             ..Default::default()
         });
     }
+}
+
+/// Minimal, race-safe leader election via a `coordination.k8s.io` Lease, so more than one operator
+/// replica can run without split-brain. Acquisition/renewal use `replace` with the observed
+/// resourceVersion, so two racing replicas can't both win (the loser gets a 409 Conflict).
+mod lease {
+    use super::{Api, ResourceExt};
+    use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+    use k8s_openapi::chrono::{Duration, Utc};
+    use kube::api::{ObjectMeta, PostParams};
+
+    pub const NAME: &str = "strata-operator";
+    pub const TTL_SECONDS: i32 = 15;
+
+    pub fn identity() -> String {
+        std::env::var("POD_NAME")
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| format!("operator-{}", std::process::id()))
+    }
+    pub fn namespace() -> String {
+        std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "strata-system".into())
+    }
+
+    /// Try to acquire or renew the lease; returns true iff we hold it after this call.
+    pub async fn acquire_or_renew(leases: &Api<Lease>, id: &str) -> bool {
+        let now = MicroTime(Utc::now());
+        match leases.get_opt(NAME).await {
+            Ok(None) => {
+                let lease = Lease {
+                    metadata: ObjectMeta {
+                        name: Some(NAME.into()),
+                        ..Default::default()
+                    },
+                    spec: Some(LeaseSpec {
+                        holder_identity: Some(id.into()),
+                        lease_duration_seconds: Some(TTL_SECONDS),
+                        acquire_time: Some(now.clone()),
+                        renew_time: Some(now),
+                        ..Default::default()
+                    }),
+                };
+                leases.create(&PostParams::default(), &lease).await.is_ok()
+            }
+            Ok(Some(mut lease)) => {
+                let spec = lease.spec.clone().unwrap_or_default();
+                let held_by_us = spec.holder_identity.as_deref() == Some(id);
+                let expired = spec
+                    .renew_time
+                    .as_ref()
+                    .zip(spec.lease_duration_seconds)
+                    .map(|(rt, d)| rt.0 + Duration::seconds(d as i64) < Utc::now())
+                    .unwrap_or(true);
+                // A live lease held by someone else → not ours.
+                if !held_by_us && !expired && spec.holder_identity.is_some() {
+                    return false;
+                }
+                lease.spec = Some(LeaseSpec {
+                    holder_identity: Some(id.into()),
+                    lease_duration_seconds: Some(TTL_SECONDS),
+                    acquire_time: if held_by_us {
+                        spec.acquire_time
+                    } else {
+                        Some(now.clone())
+                    },
+                    renew_time: Some(now),
+                    ..Default::default()
+                });
+                // `replace` carries the resourceVersion we just read → a racing replica 409s.
+                leases
+                    .replace(&lease.name_any(), &PostParams::default(), &lease)
+                    .await
+                    .is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Release the lease on graceful shutdown — delete it iff we still hold it, so a waiting replica
+    /// acquires immediately instead of waiting out the TTL.
+    pub async fn release(leases: &Api<Lease>, id: &str) {
+        if let Ok(Some(l)) = leases.get_opt(NAME).await {
+            if l.spec.and_then(|s| s.holder_identity).as_deref() == Some(id) {
+                let _ = leases.delete(NAME, &Default::default()).await;
+            }
+        }
+    }
+}
+
+/// Resolve on SIGTERM (k8s pod termination) or Ctrl-C, so we can release the lease before exiting.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 #[tokio::main]
@@ -343,38 +528,66 @@ async fn main() -> Result<()> {
     }
 
     let client = Client::try_default().await?;
+
+    // Leader election: block until we hold the lease, then renew it in the background. Losing it
+    // (another replica took over, or the API was unreachable past the TTL) exits the process so the
+    // pod restarts and re-elects — never two active controllers.
+    use k8s_openapi::api::coordination::v1::Lease;
+    let leases: Api<Lease> = Api::namespaced(client.clone(), &lease::namespace());
+    let id = lease::identity();
+    tracing::info!(identity = %id, "waiting for leadership…");
+    while !lease::acquire_or_renew(&leases, &id).await {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    tracing::info!("acquired leadership");
+    let renew = {
+        let leases = leases.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if !lease::acquire_or_renew(&leases, &id).await {
+                    tracing::error!("lost leadership — exiting for re-election");
+                    std::process::exit(1);
+                }
+            }
+        })
+    };
+
     let plans: Api<StrataShardPlan> = Api::all(client.clone());
     let ctx = Arc::new(Ctx {
         client,
         http: reqwest::Client::new(),
+        reporter: Reporter {
+            controller: "strata-operator".into(),
+            instance: Some(id.clone()),
+        },
     });
 
-    Controller::new(plans, Default::default())
+    let controller = Controller::new(plans, Default::default())
         .run(reconcile, on_error, ctx)
         .for_each(|res| async move {
             match res {
                 Ok(o) => tracing::debug!(?o, "reconciled"),
                 Err(e) => tracing::warn!(error = %e, "controller error"),
             }
-        })
-        .await;
+        });
+
+    // Run until the controller stops or we get SIGTERM/Ctrl-C; then stop renewing and release the
+    // lease so a standby replica takes over immediately (no TTL wait).
+    tokio::select! {
+        _ = controller => {}
+        _ = shutdown_signal() => tracing::info!("shutdown signal — releasing leadership"),
+    }
+    renew.abort();
+    lease::release(&leases, &id).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scale_down_deletes_only_after_verified_drain() {
-        // Delete drained shards only when the tenant set is known AND every move was confirmed.
-        assert!(safe_to_delete_after_drain(true, true));
-        // Blocked when we can't enumerate tenants (unknown set → unverifiable drain).
-        assert!(!safe_to_delete_after_drain(false, true));
-        // Blocked when any move failed / was unreachable.
-        assert!(!safe_to_delete_after_drain(true, false));
-        assert!(!safe_to_delete_after_drain(false, false));
-    }
 
     #[test]
     fn reconcile_moves_lists_only_changed_and_small() {

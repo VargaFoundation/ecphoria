@@ -71,6 +71,12 @@ pub fn router_with_engine_and_auth(
     let mut health_routes = Router::new()
         .route("/health", axum::routing::get(handlers::health))
         .route("/ready", axum::routing::get(handlers::ready))
+        // Self-contained admin console (public; authenticates to the API with an operator-supplied key).
+        .route("/ui", axum::routing::get(handlers::admin_ui))
+        .route(
+            "/",
+            axum::routing::get(|| async { axum::response::Redirect::permanent("/ui") }),
+        )
         .with_state(engine.clone());
 
     // If cluster mode, provide the coordinator as an optional extension

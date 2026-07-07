@@ -12,7 +12,7 @@ use crate::memory::cognition::{
     MemoryStore,
 };
 use crate::memory::episodic::{EpisodicStore, Event};
-use crate::memory::semantic::{SearchResult, SemanticEntry, SemanticStore};
+use crate::memory::semantic::{ScopedVectorIndex, SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
 use crate::rerank::Reranker;
@@ -30,7 +30,7 @@ pub struct StrataEngine {
     /// Bi-temporal store of distilled memories (cognition layer).
     memory_store: Arc<MemoryStore>,
     /// Vector index over memories only (kept separate from event embeddings).
-    memory_index: Arc<SemanticStore>,
+    memory_index: Arc<ScopedVectorIndex>,
     /// Per-modality vector indexes (mixed-dimension multi-modal embeddings).
     modal: crate::memory::semantic::MultiModalStore,
     ingest: IngestPipeline,
@@ -96,16 +96,18 @@ impl StrataEngine {
                 },
             ),
         );
-        let memory_index = Arc::new(
-            SemanticStore::with_dimension(config.embedding.dimension)
-                .unwrap_or_else(|_| SemanticStore::new()),
-        );
+        // Vector index for memories, partitioned by exact scope so per-scope recall isn't starved
+        // by a global top-K post-filter (see [`ScopedVectorIndex`]).
+        let memory_index = Arc::new(ScopedVectorIndex::with_dimension(
+            config.embedding.dimension,
+        ));
         // Rebuild the in-memory vector index from persisted embeddings (no provider call).
         match memory_store.load_active_with_embeddings().await {
             Ok(rows) => {
                 let n = rows.len();
                 for (mem, emb) in rows {
-                    let _ = memory_index.upsert(&mem.to_semantic_entry(emb)).await;
+                    let key = crate::memory::cognition::scope_partition_key(&mem.scope);
+                    let _ = memory_index.upsert(&key, &mem.to_semantic_entry(emb)).await;
                 }
                 if n > 0 {
                     tracing::info!(memories = n, "rebuilt memory vector index from disk");
@@ -118,24 +120,34 @@ impl StrataEngine {
         let embedding: Option<Arc<dyn EmbeddingProvider>> = match config.embedding.provider.as_str()
         {
             "ollama" => {
+                let (qp, dp) = config.embedding.resolved_prefixes();
                 tracing::info!(
                     model = %config.embedding.model,
                     url = %config.embedding.ollama_url,
+                    query_prefix = %qp,
+                    document_prefix = %dp,
                     "embedding provider: ollama"
                 );
-                Some(Arc::new(OllamaProvider::new(
-                    config.embedding.ollama_url.clone(),
-                    config.embedding.model.clone(),
-                    config.embedding.dimension,
-                )))
+                Some(Arc::new(
+                    OllamaProvider::new(
+                        config.embedding.ollama_url.clone(),
+                        config.embedding.model.clone(),
+                        config.embedding.dimension,
+                    )
+                    .with_prefixes(qp, dp),
+                ))
             }
             "openai" if !config.embedding.openai_api_key.is_empty() => {
+                let (qp, dp) = config.embedding.resolved_prefixes();
                 tracing::info!(model = %config.embedding.model, "embedding provider: openai");
-                Some(Arc::new(OpenAiProvider::new(
-                    config.embedding.openai_api_key.clone(),
-                    config.embedding.model.clone(),
-                    config.embedding.dimension,
-                )))
+                Some(Arc::new(
+                    OpenAiProvider::new(
+                        config.embedding.openai_api_key.clone(),
+                        config.embedding.model.clone(),
+                        config.embedding.dimension,
+                    )
+                    .with_prefixes(qp, dp),
+                ))
             }
             "none" | "" => {
                 tracing::info!("embedding provider: none (semantic search disabled)");
@@ -1541,7 +1553,23 @@ impl StrataEngine {
             .embedding
             .as_ref()
             .ok_or_else(|| crate::Error::Embedding("no embedding provider configured".into()))?;
-        let results = provider.embed(&[text.to_string()]).await?;
+        // Query path → apply the model's *query* task prefix (asymmetric retrieval).
+        let results = provider.embed_query(&[text.to_string()]).await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::Embedding("embedding returned empty result".into()))
+    }
+
+    /// Embed a **document** to be indexed (write/ingest path) — applies the model's *document* task
+    /// prefix, the counterpart to [`Self::embed_text`]'s query prefix. Using the right side for each
+    /// role is what makes asymmetric retrieval models (nomic, e5, …) actually work.
+    pub async fn embed_document_text(&self, text: &str) -> Result<Vec<f32>> {
+        let provider = self
+            .embedding
+            .as_ref()
+            .ok_or_else(|| crate::Error::Embedding("no embedding provider configured".into()))?;
+        let results = provider.embed_documents(&[text.to_string()]).await?;
         results
             .into_iter()
             .next()
@@ -1661,8 +1689,22 @@ impl StrataEngine {
         }
         let cog = &self.config.memory.cognition;
         let importance = input.importance.unwrap_or(cog.default_importance);
-        // Embedding is best-effort: the deterministic paths work without it.
-        let embedding = self.embed_text(&input.content).await.ok();
+        // Embedding is best-effort: the deterministic paths work without it. Memory content is an
+        // indexed *document*, so use the document task prefix (not the query one). A failure is not
+        // fatal, but it silently drops this memory out of vector search (BM25-only), so make it
+        // observable (metric + warn) rather than a silent degradation.
+        let embedding = match self.embedding.as_ref() {
+            Some(_) => match self.embed_document_text(&input.content).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    metrics::counter!("strata_memory_embed_failures_total", "op" => "ingest")
+                        .increment(1);
+                    tracing::warn!(error = %e, "memory embedding failed — stored without a vector (search degraded to BM25)");
+                    None
+                }
+            },
+            None => None,
+        };
 
         // 1. Subject-based contradiction resolution (authoritative, no embedding required).
         if let Some(subject) = input.subject.clone() {
@@ -1785,9 +1827,10 @@ impl StrataEngine {
             match row.memory.state {
                 MemoryState::Active => {
                     if let Some(emb) = &row.embedding {
+                        let key = crate::memory::cognition::scope_partition_key(&row.memory.scope);
                         let _ = self
                             .memory_index
-                            .upsert(&row.memory.to_semantic_entry(emb.clone()))
+                            .upsert(&key, &row.memory.to_semantic_entry(emb.clone()))
                             .await;
                     }
                 }
@@ -1832,13 +1875,10 @@ impl StrataEngine {
         scope: &MemoryScope,
         k: usize,
     ) -> Result<Vec<MemoryHit>> {
-        let scope = scope.clone();
-        let results = self
-            .memory_index
-            .search_filtered(vector, k, move |entry| {
-                crate::memory::cognition::scope_matches_metadata(&scope, &entry.metadata)
-            })
-            .await?;
+        // The scope is the partition key: the search only ever traverses this scope's vectors, so
+        // there is no oversample/post-filter (and no cross-scope starvation).
+        let key = crate::memory::cognition::scope_partition_key(scope);
+        let results = self.memory_index.search(&key, vector, k).await?;
         let mut hits = Vec::with_capacity(results.len());
         for r in results {
             if let Some(mem) = self.memory_store.get(r.entry.id).await? {
@@ -1866,7 +1906,7 @@ impl StrataEngine {
         scope: &MemoryScope,
         k: usize,
     ) -> Result<Vec<MemoryHit>> {
-        use crate::memory::cognition::{lexical_rank, rrf_fuse};
+        use crate::memory::cognition::{lexical_rank, rrf_fuse_weighted};
 
         if query.trim().is_empty() || k == 0 {
             let mems = self.memory_store.list_active(scope, k.max(1)).await?;
@@ -1901,7 +1941,15 @@ impl StrataEngine {
         // Vector ranking — best-effort, only when embeddings are configured.
         let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
         if !self.memory_index.is_empty() {
-            if let Ok(vector) = self.embed_text(query).await {
+            let embedded = self.embed_text(query).await;
+            if let Err(e) = &embedded {
+                // The index has vectors but we couldn't embed the query → this search silently
+                // falls back to BM25-only. Surface it instead of degrading quietly.
+                metrics::counter!("strata_memory_embed_failures_total", "op" => "query")
+                    .increment(1);
+                tracing::warn!(error = %e, "query embedding failed — search degraded to BM25-only");
+            }
+            if let Ok(vector) = embedded {
                 // Fetch enough vector candidates to fill the fused pool (feeds the reranker) without
                 // the cost of scanning the whole scope — measured neutral on recall@5 beyond this.
                 if let Ok(hits) = self
@@ -1954,15 +2002,20 @@ impl StrataEngine {
             }
         }
 
-        let mut rankings: Vec<Vec<uuid::Uuid>> = Vec::new();
+        // Weighted-RRF arms: the vector arm gets `retrieval_vector_weight`, the lexical (BM25) and
+        // graph arms share `retrieval_lexical_weight` (both keyword-derived). Defaults are 1/1 =
+        // plain equal-weight RRF; raise the vector weight when the embedder is strong and BM25 noisy.
+        let w_vec = cog.retrieval_vector_weight;
+        let w_lex = cog.retrieval_lexical_weight;
+        let mut rankings: Vec<(Vec<uuid::Uuid>, f32)> = Vec::new();
         if !vec_ids.is_empty() {
-            rankings.push(vec_ids);
+            rankings.push((vec_ids, w_vec));
         }
         if !lex_ids.is_empty() {
-            rankings.push(lex_ids);
+            rankings.push((lex_ids, w_lex));
         }
         if !graph_ids.is_empty() {
-            rankings.push(graph_ids);
+            rankings.push((graph_ids, w_lex));
         }
 
         // Nothing matched lexically or by vector → fall back to importance/recency.
@@ -1975,8 +2028,12 @@ impl StrataEngine {
         }
 
         // Over-fetch, then re-rank by relevance blended with importance + recency, so a recent or
-        // important memory can outrank a marginally-more-relevant stale one.
-        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, pool);
+        // important memory can outrank a marginally-more-relevant stale one. Weights are
+        // configurable (0/0 = pure relevance): recall benchmarks want them low, "prefer fresh
+        // facts" assistants want them higher.
+        let w_imp = cog.retrieval_importance_weight;
+        let w_rec = cog.retrieval_recency_weight;
+        let fused = rrf_fuse_weighted(&rankings, Self::MEMORY_RRF_K, pool);
         let now = chrono::Utc::now();
         let mut scored: Vec<MemoryHit> = Vec::with_capacity(fused.len());
         for (id, rrf) in fused {
@@ -1990,7 +2047,7 @@ impl StrataEngine {
             // Recency in [0,1] with a 30-day half-life; importance in [0,1].
             let age_days = (now - memory.updated_at).num_seconds().max(0) as f32 / 86_400.0;
             let recency = 0.5_f32.powf(age_days / 30.0);
-            let score = rrf * (1.0 + 0.3 * memory.importance + 0.2 * recency);
+            let score = rrf * (1.0 + w_imp * memory.importance + w_rec * recency);
             scored.push(MemoryHit { memory, score });
         }
         scored.sort_by(|a, b| {
@@ -2876,7 +2933,11 @@ impl StrataEngine {
         // Rebuild the memory vector index from the restored memories (no provider call).
         if let Ok(rows) = self.memory_store.load_active_with_embeddings().await {
             for (mem, emb) in rows {
-                let _ = self.memory_index.upsert(&mem.to_semantic_entry(emb)).await;
+                let key = crate::memory::cognition::scope_partition_key(&mem.scope);
+                let _ = self
+                    .memory_index
+                    .upsert(&key, &mem.to_semantic_entry(emb))
+                    .await;
             }
         }
 
