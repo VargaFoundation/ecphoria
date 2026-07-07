@@ -25,7 +25,10 @@ A ready-to-import Grafana dashboard that connects to Strata via its PostgreSQL w
 └─────────────────────────────────┴─────────────────────────────────┘
 ```
 
-**4 rows, 10 panels** — overview stats, event timeline with source breakdown, agent activity details, and API performance from Prometheus.
+Overview stats, event timeline with source breakdown, agent activity details, and API performance
+from Prometheus — plus an **Agent runtime & reliability** row: agent runs & steps per minute,
+**embedding failures** (each degrades search to BM25-only), LLM cache hit ratio, and Raft
+leader/term/replication-lag for cluster health.
 
 ## Quick Start
 
