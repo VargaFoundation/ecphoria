@@ -1821,7 +1821,7 @@ impl StrataEngine {
         scope: &MemoryScope,
         k: usize,
     ) -> Result<Vec<MemoryHit>> {
-        use crate::memory::cognition::{lexical_rank, rrf_fuse};
+        use crate::memory::cognition::{lexical_rank, rrf_fuse_weighted};
 
         if query.trim().is_empty() || k == 0 {
             let mems = self.memory_store.list_active(scope, k.max(1)).await?;
@@ -1917,15 +1917,20 @@ impl StrataEngine {
             }
         }
 
-        let mut rankings: Vec<Vec<uuid::Uuid>> = Vec::new();
+        // Weighted-RRF arms: the vector arm gets `retrieval_vector_weight`, the lexical (BM25) and
+        // graph arms share `retrieval_lexical_weight` (both keyword-derived). Defaults are 1/1 =
+        // plain equal-weight RRF; raise the vector weight when the embedder is strong and BM25 noisy.
+        let w_vec = cog.retrieval_vector_weight;
+        let w_lex = cog.retrieval_lexical_weight;
+        let mut rankings: Vec<(Vec<uuid::Uuid>, f32)> = Vec::new();
         if !vec_ids.is_empty() {
-            rankings.push(vec_ids);
+            rankings.push((vec_ids, w_vec));
         }
         if !lex_ids.is_empty() {
-            rankings.push(lex_ids);
+            rankings.push((lex_ids, w_lex));
         }
         if !graph_ids.is_empty() {
-            rankings.push(graph_ids);
+            rankings.push((graph_ids, w_lex));
         }
 
         // Nothing matched lexically or by vector → fall back to importance/recency.
@@ -1943,7 +1948,7 @@ impl StrataEngine {
         // facts" assistants want them higher.
         let w_imp = cog.retrieval_importance_weight;
         let w_rec = cog.retrieval_recency_weight;
-        let fused = rrf_fuse(&rankings, Self::MEMORY_RRF_K, pool);
+        let fused = rrf_fuse_weighted(&rankings, Self::MEMORY_RRF_K, pool);
         let now = chrono::Utc::now();
         let mut scored: Vec<MemoryHit> = Vec::with_capacity(fused.len());
         for (id, rrf) in fused {

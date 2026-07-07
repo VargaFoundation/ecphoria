@@ -159,6 +159,14 @@ pub struct CognitionConfig {
     /// toward 0 lets pure relevance rank; raise them for assistants that should prefer fresh facts.
     #[serde(default = "default_recency_weight")]
     pub retrieval_recency_weight: f32,
+    /// Weighted-RRF fusion weight of the **vector** arm in hybrid retrieval. Default 1.0 (equal to
+    /// the lexical arm = plain RRF). Raise it when the embedding model is strong and BM25 is noisy.
+    #[serde(default = "default_arm_weight")]
+    pub retrieval_vector_weight: f32,
+    /// Weighted-RRF fusion weight of the **lexical** (BM25) arm — also applied to the
+    /// graph-expansion arm (both keyword-derived). Default 1.0.
+    #[serde(default = "default_arm_weight")]
+    pub retrieval_lexical_weight: f32,
 }
 
 impl Default for CognitionConfig {
@@ -180,6 +188,8 @@ impl Default for CognitionConfig {
             auto_graph: false,
             retrieval_importance_weight: default_importance_weight(),
             retrieval_recency_weight: default_recency_weight(),
+            retrieval_vector_weight: default_arm_weight(),
+            retrieval_lexical_weight: default_arm_weight(),
         }
     }
 }
@@ -192,6 +202,11 @@ fn default_importance_weight() -> f32 {
 /// Default weight of recency in the retrieval blend.
 fn default_recency_weight() -> f32 {
     0.2
+}
+
+/// Default weighted-RRF weight for a retrieval arm (1.0 = equal weight = plain RRF).
+fn default_arm_weight() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]

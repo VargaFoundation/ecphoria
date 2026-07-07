@@ -207,6 +207,15 @@ fn apply_env(config: &mut CoreConfig) {
         &mut config.memory.cognition.retrieval_recency_weight,
         "STRATA_COGNITION__RETRIEVAL_RECENCY_WEIGHT",
     );
+    // Weighted-RRF arm weights (for A/B: default 1/1 = equal, e.g. vector=2 lexical=1 favours vector).
+    set_f32(
+        &mut config.memory.cognition.retrieval_vector_weight,
+        "STRATA_COGNITION__RETRIEVAL_VECTOR_WEIGHT",
+    );
+    set_f32(
+        &mut config.memory.cognition.retrieval_lexical_weight,
+        "STRATA_COGNITION__RETRIEVAL_LEXICAL_WEIGHT",
+    );
 }
 
 fn load_dataset() -> Vec<Conversation> {
