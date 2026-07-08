@@ -283,17 +283,12 @@ impl MemStore {
             // Events are already fully formed (ids + timestamps fixed by the leader), so apply
             // is deterministic across nodes.
             AppRequest::Ingest { events, tenant } => {
-                let n = match tenant {
-                    Some(t) => {
-                        engine
-                            .ingest_for_tenant(
-                                events.clone(),
-                                &strata_core::config::TenantContext::new(t.clone()),
-                            )
-                            .await?
-                    }
-                    None => engine.ingest(events.clone()).await?,
-                };
+                // Episodic append ONLY — deterministic. Vectors are indexed locally + best-effort by
+                // the background reindex loop, so apply makes no external, non-deterministic
+                // embedding call (which would diverge the index across nodes and stall apply).
+                let n = engine
+                    .ingest_replicated(events.clone(), tenant.as_deref())
+                    .await?;
                 AppResponse::Ingested(n)
             }
             AppRequest::StateSet {

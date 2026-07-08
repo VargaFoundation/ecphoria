@@ -1255,6 +1255,29 @@ impl StrataEngine {
         self.ingest.ingest(events).await
     }
 
+    /// Append fully-materialized events to episodic ONLY (no embedding) — the deterministic write
+    /// used on the Raft apply path. Tags `_tenant_id` (if scoped) at insert time like
+    /// `ingest_for_tenant`, but leaves vector indexing to the local background reindex loop, so
+    /// apply stays a pure function of the request (no external, non-deterministic embedding call
+    /// that would diverge the index across nodes or stall the apply loop on a hung provider).
+    pub async fn ingest_replicated(
+        &self,
+        mut events: Vec<Event>,
+        tenant: Option<&str>,
+    ) -> Result<u64> {
+        if let Some(t) = tenant {
+            for event in &mut events {
+                if let serde_json::Value::Object(ref mut map) = event.payload {
+                    map.insert(
+                        "_tenant_id".to_string(),
+                        serde_json::Value::String(t.to_string()),
+                    );
+                }
+            }
+        }
+        self.ingest.ingest_episodic_only(events).await
+    }
+
     /// Query events by source.
     pub async fn query_by_source(&self, source: &str, limit: usize) -> Result<Vec<Event>> {
         let limit = limit.min(self.config.query.max_rows);
