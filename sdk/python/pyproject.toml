@@ -21,7 +21,7 @@ Documentation = "https://github.com/VargaFoundation/strata/tree/main/sdk/python"
 
 [project.optional-dependencies]
 dev = ["pytest"]
-langchain = ["langchain-core>=0.1"]
+langchain = ["langchain-core>=1.4.9"]
 llama-index = ["llama-index-core>=0.10"]
 
 [tool.pytest.ini_options]
