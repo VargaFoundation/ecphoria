@@ -5601,6 +5601,7 @@ dependencies = [
  "serde_json",
  "strata-core",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

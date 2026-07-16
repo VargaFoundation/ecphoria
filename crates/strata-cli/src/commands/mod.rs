@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod backup;
+pub mod doctor;
 pub mod export;
 pub mod ingest;
 pub mod query;
@@ -34,6 +35,12 @@ pub enum Command {
         /// Entity ID to export
         #[arg(long)]
         entity: String,
+    },
+    /// Lint a strata.toml (+ STRATA_* env) for misconfigurations — no server needed
+    Doctor {
+        /// Path to the config file (default: strata.toml, or STRATA_CONFIG)
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Interactive SQL shell (REPL)
     Shell,
@@ -139,6 +146,7 @@ pub enum MemoryCmd {
 pub async fn execute(cmd: Command, url: &str) -> anyhow::Result<()> {
     match cmd {
         Command::Status => status::run(url).await,
+        Command::Doctor { config } => doctor::run(config.as_deref()).await,
         Command::Query { sql } => query::run(url, &sql).await,
         Command::Ingest { source, file } => ingest::run(url, &source, &file).await,
         Command::Export { entity } => export::run(url, &entity).await,

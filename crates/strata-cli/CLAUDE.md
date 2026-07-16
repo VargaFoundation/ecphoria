@@ -9,6 +9,7 @@ Binary name: `strata`.
 
 ```
 strata status                          # server health check
+strata doctor [--config strata.toml]   # lint config for misconfigs (local, no server)
 strata query "SELECT ..."              # execute SQL
 strata ingest --source X --file Y      # bulk ingest
 strata export --entity ID              # GDPR data export
