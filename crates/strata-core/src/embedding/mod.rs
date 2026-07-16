@@ -1,3 +1,4 @@
+pub mod local;
 pub mod ollama;
 pub mod openai;
 pub mod provider;

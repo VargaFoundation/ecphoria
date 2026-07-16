@@ -11,6 +11,13 @@ description = "Main server binary for the Strata context lake"
 name = "strata-server"
 path = "src/main.rs"
 
+[features]
+# Passthrough to strata-core's optional local ONNX backends (off by default; each pulls a heavy
+# native onnxruntime dep + model download). Build e.g.:
+#   cargo build -p strata-server --release --features embed-local
+embed-local = ["strata-core/embed-local"]
+rerank-local = ["strata-core/rerank-local"]
+
 [dependencies]
 strata-core.workspace = true
 strata-gateway.workspace = true

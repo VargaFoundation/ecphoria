@@ -30,7 +30,10 @@ db_path = "./data/state.db"
 # decay_interval_secs = 0        # >0 → leader forgets decayed memories on this interval (0 = off)
 
 [embedding]
-provider = "ollama"            # "ollama" | "openai"
+provider = "ollama"            # "ollama" | "openai" | "local" | "none"
+# "local" = in-process ONNX embeddings (no sidecar) — build with `--features embed-local`.
+#   Then set model to one of: bge-small-en (384) | bge-base-en (768) | all-minilm (384) |
+#   multilingual-e5-small (384) | nomic-embed (768), and set `dimension` to match.
 model = "nomic-embed-text"
 dimension = 768
 batch_size = 64

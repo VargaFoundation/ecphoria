@@ -241,6 +241,38 @@ impl StrataEngine {
                     .with_prefixes(qp, dp),
                 ))
             }
+            // In-process ONNX embeddings (no sidecar) — requires the `embed-local` build feature.
+            "local" | "fastembed" => {
+                #[cfg(feature = "embed-local")]
+                {
+                    let (qp, dp) = config.embedding.resolved_prefixes();
+                    match crate::embedding::local::FastEmbedProvider::new(
+                        &config.embedding.model,
+                        qp,
+                        dp,
+                    ) {
+                        Ok(p) => {
+                            tracing::info!(
+                                model = %config.embedding.model,
+                                dimension = p.dimension(),
+                                "embedding provider: local (in-process ONNX)"
+                            );
+                            Some(Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to load local embedding model — auto-embedding disabled");
+                            None
+                        }
+                    }
+                }
+                #[cfg(not(feature = "embed-local"))]
+                {
+                    tracing::warn!(
+                        "embedding.provider='local' requires building with `--features embed-local`; auto-embedding disabled"
+                    );
+                    None
+                }
+            }
             "none" | "" => {
                 tracing::info!("embedding provider: none (semantic search disabled)");
                 tracing::info!("  → to enable: set STRATA_EMBEDDING__PROVIDER=ollama or openai");
@@ -251,7 +283,7 @@ impl StrataEngine {
                     provider = %other,
                     "unknown embedding provider, auto-embedding disabled"
                 );
-                tracing::info!("  → supported providers: ollama, openai, none");
+                tracing::info!("  → supported providers: ollama, openai, local, none");
                 None
             }
         };
