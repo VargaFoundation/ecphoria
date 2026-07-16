@@ -167,6 +167,12 @@ pub struct CognitionConfig {
     /// graph-expansion arm (both keyword-derived). Default 1.0.
     #[serde(default = "default_arm_weight")]
     pub retrieval_lexical_weight: f32,
+    /// Human-in-the-loop contradiction review. When true, a subject contradiction does NOT
+    /// auto-supersede the prior memory — both stay active and the conflict surfaces in the review
+    /// queue (`memory_contradictions`) for a human to resolve. Off by default (deterministic
+    /// auto-supersession, today's behavior).
+    #[serde(default)]
+    pub contradiction_review: bool,
 }
 
 impl Default for CognitionConfig {
@@ -190,6 +196,7 @@ impl Default for CognitionConfig {
             retrieval_recency_weight: default_recency_weight(),
             retrieval_vector_weight: default_arm_weight(),
             retrieval_lexical_weight: default_arm_weight(),
+            contradiction_review: false,
         }
     }
 }

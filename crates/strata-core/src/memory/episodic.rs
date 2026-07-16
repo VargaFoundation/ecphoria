@@ -1122,6 +1122,68 @@ impl Default for EpisodicStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// A shared in-memory store seeded with one row for `VICTIM`, built once for the isolation
+    /// property test (rebuilding DuckDB per proptest case would be far too slow).
+    const VICTIM: &str = "victim-tenant";
+    fn isolation_fixture() -> &'static (tokio::runtime::Runtime, EpisodicStore) {
+        static FIXTURE: std::sync::OnceLock<(tokio::runtime::Runtime, EpisodicStore)> =
+            std::sync::OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let store = EpisodicStore::new();
+            rt.block_on(store.append(&[make_event("secret-src", "e")]))
+                .unwrap();
+            {
+                let db = store.write_conn();
+                db.execute(
+                    "UPDATE episodic SET tenant_id = ? WHERE source = 'secret-src'",
+                    duckdb::params![VICTIM],
+                )
+                .unwrap();
+            }
+            (rt, store)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        /// No fuzzed tenant string — including SQL metacharacters, quotes, and unicode — may ever
+        /// read another tenant's rows through the AST rewriter. This is the isolation-boundary
+        /// injection defense; a failure here is a cross-tenant leak.
+        #[test]
+        fn fuzzed_tenant_id_never_leaks_victim_rows(attacker in "\\PC{0,64}") {
+            prop_assume!(attacker != VICTIM);
+            let (_rt, store) = isolation_fixture();
+            // Must never panic; on any parse/scope failure it fails closed (Err → no rows).
+            let rows = store
+                .query_sql_for_tenant("SELECT source FROM episodic", &attacker, 100)
+                .unwrap_or_default();
+            prop_assert!(
+                rows.is_empty(),
+                "tenant {:?} leaked {} victim row(s)",
+                attacker,
+                rows.len()
+            );
+        }
+
+        /// The rewriter, for any tenant, must rewrite a bare `episodic` reference to that tenant's
+        /// namespaced view — never leaving an unscoped `FROM episodic` that would read all tenants.
+        #[test]
+        fn rewriter_always_scopes_episodic(tenant in "\\PC{1,48}") {
+            if let Ok(sql) = EpisodicStore::scope_sql_to_view("SELECT source FROM episodic", &tenant) {
+                let expected_view = EpisodicStore::tenant_view_name(&tenant);
+                prop_assert!(
+                    sql.contains(&expected_view),
+                    "rewrite {:?} did not scope to the tenant view {:?}",
+                    sql,
+                    expected_view
+                );
+            }
+        }
+    }
 
     fn make_event(source: &str, event_type: &str) -> Event {
         Event {

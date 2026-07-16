@@ -191,6 +191,38 @@ fn normalize_generic(source: &str, payload: &serde_json::Value) -> crate::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// A bounded arbitrary `serde_json::Value` strategy (depth-limited) for fuzzing the webhook
+    /// normalizers — which parse attacker-controlled vendor payloads.
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::from),
+            any::<i64>().prop_map(serde_json::Value::from),
+            ".*".prop_map(serde_json::Value::from),
+        ];
+        leaf.prop_recursive(4, 32, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map(".*", inner, 0..8)
+                    .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        /// The webhook normalizers must never panic on arbitrary vendor JSON — a webhook endpoint is
+        /// internet-facing, so a panic on crafted input would be a DoS. Every source is exercised.
+        #[test]
+        fn normalizers_never_panic(payload in arb_json()) {
+            for source in ["github", "sentry", "slack", "pagerduty", "unknown-vendor"] {
+                let _ = normalize_webhook(source, &payload);
+            }
+        }
+    }
 
     #[test]
     fn normalize_github_push() {

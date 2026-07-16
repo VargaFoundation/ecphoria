@@ -12,5 +12,8 @@ pub mod runtime;
 pub mod storage;
 
 pub use config::CoreConfig;
-pub use engine::{FeedbackAction, MemoryChange, MemoryFeedback, MemoryProvenance, StrataEngine};
+pub use engine::{
+    ContradictionGroup, FeedbackAction, MemoryChange, MemoryFeedback, MemoryProvenance,
+    StrataEngine,
+};
 pub use error::{Error, Result};

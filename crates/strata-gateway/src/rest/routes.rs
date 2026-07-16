@@ -170,6 +170,14 @@ pub fn router_with_engine_and_auth(
             axum::routing::get(handlers::memory_watch),
         )
         .route(
+            "/memories/contradictions",
+            axum::routing::get(handlers::memory_contradictions),
+        )
+        .route(
+            "/memories/contradictions/resolve",
+            axum::routing::post(handlers::memory_resolve_contradiction),
+        )
+        .route(
             "/admin/memory/decay",
             axum::routing::post(handlers::memory_decay),
         )

@@ -175,6 +175,30 @@ pub struct MemoryFeedbackRequest {
     pub verdict: String,
 }
 
+/// Scope query for the contradiction review queue.
+#[derive(Debug, Deserialize)]
+pub struct ContradictionsQuery {
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Resolve a contradiction: keep `keep_id`, supersede the other active memories for `subject`.
+#[derive(Debug, Deserialize)]
+pub struct ResolveContradictionRequest {
+    pub subject: String,
+    pub keep_id: uuid::Uuid,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Create an agent/workflow run.
 #[derive(Debug, Deserialize)]
 pub struct CreateRunRequest {

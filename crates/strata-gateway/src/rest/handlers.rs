@@ -1700,6 +1700,85 @@ pub async fn memory_feedback(
     }
 }
 
+/// GET /api/v1/memories/contradictions — the HITL review queue.
+///
+/// Lists subjects with more than one active memory (only possible under
+/// `cognition.contradiction_review`), each group awaiting resolution. Tenant/scope from the token.
+pub async fn memory_contradictions(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(q): axum::extract::Query<ContradictionsQuery>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_contradictions")
+        .increment(1);
+    let scope = scope_from(
+        &auth,
+        None,
+        q.user_id.as_deref(),
+        q.agent_id.as_deref(),
+        q.session_id.as_deref(),
+    );
+    match engine.memory_contradictions(&scope).await {
+        Ok(groups) => {
+            api_ok(serde_json::json!({ "contradictions": groups, "count": groups.len() }))
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// POST /api/v1/memories/contradictions/resolve — resolve a contradiction by keeping one memory and
+/// superseding the others for that subject. Replicated in cluster mode.
+pub async fn memory_resolve_contradiction(
+    State(engine): State<Arc<StrataEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
+    Json(req): Json<ResolveContradictionRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_resolve_contradiction")
+        .increment(1);
+    let scope = scope_from(
+        &auth,
+        None,
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let rows = match engine
+        .memory_resolve_plan(&scope, &req.subject, req.keep_id)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "RESOLVE_ERROR", e.to_string()),
+    };
+    let superseded = rows.len();
+
+    if let Some(Extension(coord)) = cluster {
+        return match coord
+            .read()
+            .await
+            .client_write(strata_cluster::raft::types::AppRequest::MemoryUpsert { rows })
+            .await
+        {
+            Ok(_) => api_ok(serde_json::json!({ "kept": req.keep_id, "superseded": superseded })),
+            Err(e) => cluster_write_error(e),
+        };
+    }
+    match engine.memory_apply_rows(rows).await {
+        Ok(_) => api_ok(serde_json::json!({ "kept": req.keep_id, "superseded": superseded })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// Forget low-value memories via time-decay of importance (admin).
 ///
 /// POST /api/v1/admin/memory/decay

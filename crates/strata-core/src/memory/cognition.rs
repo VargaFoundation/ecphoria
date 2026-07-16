@@ -389,6 +389,9 @@ pub enum MemoryOutcome {
     Merged,
     /// A contradicting memory was superseded and a new one inserted.
     Superseded,
+    /// A contradiction was detected but NOT auto-resolved (HITL review mode): the new memory was
+    /// inserted alongside the prior one(s) for a human to resolve via the review queue.
+    Conflict,
 }
 
 /// Result of adding a memory through the cognition pipeline.
@@ -433,6 +436,19 @@ fn stem(w: &str) -> String {
         return w[..n - 1].to_string();
     }
     w.to_string()
+}
+
+/// Canonicalize a memory `subject` key so casing/whitespace differences don't spawn parallel
+/// active memories for the same fact: lowercase, trim, and collapse internal whitespace runs to a
+/// single space. Structural characters (`.`, `_`) are preserved — `user.city` stays `user.city`.
+/// Applied consistently at write and lookup so `"Plan"`, `"plan"`, and `" plan "` resolve to one
+/// subject (deterministic; idempotent).
+pub fn normalize_subject(subject: &str) -> String {
+    subject
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Tokenize for BM25 + graph matching: split on non-alphanumerics, lowercase, drop stop words, and
@@ -1723,6 +1739,15 @@ mod tests {
         let loaded = store.load_active_with_embeddings().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn normalize_subject_canonicalizes() {
+        assert_eq!(normalize_subject("Plan"), "plan");
+        assert_eq!(normalize_subject("  Favorite   Color "), "favorite color");
+        assert_eq!(normalize_subject("user.City"), "user.city");
+        // Idempotent.
+        assert_eq!(normalize_subject(&normalize_subject("Plan")), "plan");
     }
 
     #[test]

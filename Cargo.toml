@@ -109,6 +109,7 @@ mimalloc = { version = "0.1", default-features = false }
 # Testing
 tempfile = { version = "3" }
 criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = { version = "1" }
 
 [profile.dev]
 # Lighter debug info: keeps file:line in backtraces (panics, RUST_BACKTRACE),

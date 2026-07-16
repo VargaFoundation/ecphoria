@@ -34,6 +34,14 @@ pub struct MemoryProvenance {
     pub history: Vec<Memory>,
 }
 
+/// A group of conflicting active memories for one subject, awaiting human resolution (HITL
+/// contradiction review — see [`StrataEngine::memory_contradictions`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContradictionGroup {
+    pub subject: String,
+    pub memories: Vec<Memory>,
+}
+
 /// A memory lifecycle change emitted on the CDC stream (see [`StrataEngine::memory_subscribe`]).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemoryChange {
@@ -1896,6 +1904,13 @@ impl StrataEngine {
         if input.scope.tenant_id.is_empty() {
             input.scope.tenant_id = "default".into();
         }
+        // Canonicalize the subject once, up front: both the contradiction lookup
+        // (`find_active_by_subject`) and the stored `mem.subject` then use the same normalized key,
+        // so "Plan"/"plan"/" plan " resolve to a single active memory instead of coexisting.
+        input.subject = input
+            .subject
+            .map(|s| crate::memory::cognition::normalize_subject(&s))
+            .filter(|s| !s.is_empty());
         let cog = &self.config.memory.cognition;
         let importance = input.importance.unwrap_or(cog.default_importance);
         // Embedding is best-effort: the deterministic paths work without it. Memory content is an
@@ -1944,6 +1959,31 @@ impl StrataEngine {
                         }],
                     ));
                 }
+                // HITL review mode: a contradiction does NOT auto-supersede. Insert the new memory
+                // as active alongside the prior one(s); the (scope, subject) now has multiple active
+                // memories, which surfaces in the review queue (`memory_contradictions`) for a human
+                // to resolve. Deterministic (no supersession rows), so Raft apply stays identical.
+                if cog.contradiction_review {
+                    let mut mem = Memory::new(input.scope.clone(), input.content.clone());
+                    mem.subject = Some(subject);
+                    mem.importance = importance;
+                    mem.source_event_ids = input.source_event_ids.clone();
+                    mem.metadata = input.metadata.clone();
+                    if let Some(t) = &input.mem_type {
+                        mem.mem_type = t.clone();
+                    }
+                    return Ok((
+                        MemoryAdd {
+                            memory: mem.clone(),
+                            outcome: MemoryOutcome::Conflict,
+                        },
+                        vec![MemoryRow {
+                            memory: mem,
+                            embedding: embedding.clone(),
+                        }],
+                    ));
+                }
+
                 // Contradiction: supersede every active memory for this subject, insert new.
                 let now = chrono::Utc::now();
                 let mut rows: Vec<MemoryRow> = Vec::with_capacity(actives.len() + 1);
@@ -2403,19 +2443,89 @@ impl StrataEngine {
         }))
     }
 
-    /// Full temporal history for a `(scope, subject)` — every version, oldest first.
+    /// Full temporal history for a `(scope, subject)` — every version, oldest first. The subject is
+    /// normalized to match the canonical key used at write time.
     pub async fn memory_history(&self, scope: &MemoryScope, subject: &str) -> Result<Vec<Memory>> {
-        self.memory_store.history(scope, subject).await
+        let subject = crate::memory::cognition::normalize_subject(subject);
+        self.memory_store.history(scope, &subject).await
     }
 
-    /// The memory that was valid for a `(scope, subject)` at instant `at` (bi-temporal).
+    /// The memory that was valid for a `(scope, subject)` at instant `at` (bi-temporal). The subject
+    /// is normalized to match the canonical key used at write time.
     pub async fn memory_as_of(
         &self,
         scope: &MemoryScope,
         subject: &str,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<Memory>> {
-        self.memory_store.as_of(scope, subject, at).await
+        let subject = crate::memory::cognition::normalize_subject(subject);
+        self.memory_store.as_of(scope, &subject, at).await
+    }
+
+    /// The contradiction review queue for a scope: subjects that currently have **more than one**
+    /// active memory (only possible under `cognition.contradiction_review`, where contradictions are
+    /// not auto-superseded). Each group is the set of conflicting active memories for one subject,
+    /// awaiting human resolution via [`Self::memory_resolve_plan`].
+    pub async fn memory_contradictions(
+        &self,
+        scope: &MemoryScope,
+    ) -> Result<Vec<ContradictionGroup>> {
+        let actives = self
+            .memory_store
+            .list_active(scope, self.config.query.max_rows)
+            .await?;
+        let mut by_subject: std::collections::HashMap<String, Vec<Memory>> =
+            std::collections::HashMap::new();
+        for m in actives {
+            if let Some(subj) = m.subject.clone() {
+                by_subject.entry(subj).or_default().push(m);
+            }
+        }
+        let mut groups: Vec<ContradictionGroup> = by_subject
+            .into_iter()
+            .filter(|(_, ms)| ms.len() > 1)
+            .map(|(subject, memories)| ContradictionGroup { subject, memories })
+            .collect();
+        groups.sort_by(|a, b| a.subject.cmp(&b.subject));
+        Ok(groups)
+    }
+
+    /// Resolve a contradiction by keeping `keep_id` and superseding the other active memories for
+    /// `(scope, subject)`. Returns the materialized superseded rows (apply with
+    /// [`Self::memory_apply_rows`] locally, or replicate as `MemoryUpsert` in cluster mode). Errors
+    /// if `keep_id` is not one of the subject's active memories (fail-closed — no partial resolve).
+    pub async fn memory_resolve_plan(
+        &self,
+        scope: &MemoryScope,
+        subject: &str,
+        keep_id: uuid::Uuid,
+    ) -> Result<Vec<MemoryRow>> {
+        let subject = crate::memory::cognition::normalize_subject(subject);
+        let actives = self
+            .memory_store
+            .find_active_by_subject(scope, &subject)
+            .await?;
+        if !actives.iter().any(|m| m.id == keep_id) {
+            return Err(crate::Error::State(format!(
+                "keep_id {keep_id} is not an active memory for subject '{subject}' in this scope"
+            )));
+        }
+        let now = chrono::Utc::now();
+        let rows = actives
+            .into_iter()
+            .filter(|m| m.id != keep_id)
+            .map(|mut loser| {
+                loser.state = MemoryState::Superseded;
+                loser.valid_to = Some(now);
+                loser.updated_at = now;
+                loser.supersedes = Some(keep_id);
+                MemoryRow {
+                    memory: loser,
+                    embedding: None,
+                }
+            })
+            .collect();
+        Ok(rows)
     }
 
     /// Delete a memory (and its vector).
@@ -3870,6 +3980,92 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn contradiction_review_queues_then_resolves() {
+        let mut cfg = inmem_config();
+        cfg.memory.cognition.contradiction_review = true;
+        let engine = StrataEngine::new(cfg).await.unwrap();
+        let scope = MemoryScope::user("alice");
+
+        let first = engine
+            .memory_add(MemoryInput::new(scope.clone(), "on the pro plan").with_subject("plan"))
+            .await
+            .unwrap();
+        // In review mode a contradiction does NOT auto-supersede — it flags a Conflict.
+        let second = engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), "upgraded to enterprise").with_subject("plan"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.outcome, MemoryOutcome::Conflict);
+        // Both are active.
+        assert_eq!(engine.memory_all(&scope, 10).await.unwrap().len(), 2);
+
+        // The review queue surfaces the conflicting subject.
+        let queue = engine.memory_contradictions(&scope).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].subject, "plan");
+        assert_eq!(queue[0].memories.len(), 2);
+
+        // Resolve: keep the newer memory, supersede the other.
+        let rows = engine
+            .memory_resolve_plan(&scope, "plan", second.memory.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        engine.memory_apply_rows(rows).await.unwrap();
+
+        // Now a single active memory, and the queue is empty.
+        let active = engine.memory_all(&scope, 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].content, "upgraded to enterprise");
+        assert!(engine
+            .memory_contradictions(&scope)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Resolving with an id that isn't active for the subject is rejected (fail-closed).
+        assert!(engine
+            .memory_resolve_plan(&scope, "plan", first.memory.id)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn subject_casing_variants_contradict_not_coexist() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+
+        // Same subject, different casing/whitespace → must be treated as ONE subject.
+        let first = engine
+            .memory_add(MemoryInput::new(scope.clone(), "blue").with_subject("Favorite Color"))
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, MemoryOutcome::Inserted);
+        let second = engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), "green").with_subject("  favorite   color "),
+            )
+            .await
+            .unwrap();
+        // Contradiction resolved rather than a parallel active memory created.
+        assert_eq!(second.outcome, MemoryOutcome::Superseded);
+
+        let active = engine.memory_all(&scope, 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].content, "green");
+        assert_eq!(active[0].subject.as_deref(), Some("favorite color"));
+
+        // History is retrievable via any casing (normalized at query time too).
+        let hist = engine
+            .memory_history(&scope, "FAVORITE color")
+            .await
+            .unwrap();
+        assert_eq!(hist.len(), 2);
     }
 
     #[tokio::test]
