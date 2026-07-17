@@ -112,6 +112,15 @@ pub struct MemoryAddRequest {
     pub mem_type: Option<String>,
 }
 
+/// Re-embed active memories with the currently-configured provider (after a model/dimension change).
+#[derive(Debug, Deserialize)]
+pub struct MemoryReembedRequest {
+    /// Re-embed at most this many memories (oldest-updated first). Defaults to 1000. Call repeatedly
+    /// to page through a larger corpus.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Consolidate a scope's lowest-importance memories into one summary.
 #[derive(Debug, Deserialize)]
 pub struct MemoryConsolidateRequest {

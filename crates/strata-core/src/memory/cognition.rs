@@ -1578,6 +1578,24 @@ impl MemoryStore {
             .collect())
     }
 
+    /// List active memories across **all** scopes, ordered by `updated_at` ascending (oldest first),
+    /// bounded by `limit`. The stable oldest-first order lets a re-embedding job page deterministically
+    /// through the corpus. Cross-tenant by design — callers with tenant scope must filter.
+    pub async fn all_active(&self, limit: usize) -> crate::Result<Vec<Memory>> {
+        let db = self.read_conn();
+        let sql = format!(
+            "SELECT {} FROM memories WHERE state = 'active' ORDER BY updated_at ASC LIMIT ?",
+            Self::SELECT_COLS
+        );
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map([limit as i64], Self::parse_memory)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Load just the persisted embedding for a memory id (None if absent/null). Used to preserve
     /// an existing vector when re-materializing a memory that wasn't re-embedded.
     pub async fn get_embedding(&self, id: Uuid) -> crate::Result<Option<Vec<f32>>> {

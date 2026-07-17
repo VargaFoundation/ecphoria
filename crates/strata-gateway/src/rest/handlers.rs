@@ -1933,6 +1933,60 @@ pub async fn memory_resolve_contradiction(
     }
 }
 
+/// Re-embed active memories with the currently-configured provider (admin).
+///
+/// Run after switching embedding model/dimension so existing memories are searchable under the new
+/// vectors. Recomputes up to `limit` memories' vectors (oldest-updated first, so repeated calls page
+/// forward through the corpus) and re-indexes them. In cluster mode the leader computes the fresh
+/// vectors and replicates the rows via Raft so every node re-indexes identically.
+///
+/// POST /api/v1/admin/memory/reembed  { "limit": 1000 }
+pub async fn memory_reembed(
+    State(engine): State<Arc<StrataEngine>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<strata_cluster::ClusterCoordinator>>>,
+    >,
+    Json(req): Json<MemoryReembedRequest>,
+) -> Response {
+    metrics::counter!("strata_rest_requests_total", "endpoint" => "memory_reembed").increment(1);
+    let limit = req.limit.unwrap_or(1000);
+
+    let rows = match engine.memory_reembed_plan(limit).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REEMBED_ERROR",
+                e.to_string(),
+            )
+        }
+    };
+    let reembedded = rows.len();
+    if reembedded == 0 {
+        return api_ok(serde_json::json!({ "reembedded": 0 }));
+    }
+
+    if let Some(Extension(coord)) = cluster {
+        return match coord
+            .read()
+            .await
+            .client_write(strata_cluster::raft::types::AppRequest::MemoryUpsert { rows })
+            .await
+        {
+            Ok(_) => api_ok(serde_json::json!({ "reembedded": reembedded })),
+            Err(e) => cluster_write_error(e),
+        };
+    }
+    match engine.memory_apply_rows(rows).await {
+        Ok(_) => api_ok(serde_json::json!({ "reembedded": reembedded })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// Forget low-value memories via time-decay of importance (admin).
 ///
 /// POST /api/v1/admin/memory/decay

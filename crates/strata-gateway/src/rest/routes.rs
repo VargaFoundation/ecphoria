@@ -182,6 +182,10 @@ pub fn router_with_engine_and_auth(
             axum::routing::post(handlers::memory_decay),
         )
         .route(
+            "/admin/memory/reembed",
+            axum::routing::post(handlers::memory_reembed),
+        )
+        .route(
             "/admin/memory/consolidate",
             axum::routing::post(handlers::memory_consolidate),
         )

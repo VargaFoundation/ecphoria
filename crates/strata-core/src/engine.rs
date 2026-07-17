@@ -3058,6 +3058,50 @@ impl StrataEngine {
         Ok(out)
     }
 
+    /// Re-embed active memories with the currently-configured provider — run this after switching
+    /// embedding model or dimension so existing memories are searchable under the new vectors.
+    ///
+    /// Fetches up to `limit` active memories (oldest-updated first, so repeated calls page forward),
+    /// recomputes each vector from the memory's content, and returns the refreshed [`MemoryRow`]s
+    /// (state unchanged = Active, so applying re-persists the row and re-indexes its vector). Writes
+    /// nothing — the gateway applies locally via [`Self::memory_apply_rows`] or, in cluster mode,
+    /// replicates the rows through Raft (`MemoryUpsert`) so every node re-indexes identically. Empty
+    /// if no embedding provider is configured. A per-memory embedding failure skips that memory
+    /// (leaving its old vector intact) rather than dropping it.
+    pub async fn memory_reembed_plan(&self, limit: usize) -> Result<Vec<MemoryRow>> {
+        if self.embedding.is_none() {
+            return Ok(Vec::new());
+        }
+        let memories = self.memory_store.all_active(limit).await?;
+        let mut rows = Vec::with_capacity(memories.len());
+        for memory in memories {
+            match self.embed_document_text(&memory.content).await {
+                Ok(embedding) => rows.push(MemoryRow {
+                    memory,
+                    embedding: Some(embedding),
+                }),
+                Err(e) => {
+                    metrics::counter!("strata_memory_embed_failures_total", "op" => "reembed")
+                        .increment(1);
+                    tracing::warn!(id = %memory.id, error = %e, "re-embed failed; keeping prior vector");
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Re-embed active memories and apply the refreshed vectors locally (single-node convenience).
+    /// Returns the number of memories re-embedded. In cluster mode use [`Self::memory_reembed_plan`]
+    /// on the leader and replicate the rows instead, so followers re-index the identical vectors.
+    pub async fn memory_reembed(&self, limit: usize) -> Result<usize> {
+        let rows = self.memory_reembed_plan(limit).await?;
+        let n = rows.len();
+        if n > 0 {
+            self.memory_apply_rows(rows).await?;
+        }
+        Ok(n)
+    }
+
     /// Consolidate a scope's lowest-importance memories into one summary memory.
     ///
     /// When the scope has more than `keep` active memories, the lowest-importance tail is summarized
@@ -4292,6 +4336,45 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn memory_reembed_indexes_vectorless_memories() {
+        let mut cfg = inmem_config();
+        cfg.embedding.dimension = 8;
+        let mut engine = StrataEngine::new(cfg).await.unwrap();
+        let scope = MemoryScope::user("alice");
+
+        // Store a memory with NO embedding (as if ingested while the provider was down / before a
+        // model was configured).
+        let m = Memory::new(scope.clone(), "alice prefers window seats");
+        let id = m.id;
+        engine
+            .memory_apply_rows(vec![MemoryRow {
+                memory: m,
+                embedding: None,
+            }])
+            .await
+            .unwrap();
+        assert!(engine
+            .memory_store
+            .get_embedding(id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // No provider yet → reembed is a no-op.
+        assert_eq!(engine.memory_reembed(100).await.unwrap(), 0);
+
+        // Configure a provider and re-embed: the memory now carries a vector.
+        engine.set_embedding_for_test(Arc::new(ConstEmbedding { dim: 8 }));
+        assert_eq!(engine.memory_reembed(100).await.unwrap(), 1);
+        assert!(engine
+            .memory_store
+            .get_embedding(id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
