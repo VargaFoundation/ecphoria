@@ -120,6 +120,10 @@ pub struct StrataEngine {
     /// Optional replicator routing run-ledger writes through Raft (cluster mode), injected by the
     /// server. Absent → the agent driver writes runs/steps locally.
     run_replicator: parking_lot::RwLock<Option<Arc<dyn RunReplicator>>>,
+    /// Cross-scope read authorization backend. Defaults to `LocalGrants` (the tenant-strict
+    /// `memory_grants` table); swappable for a richer/external policy engine via
+    /// [`Self::set_authz_backend`].
+    authz: parking_lot::RwLock<Arc<dyn crate::authz::AuthzBackend>>,
 }
 
 impl std::fmt::Debug for StrataEngine {
@@ -434,6 +438,10 @@ impl StrataEngine {
 
         tracing::info!("Strata engine initialized");
 
+        // Default authorization backend (built before the struct literal moves `memory_store`).
+        let authz: Arc<dyn crate::authz::AuthzBackend> =
+            Arc::new(crate::authz::LocalGrants::new(memory_store.clone()));
+
         Ok(Self {
             config,
             episodic,
@@ -451,6 +459,7 @@ impl StrataEngine {
             memory_change_tx: tokio::sync::broadcast::channel(1024).0,
             tool_executor: parking_lot::RwLock::new(None),
             run_replicator: parking_lot::RwLock::new(None),
+            authz: parking_lot::RwLock::new(authz),
         })
     }
 
@@ -469,6 +478,13 @@ impl StrataEngine {
     /// and survive leader failover. Absent → writes are local.
     pub fn set_run_replicator(&self, replicator: Arc<dyn RunReplicator>) {
         *self.run_replicator.write() = Some(replicator);
+    }
+
+    /// Swap the cross-scope authorization backend (default: `LocalGrants`). Lets a deployment plug
+    /// in a richer/external policy engine (teams/roles, ReBAC/SpiceDB) without touching the read
+    /// path. The backend MUST stay tenant-strict (never widen access across tenants).
+    pub fn set_authz_backend(&self, backend: Arc<dyn crate::authz::AuthzBackend>) {
+        *self.authz.write() = backend;
     }
 
     // ---- Agent-run ledger (agentic-platform substrate) ----
@@ -2534,10 +2550,14 @@ impl StrataEngine {
             } else {
                 scope.tenant_id.as_str()
             };
-            for g in self.memory_store.list_grants(tenant, &grantee).await? {
+            // Resolve the readable grantor users through the pluggable authz backend (default:
+            // LocalGrants over the tenant-strict grants table). A future ReBAC/SpiceDB backend
+            // plugs in here with no change to the read path.
+            let backend = self.authz.read().clone();
+            for grantor in backend.granted_read_scopes(tenant, &grantee).await? {
                 let grantor_scope = MemoryScope {
                     tenant_id: scope.tenant_id.clone(),
-                    user_id: Some(g.grantor_user_id),
+                    user_id: Some(grantor),
                     agent_id: None,
                     session_id: None,
                 };
@@ -4272,6 +4292,42 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn authz_backend_is_pluggable() {
+        // A custom backend that grants read of "bob" to everyone — proves the seam is on the read
+        // path (no DB grant is created; the swap alone changes what shared-search returns).
+        struct AlwaysBob;
+        #[async_trait::async_trait]
+        impl crate::authz::AuthzBackend for AlwaysBob {
+            async fn granted_read_scopes(&self, _t: &str, _u: &str) -> Result<Vec<String>> {
+                Ok(vec!["bob".into()])
+            }
+        }
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let alice = MemoryScope::user("alice");
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::user("bob"),
+                "bob likes sushi",
+            ))
+            .await
+            .unwrap();
+        // Default LocalGrants + no grant → alice sees nothing shared.
+        assert!(engine
+            .memory_search_shared("sushi", &alice, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        // Inject the custom backend → alice now reads bob's memory, with no DB grant.
+        engine.set_authz_backend(std::sync::Arc::new(AlwaysBob));
+        let shared = engine
+            .memory_search_shared("sushi", &alice, 5)
+            .await
+            .unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].memory.content, "bob likes sushi");
     }
 
     #[tokio::test]
