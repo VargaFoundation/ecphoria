@@ -41,6 +41,18 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
 
+  features-local:
+    name: Local ONNX backends (compile guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # embed-local/rerank-local pull fastembed → ort, which downloads a native onnxruntime binary at
+      # build time (needs network — not buildable in an offline sandbox). Compile-check them here so
+      # the feature-gated code can't rot. `cargo check` is enough to type-check against fastembed.
+      - run: cargo check -p strata-core --features embed-local,rerank-local
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -53,8 +65,9 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-      # Guard the optional feature-gated backends so they don't rot (they're not in the default
-      # build). Compile-check embeddings/rerank/OTLP; run the OTLP export test (mock collector).
+      # Guard the optional `otlp` feature (not in the default build) — run its mock-collector export
+      # test so the exporter wiring can't rot. (The `embed-local`/`rerank-local` backends download a
+      # native onnxruntime binary at build time; they're compile-guarded in the dedicated job below.)
       - run: cargo test -p strata-server --features otlp telemetry
         env:
           SCCACHE_GHA_ENABLED: "true"
@@ -197,7 +210,7 @@ jobs:
         run: tail -n 100 /tmp/strata-cluster/node-*/server.log 2>/dev/null || true
 
   cluster-sharded:
-    name: Cluster sharded (2 groups: routing + isolation)
+    name: "Cluster sharded (2 groups: routing + isolation)"
     runs-on: ubuntu-latest
     needs: build
     steps:
