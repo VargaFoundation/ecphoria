@@ -3019,6 +3019,25 @@ impl StrataEngine {
         Ok(out)
     }
 
+    /// Plan `remember` WITHOUT writing: extract facts (LLM or fallback) once on the leader and return
+    /// one `(MemoryAdd, rows)` per fact, so cluster mode can replicate each through the Raft log
+    /// (`MemoryUpsert`) — closing the gap where the MCP `remember` tool wrote only locally. Mirrors
+    /// [`Self::session_distill_plan`].
+    pub async fn memory_remember_plan(
+        &self,
+        raw_text: &str,
+        scope: &MemoryScope,
+    ) -> Result<Vec<(MemoryAdd, Vec<MemoryRow>)>> {
+        let facts = self.extract_facts(raw_text).await;
+        let mut out = Vec::with_capacity(facts.len());
+        for (subject, content) in facts {
+            let mut input = MemoryInput::new(scope.clone(), content);
+            input.subject = subject;
+            out.push(self.memory_plan(input).await?);
+        }
+        Ok(out)
+    }
+
     /// Consolidate a scope's lowest-importance memories into one summary memory.
     ///
     /// When the scope has more than `keep` active memories, the lowest-importance tail is summarized
@@ -4381,6 +4400,23 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn memory_remember_plan_materializes_without_writing() {
+        let engine = StrataEngine::new(inmem_config()).await.unwrap();
+        let scope = MemoryScope::user("alice");
+        // No LLM extraction configured → the text becomes one fact/plan.
+        let plans = engine
+            .memory_remember_plan("alice prefers tea over coffee", &scope)
+            .await
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        let (result, rows) = &plans[0];
+        assert_eq!(result.memory.content, "alice prefers tea over coffee");
+        assert!(!rows.is_empty());
+        // Planning is side-effect-free (the cluster path applies via Raft; nothing written locally).
+        assert_eq!(engine.memory_count().await.unwrap(), 0);
     }
 
     #[tokio::test]

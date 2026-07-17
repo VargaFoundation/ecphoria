@@ -34,8 +34,15 @@ cluster's integrity, (3) secrets (JWT/API keys, provider keys).
 - **Fail-closed:** with `auth_enabled = true` but no api_keys/jwt_secret/OIDC configured, the server
   **refuses to start** (it will not silently run unauthenticated). A `jwt_secret` shorter than 32
   bytes is rejected.
-- **PostgreSQL wire (:5432)** uses a no-op startup handler — it is **not authenticated**. Do **not**
-  expose :5432 outside a trusted network (bind it to localhost or a private subnet / NetworkPolicy).
+- **PostgreSQL wire (:5432)** authenticates when `auth_enabled`: the **password is the API key / JWT**,
+  validated against the same `AuthState` and scoped to the resolved tenant (auth disabled → no
+  password step, dev only). Because the password crosses the wire, **enable TLS** (`[gateway.pg_tls]`
+  `cert_path`/`key_path`) or keep :5432 on a private subnet / NetworkPolicy. Generate a dev cert with
+  `scripts/gen-pg-tls.sh`; in production use a CA-issued cert (cert-manager) and **rotate** it —
+  Strata reads the cert at startup, so rotation is a rolling-restart concern: cert-manager renews the
+  Secret + [Stakater Reloader](https://github.com/stakater/Reloader) (`reloader.stakater.com/auto:
+  "true"`, exposed via the chart's `podAnnotations`) restarts the pods on change (same pattern as the
+  Raft certs).
 - `/health`, `/ready`, `/metrics` are intentionally unauthenticated (probes / Prometheus scraping);
   restrict them with network policy.
 

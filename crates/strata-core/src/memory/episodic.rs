@@ -739,7 +739,7 @@ impl EpisodicStore {
             }
             let mut obj = serde_json::Map::new();
             for (i, name) in column_names.iter().enumerate() {
-                obj.insert(name.clone(), column_to_json(&row, i));
+                obj.insert(name.clone(), column_to_json(row, i));
             }
             results.push(serde_json::Value::Object(obj));
         }

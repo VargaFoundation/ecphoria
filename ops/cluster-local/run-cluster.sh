@@ -55,6 +55,8 @@ for i in $(seq 1 "$NODES"); do
   # semantic index, raft log) is isolated per node — no shared files, no lock conflicts.
   (
     cd "$nodedir"
+    # Throwaway localhost/CI cluster with auth off → opt out of the secure-by-default startup guard
+    # (it otherwise refuses to serve unauthenticated on a non-loopback 0.0.0.0 bind).
     STRATA_CLUSTER__ENABLED=true \
     STRATA_CLUSTER__NODE_ID="$i" \
     STRATA_CLUSTER__LISTEN="0.0.0.0:${raft}" \
@@ -62,6 +64,7 @@ for i in $(seq 1 "$NODES"); do
     STRATA_GATEWAY__LISTEN="0.0.0.0:${http}" \
     STRATA_GATEWAY__PG_LISTEN="0.0.0.0:${pg}" \
     STRATA_GATEWAY__GRPC_LISTEN="0.0.0.0:${grpc}" \
+    STRATA_GATEWAY__ALLOW_INSECURE="${STRATA_GATEWAY__ALLOW_INSECURE:-true}" \
     exec "$BIN" >"$nodedir/server.log" 2>&1
   ) &
   echo "$!" >"$RUN_DIR/node-$i.pid"

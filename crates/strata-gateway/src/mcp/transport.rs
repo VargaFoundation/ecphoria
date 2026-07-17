@@ -585,8 +585,23 @@ async fn call_tool(
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("missing 'text' parameter")?;
+            let scope = scoped_for(args, tenant);
+            // Cluster mode: run extraction+cognition on the leader, replicate each distilled fact's
+            // rows through the Raft log so followers converge (was previously a local-only write).
+            if let Some(coord) = &cluster {
+                let plans = engine
+                    .memory_remember_plan(text, &scope)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut added = Vec::with_capacity(plans.len());
+                for (result, rows) in plans {
+                    mcp_cluster_write(coord, AppRequest::MemoryUpsert { rows }).await?;
+                    added.push(result);
+                }
+                return Ok(serde_json::json!({"remembered": added.len(), "memories": added}));
+            }
             engine
-                .memory_remember(text, &scoped_for(args, tenant))
+                .memory_remember(text, &scope)
                 .await
                 .map(|added| serde_json::json!({"remembered": added.len(), "memories": added}))
                 .map_err(|e| e.to_string())

@@ -8,9 +8,9 @@ the leader, and provides cluster coordination.
 In cluster mode, **ingest, state, and memory writes** are proposed as an `AppRequest` through Raft
 (`coordinator.client_write`) and applied deterministically to every node's `StrataEngine` on
 commit — committed writes survive leader failover. This covers the REST write handlers AND the MCP
-write tools (`ingest`/`set_state`/`add_memory`/`delete_memory`); for `add_memory` the leader runs
-cognition (`memory_plan`) and replicates the materialized rows. The one exception is the MCP
-`remember` tool (LLM extraction) which stays direct + snapshot-replicated. `apply` MUST be
+write tools (`ingest`/`set_state`/`add_memory`/`delete_memory`/`remember`); for `add_memory` and
+`remember` the leader runs cognition + extraction (`memory_plan` / `memory_remember_plan`) once and
+replicates the materialized rows (`MemoryUpsert`) so followers converge. `apply` MUST be
 deterministic: requests carry fully-materialized values (ids, timestamps, cognition results)
 computed once on the leader — never re-run non-deterministic logic (uuid/now/LLM) at apply time.
 

@@ -164,3 +164,28 @@ jobs:
         with:
           name: strata-server
           path: target/release/strata-server
+
+  cluster-ha:
+    name: Cluster HA (real 3-node failover)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: strata-server
+          path: target/release
+      - run: chmod +x target/release/strata-server ops/cluster-local/*.sh
+      # Form a real 3-node Raft cluster as separate processes, then prove a durable run created on the
+      # leader survives KILLING the leader (re-election + replication). Exercises the production
+      # start_raft path over real sockets — the coverage the in-process tests can't give.
+      - name: Start cluster + failover test
+        run: |
+          ops/cluster-local/run-cluster.sh
+          ops/cluster-local/failover-test.sh
+      - name: Stop cluster
+        if: always()
+        run: ops/cluster-local/stop-cluster.sh || true
+      - name: Node logs on failure
+        if: failure()
+        run: tail -n 100 /tmp/strata-cluster/node-*/server.log 2>/dev/null || true
