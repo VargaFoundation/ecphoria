@@ -189,3 +189,32 @@ jobs:
       - name: Node logs on failure
         if: failure()
         run: tail -n 100 /tmp/strata-cluster/node-*/server.log 2>/dev/null || true
+
+  cluster-sharded:
+    name: Cluster sharded (2 groups: routing + isolation)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: strata-server
+          path: target/release
+      - run: chmod +x target/release/strata-server ops/cluster-local/*.sh
+      # Form TWO independent Raft groups (2 shards × 3 replicas) as separate processes and prove the
+      # three multi-Raft properties the single-group test can't: each shard elects its own leader,
+      # a tenant written via one shard's gateway is readable via the other (cross-shard reverse-proxy
+      # routing), and killing one shard's leader leaves the other shard untouched (failover isolation).
+      - name: Start sharded cluster + routing/isolation test
+        env:
+          SHARDS: "2"
+          REPLICAS: "3"
+        run: |
+          ops/cluster-local/run-sharded.sh
+          ops/cluster-local/sharding-test.sh
+      - name: Stop cluster
+        if: always()
+        run: RUN_DIR=/tmp/strata-sharded ops/cluster-local/stop-cluster.sh || true
+      - name: Node logs on failure
+        if: failure()
+        run: tail -n 100 /tmp/strata-sharded/shard-*/server.log 2>/dev/null || true

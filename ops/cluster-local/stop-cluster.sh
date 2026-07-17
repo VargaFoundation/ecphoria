@@ -4,7 +4,8 @@ set -uo pipefail
 RUN_DIR="${RUN_DIR:-/tmp/strata-cluster}"
 
 shopt -s nullglob
-pids=("$RUN_DIR"/node-*.pid)
+# Matches both the single-group harness (node-*.pid) and the sharded harness (shard-*-node-*.pid).
+pids=("$RUN_DIR"/*node-*.pid)
 if [[ ${#pids[@]} -eq 0 ]]; then
   echo "No cluster PIDs found under $RUN_DIR"
   exit 0

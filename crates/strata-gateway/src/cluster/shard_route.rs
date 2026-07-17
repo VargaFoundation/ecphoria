@@ -149,11 +149,17 @@ async fn proxy(
     marker: Option<&str>,
 ) -> Response {
     let (parts, body) = req.into_parts();
+    // Use the ORIGINAL request path. This middleware is a `route_layer` on the router that is
+    // `nest`ed under `/api/v1`, so `parts.uri` here is the nest-stripped path (`/memories`); axum
+    // preserves the full path in the `OriginalUri` extension. Forwarding the stripped path would
+    // 404 at the destination (its routes live under `/api/v1`). Falls back to `parts.uri` when the
+    // layer is mounted un-nested (e.g. the protocol routes).
     let pq = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .and_then(|o| o.0.path_and_query().map(|p| p.as_str().to_string()))
+        .or_else(|| parts.uri.path_and_query().map(|p| p.as_str().to_string()))
+        .unwrap_or_else(|| "/".to_string());
     let url = format!("{base}{pq}");
 
     // Body bounded by the global 16 MB DefaultBodyLimit (applied outside this middleware).
@@ -550,5 +556,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"LOCAL", "local tenant should not be proxied");
+    }
+
+    /// Regression: the shard layer is a `route_layer` on a router `nest`ed under `/api/v1`, so
+    /// `req.uri()` inside it is the nest-stripped path. The proxy must forward the ORIGINAL full
+    /// path (`/api/v1/echo`), not the stripped one (`/echo`) — otherwise every cross-shard request
+    /// 404s at the destination, whose routes live under `/api/v1`. (A live 2-shard cluster caught
+    /// this; the root-mounted e2e test above could not.)
+    #[tokio::test]
+    async fn proxy_preserves_full_path_under_nest() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        // Downstream "owning shard": routes live under /api/v1, mirroring production. If the proxy
+        // forwarded the stripped "/echo", this 404s.
+        let downstream = axum::Router::new()
+            .route("/api/v1/echo", get(|| async { "OK" }))
+            .fallback(|uri: axum::http::Uri| async move {
+                (StatusCode::NOT_FOUND, format!("no route: {}", uri.path()))
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, downstream).await.unwrap() });
+
+        // Route the no-auth key ("default") to the OTHER shard so the request is proxied, not local.
+        let router = ShardRouter::new(2, 128);
+        let owner = router.shard_for("default");
+        let mut base_urls = vec!["http://unused".to_string(); 2];
+        base_urls[owner] = format!("http://{addr}");
+        let state = ShardRoutingState {
+            router: Arc::new(router),
+            my_shard: 1 - owner,
+            base_urls: Arc::new(base_urls),
+            http: reqwest::Client::new(),
+            forward_secret: None,
+        };
+
+        // Mirror production: routes + shard layer live in a sub-router nested under /api/v1.
+        let api = axum::Router::new()
+            .route("/echo", get(|| async { "LOCAL" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state,
+                route_to_owning_shard,
+            ));
+        let app = axum::Router::new().nest("/api/v1", api);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "proxied request must reach the destination's /api/v1/echo (full path preserved)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"OK");
     }
 }

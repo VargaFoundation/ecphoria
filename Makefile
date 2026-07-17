@@ -6,7 +6,7 @@ CAP_GB ?= 40
 export CAP_GB
 GUARD  := scripts/target-guard.sh
 
-.PHONY: build test check fmt clippy run guard disk clean clean-all release bench bench-smoke cluster-up cluster-down cluster-failover
+.PHONY: build test check fmt clippy run guard disk clean clean-all release bench bench-smoke cluster-up cluster-down cluster-failover cluster-sharded
 
 ## Guarded common tasks (auto-clean target/ if it's over the cap, then run cargo).
 build: guard ; cargo build --workspace
@@ -28,6 +28,8 @@ bench:       guard ; bash ops/bench/run-locomo-claude.sh
 cluster-up:       ; bash ops/cluster-local/run-cluster.sh
 cluster-failover: ; bash ops/cluster-local/failover-test.sh
 cluster-down:     ; bash ops/cluster-local/stop-cluster.sh
+## Local sharded cluster (2 groups × 3 replicas): cross-shard routing + failover isolation.
+cluster-sharded:  ; bash ops/cluster-local/run-sharded.sh && bash ops/cluster-local/sharding-test.sh; RUN_DIR=/tmp/strata-sharded bash ops/cluster-local/stop-cluster.sh
 
 ## Disk hygiene.
 guard:     ; @bash $(GUARD)            # clean only if over the cap

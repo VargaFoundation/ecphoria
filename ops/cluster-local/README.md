@@ -49,6 +49,28 @@ format the Helm chart and `deploy/docker-compose.cluster.yml` use.)
 4. **Kills the leader process**, waits for re-election.
 5. Reads the run from the new leader — proves it **survived leader loss**.
 
+## Sharded variant (`run-sharded.sh` + `sharding-test.sh`)
+
+For **multi-Raft** (horizontal write scaling), `run-sharded.sh` brings up `SHARDS` independent Raft
+groups of `REPLICAS` nodes each (default 2×3) with auth on and per-tenant API keys (the shard router
+keys on the tenant, so auth must be enabled). `sharding-test.sh` then proves the three properties a
+single group can't:
+
+1. **Group isolation at formation** — each shard elects its own leader independently.
+2. **Cross-shard tenant routing** — a tenant written via one shard's gateway is readable via every
+   other shard's gateway (the reverse-proxy path).
+3. **Failover isolation** — killing shard 0's leader re-elects within shard 0 while shard 1's
+   leader/term stay untouched.
+
+```bash
+make release
+SHARDS=2 REPLICAS=3 ops/cluster-local/run-sharded.sh
+SHARDS=2 REPLICAS=3 ops/cluster-local/sharding-test.sh
+RUN_DIR=/tmp/strata-sharded ops/cluster-local/stop-cluster.sh
+```
+
+Both harnesses run in CI (`cluster-ha` + `cluster-sharded` jobs).
+
 ## Scope / honest note
 
 This proves the **durable run ledger** (create/update) is replicated and survives failover — the HA

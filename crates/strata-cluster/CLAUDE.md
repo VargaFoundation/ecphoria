@@ -130,8 +130,17 @@ to avoid recursion). The exception is `DELETE /admin/tenants/{id}`, which routes
 **MCP + LLM-proxy** are shard-routed by tenant too. **Rate-limiting** is skipped on reverse-proxied
 requests (origin pod already counted them).
 
+**Validated on a live multi-process sharded cluster** (`ops/cluster-local/run-sharded.sh` +
+`sharding-test.sh`, wired into CI as the `cluster-sharded` job / `make cluster-sharded`): 2 shards ×
+3 replicas prove each shard elects its **own** leader, a tenant written via one shard's gateway is
+readable via the other (**cross-shard reverse-proxy routing**), and killing one shard's leader leaves
+the other shard's leader/term **untouched** (failover isolation). This live harness caught a real
+proxy bug the root-mounted unit test could not: the shard layer is a `route_layer` under the
+`/api/v1` `nest`, so `req.uri()` is the nest-stripped path — the proxy must forward the `OriginalUri`
+(full `/api/v1/...`), else every cross-shard request 404s. Fixed + regression-tested
+(`proxy_preserves_full_path_under_nest`).
+
 **Known limits (documented, not bugs):** (1) admin **writes** that span shards (backup, reindex,
 retention) run per-shard — hit each shard, or use the operator. (2) **gRPC + PG wire** are separate
 listeners → not yet shard-routed. (3) A cross-shard write landing on a destination follower relies on
-the proxy's bounded 307-retry + Service balancing to reach the leader. Cross-shard 307 convergence +
-Raft-group isolation need a live multi-pod cluster to validate.
+the proxy's bounded 307-retry + Service balancing to reach the leader.
