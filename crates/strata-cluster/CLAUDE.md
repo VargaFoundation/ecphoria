@@ -25,7 +25,6 @@ computed once on the leader — never re-run non-deterministic logic (uuid/now/L
 | `ClusterCoordinator` | **Working** | Owns the `openraft::Raft` instance, `client_write()`, `is_leader()`, `leader_id()`, graceful shutdown. **Cluster formation**: single-node inits immediately; multi-node parses `peers` as `id@addr` voter membership and the lowest-id node bootstraps via `initialize` once — idempotent on restart, retries until peers are reachable. `start_raft_with_network` allows injecting a network (tests). |
 | `ClusterConfig` | **Working** | TOML deserialization, node_id, listen, peers |
 | `ClusterCoordinator` (metrics) | **Working** | Background task publishing Raft metrics to Prometheus (term, is_leader, replication_lag, leader_changes) |
-| `LogShipper` | Stub | WAL segment shipping between peers (not needed for basic Raft, uses AppendEntries) |
 | `SnapshotManager` | **Working** | Binary pack/unpack of **all 4 stores** (episodic + memories DuckDB exports, state SQLite, USearch index); restore via `engine.restore_from_backup` (atomic stage-then-swap), build/install wired into RaftSnapshotBuilder |
 
 ## Internal Architecture
@@ -44,7 +43,6 @@ src/
     pb (in mod.rs) tonic::include_proto! generated types
     store.rs       MemStore: RaftStorage + RaftLogReader + RaftSnapshotBuilder
   replication/
-    log_shipper.rs WAL segment shipping (stub)
     snapshot.rs    SnapshotManager: build/restore with binary pack/unpack format
 ```
 

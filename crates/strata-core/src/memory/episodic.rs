@@ -739,8 +739,7 @@ impl EpisodicStore {
             }
             let mut obj = serde_json::Map::new();
             for (i, name) in column_names.iter().enumerate() {
-                let val: String = row.get::<_, String>(i).unwrap_or_default();
-                obj.insert(name.clone(), serde_json::Value::String(val));
+                obj.insert(name.clone(), column_to_json(&row, i));
             }
             results.push(serde_json::Value::Object(obj));
         }
@@ -1116,6 +1115,42 @@ impl EpisodicStore {
 impl Default for EpisodicStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert a DuckDB result column to a typed JSON value. Tries the concrete Rust types in an order
+/// that preserves DuckDB's own types (bool → integer → float → string), so `SELECT count(*)` returns
+/// a JSON number and a `DOUBLE` stays a number, while VARCHAR/JSON/TIMESTAMP columns come back as
+/// strings. Previously every column was coerced via `get::<String>`, which returned "" for any
+/// non-VARCHAR column (e.g. aggregates).
+fn column_to_json(row: &duckdb::Row<'_>, i: usize) -> serde_json::Value {
+    // Match the column's ACTUAL type (via ValueRef) rather than trying Rust types in sequence —
+    // DuckDB's FromSql coerces between numeric types (DOUBLE→i64 truncates, integer→bool), so a
+    // try-in-order approach would mangle values. This preserves each column's real type in JSON.
+    use duckdb::types::ValueRef as V;
+    match row.get_ref(i) {
+        Ok(V::Null) => serde_json::Value::Null,
+        Ok(V::Boolean(b)) => serde_json::json!(b),
+        Ok(V::TinyInt(n)) => serde_json::json!(n),
+        Ok(V::SmallInt(n)) => serde_json::json!(n),
+        Ok(V::Int(n)) => serde_json::json!(n),
+        Ok(V::BigInt(n)) => serde_json::json!(n),
+        Ok(V::UTinyInt(n)) => serde_json::json!(n),
+        Ok(V::USmallInt(n)) => serde_json::json!(n),
+        Ok(V::UInt(n)) => serde_json::json!(n),
+        Ok(V::UBigInt(n)) => serde_json::json!(n),
+        // i128 doesn't fit a JSON number → keep precision as a string.
+        Ok(V::HugeInt(n)) => serde_json::json!(n.to_string()),
+        Ok(V::Float(f)) => serde_json::json!(f),
+        Ok(V::Double(f)) => serde_json::json!(f),
+        Ok(V::Text(t)) => serde_json::json!(String::from_utf8_lossy(t).into_owned()),
+        // Decimal / Timestamp / Date / Time / Interval / Blob → stringify (readable, lossless enough
+        // for a query result). Reuse the String getter for a clean rendering where available.
+        Ok(_) => row
+            .get::<_, String>(i)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
     }
 }
 
@@ -1505,6 +1540,28 @@ mod tests {
             .query_sql_for_tenant("SELECT source FROM episodic", "x' OR '1'='1", 100)
             .unwrap();
         assert_eq!(inj.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_returns_typed_json_values() {
+        let store = EpisodicStore::new();
+        let rows = store
+            .query_sql_limited(
+                "SELECT count(*)::BIGINT AS n, 'hello' AS s, 1.5::DOUBLE AS f, \
+                 true AS b, '42' AS numstr FROM (SELECT 1)",
+                10,
+            )
+            .unwrap();
+        let r = &rows[0];
+        assert_eq!(r["n"], serde_json::json!(1), "count → JSON number, not ''");
+        assert_eq!(r["s"], serde_json::json!("hello"), "text → string");
+        assert_eq!(r["f"], serde_json::json!(1.5), "double → number");
+        assert_eq!(r["b"], serde_json::json!(true), "boolean → bool");
+        assert_eq!(
+            r["numstr"],
+            serde_json::json!("42"),
+            "numeric-looking VARCHAR must stay a string"
+        );
     }
 
     #[tokio::test]
