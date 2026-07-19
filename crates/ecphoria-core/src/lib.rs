@@ -1,5 +1,6 @@
 pub mod authz;
 pub mod config;
+pub mod embedded;
 pub mod embedding;
 pub mod engine;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod runtime;
 pub mod storage;
 
 pub use config::CoreConfig;
+pub use embedded::Ecphoria;
 pub use engine::{
     ContradictionGroup, EcphoriaEngine, FeedbackAction, MemoryChange, MemoryFeedback,
     MemoryProvenance,

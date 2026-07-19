@@ -28,6 +28,13 @@ or clustering (Raft).
 
 ## Public API Surface
 
+### Embedded facade (`embedded::Ecphoria`)
+
+The **no-server, in-process** entry point — "the SQLite of agent memory." `Ecphoria::open(dir)`
+(file-backed) / `open_in_memory()` build an engine with zero config; convenience methods
+`remember`/`add`/`recall`/`all` are scoped by user; `.engine()` exposes the full API. See
+`examples/embedded.rs`.
+
 ### EcphoriaEngine (main entry point)
 
 **Episodic Memory:**
