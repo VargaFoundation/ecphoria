@@ -321,6 +321,22 @@ pub struct MemoryEdgesQuery {
     pub limit: Option<usize>,
 }
 
+/// Create a memory from a built-in template + field values.
+#[derive(Debug, serde::Deserialize)]
+pub struct FromTemplateRequest {
+    pub template: String,
+    #[serde(default)]
+    pub fields: serde_json::Value,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Query params for graph analytics (centrality, communities). `as_of` = RFC3339 for a temporal
 /// (bi-temporal) snapshot; omit for the current graph.
 #[derive(Debug, serde::Deserialize)]

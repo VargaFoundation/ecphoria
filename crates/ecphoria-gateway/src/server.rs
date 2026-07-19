@@ -88,6 +88,15 @@ pub struct GatewayConfig {
     /// with bounded retry; the operator configures a trusted endpoint (no SSRF guard applies).
     #[serde(default)]
     pub cdc_sink_url: Option<String>,
+    /// **Public read-only publish** (like Obsidian Publish): when true, exposes UNAUTHENTICATED
+    /// read-only endpoints (`/public`, `/public/memories`) serving ONLY memories explicitly marked
+    /// `metadata.published = true` for `publish_tenant`. Off by default — this deliberately exposes
+    /// data to the internet, so it is opt-in and serves only the published subset.
+    #[serde(default)]
+    pub publish_enabled: bool,
+    /// The tenant whose published memories are exposed when `publish_enabled` (default `"default"`).
+    #[serde(default)]
+    pub publish_tenant: Option<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -136,6 +145,8 @@ impl Default for GatewayConfig {
             tool_gateway_allow_private_networks: false,
             pg_tls: None,
             cdc_sink_url: None,
+            publish_enabled: false,
+            publish_tenant: None,
         }
     }
 }

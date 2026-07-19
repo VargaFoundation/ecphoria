@@ -71,6 +71,10 @@ auth_enabled = false
 # Outbound CDC: mirror every memory change (upserted/superseded/expired) as JSON POST to a
 # downstream system (search index, warehouse, event bus). Leader-gated in cluster mode.
 #   cdc_sink_url = "https://collector.internal/ecphoria-cdc"
+# Public read-only publish (like Obsidian Publish) — UNAUTHENTICATED. Off by default. When on, only
+# memories marked metadata.published=true for publish_tenant are exposed at /public + /public/memories.
+#   publish_enabled = true
+#   publish_tenant = "default"
 
 [cluster]
 enabled = false

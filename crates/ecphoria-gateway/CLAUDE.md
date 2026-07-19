@@ -56,6 +56,9 @@ LLM proxy) into calls on `ecphoria_core::EcphoriaEngine`. Also handles authentic
 | GET | `/api/v1/memories/graph/centrality` | degree + PageRank per node (`?as_of` temporal, `?limit`) | Yes* | **Working** |
 | GET | `/api/v1/memories/graph/path` | shortest directed path (`?src&dst&as_of`) | Yes* | **Working** |
 | GET | `/api/v1/memories/graph/communities` | community detection (connected components, `?as_of`) | Yes* | **Working** |
+| GET | `/api/v1/memory-templates` | list built-in memory templates | Yes* | **Working** |
+| POST | `/api/v1/memories/from-template` | create a memory from a template + fields | Yes* | **Working** |
+| GET | `/public` · `/public/memories` | opt-in UNAUTH read-only published memories (HTML/JSON) | No | **Working** |
 | POST | `/api/v1/attachments` | upload a multimodal blob (body=bytes; `?memory_id&filename&caption`) | Yes* | **Working** |
 | GET | `/api/v1/attachments` | list attachments (`?memory_id`) | Yes* | **Working** |
 | GET/DELETE | `/api/v1/attachments/{id}` | download bytes (stored Content-Type) / delete | Yes* | **Working** |

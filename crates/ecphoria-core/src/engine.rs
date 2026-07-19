@@ -2608,6 +2608,17 @@ impl EcphoriaEngine {
         self.memory_store.list_active(scope, limit).await
     }
 
+    /// Memories a tenant has explicitly **published** (`metadata.published == true`) — the read set
+    /// behind the opt-in public read-only view. Only the published subset is ever returned.
+    pub async fn memory_published(&self, tenant: &str, limit: usize) -> Result<Vec<Memory>> {
+        let cap = limit.min(self.config.query.max_rows);
+        let all = self.memory_store.list_by_tenant(tenant, cap).await?;
+        Ok(all
+            .into_iter()
+            .filter(|m| m.metadata.get("published").and_then(|v| v.as_bool()) == Some(true))
+            .collect())
+    }
+
     /// GDPR erasure: delete ALL of a tenant's data across every store — episodic events + sessions,
     /// memories + their vectors, agent state, and event embeddings. Sequential best-effort (the
     /// stores are independent engines, so it isn't a single transaction); returns a per-store
@@ -4533,6 +4544,25 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_published_returns_only_published() {
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        let mut pubd = MemoryInput::new(MemoryScope::tenant("default"), "public fact");
+        pubd.metadata = serde_json::json!({ "published": true });
+        engine.memory_add(pubd).await.unwrap();
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::tenant("default"),
+                "private fact",
+            ))
+            .await
+            .unwrap();
+
+        let published = engine.memory_published("default", 50).await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].content, "public fact");
     }
 
     #[tokio::test]

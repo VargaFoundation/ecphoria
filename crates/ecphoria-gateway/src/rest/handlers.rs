@@ -2384,6 +2384,209 @@ pub async fn memory_edges(
     }
 }
 
+// ── Public read-only publish (opt-in, unauthenticated) ─────────────────────
+
+/// State for the public publish endpoints — the tenant whose published memories are exposed.
+/// Only layered when `gateway.publish_enabled`, so the routes 404 otherwise.
+#[derive(Clone)]
+pub struct PublishState {
+    pub tenant: String,
+}
+
+/// The published memories as `{subject, content, updated_at}` (never scope/metadata) — the read set
+/// shared by the JSON and HTML public views.
+async fn published_items(
+    engine: &EcphoriaEngine,
+    tenant: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    match engine.memory_published(tenant, 500).await {
+        Ok(mems) => Ok(mems
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "subject": m.subject,
+                    "content": m.content,
+                    "updated_at": m.updated_at,
+                })
+            })
+            .collect()),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PUBLISH_ERROR",
+            e.to_string(),
+        )),
+    }
+}
+
+/// Public read-only list of published memories (JSON). No auth.
+///
+/// GET /public/memories
+pub async fn public_memories(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    publish: Option<Extension<PublishState>>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "public_memories").increment(1);
+    let Some(Extension(p)) = publish else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "PUBLISH_DISABLED",
+            "publishing is disabled".into(),
+        );
+    };
+    match published_items(&engine, &p.tenant).await {
+        Ok(items) => api_ok(serde_json::json!({ "memories": items, "count": items.len() })),
+        Err(resp) => resp,
+    }
+}
+
+/// Public read-only HTML view of published memories (like Obsidian Publish). No auth.
+///
+/// GET /public
+pub async fn public_index(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    publish: Option<Extension<PublishState>>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "public_index").increment(1);
+    let Some(Extension(p)) = publish else {
+        return (StatusCode::NOT_FOUND, "publishing is disabled").into_response();
+    };
+    let items = match published_items(&engine, &p.tenant).await {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let cards: String = items
+        .iter()
+        .map(|m| {
+            let subject = m.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let head = if subject.is_empty() {
+                String::new()
+            } else {
+                format!("<h3>{}</h3>", esc(subject))
+            };
+            format!("<article>{head}<p>{}</p></article>", esc(content))
+        })
+        .collect();
+    let html = format!(
+        "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <title>Published memories</title><style>body{{max-width:720px;margin:2rem auto;padding:0 1rem;font:16px/1.6 system-ui,sans-serif;color:#222}}\
+         article{{border-bottom:1px solid #eee;padding:1rem 0}}h3{{margin:0 0 .3rem}}p{{margin:0;white-space:pre-wrap}}\
+         footer{{color:#888;font-size:13px;margin-top:2rem}}</style></head><body>\
+         <h1>Published memories</h1>{}<footer>{} memories · powered by Ecphoria</footer></body></html>",
+        if cards.is_empty() { "<p>Nothing published yet.</p>".into() } else { cards },
+        items.len()
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+// ── Memory templates (structured memory creation) ──────────────────────────
+
+/// Built-in memory templates: `(name, description, [field, …])`.
+fn template_catalog() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({ "name": "preference", "description": "A user preference", "fields": ["subject", "value"] }),
+        serde_json::json!({ "name": "person", "description": "A fact about a person", "fields": ["name", "detail"] }),
+        serde_json::json!({ "name": "decision", "description": "A decision made", "fields": ["topic", "decision"] }),
+        serde_json::json!({ "name": "task", "description": "A task / procedure", "fields": ["task"] }),
+    ]
+}
+
+/// Render a template into `(content, subject, mem_type)`. None if the template is unknown or a
+/// required field is missing. Pure — unit-tested.
+fn render_template(name: &str, fields: &serde_json::Value) -> Option<(String, String, String)> {
+    let f = |k: &str| {
+        fields
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    match name {
+        "preference" => {
+            let (s, v) = (f("subject"), f("value"));
+            (!s.is_empty() && !v.is_empty()).then(|| (format!("{s}: {v}"), s, "semantic".into()))
+        }
+        "person" => {
+            let (n, d) = (f("name"), f("detail"));
+            (!n.is_empty()).then(|| {
+                let content = if d.is_empty() {
+                    n.clone()
+                } else {
+                    format!("{n} — {d}")
+                };
+                (content, n, "semantic".into())
+            })
+        }
+        "decision" => {
+            let (t, d) = (f("topic"), f("decision"));
+            (!t.is_empty() && !d.is_empty())
+                .then(|| (format!("Decision on {t}: {d}"), t, "semantic".into()))
+        }
+        "task" => {
+            let t = f("task");
+            (!t.is_empty()).then(|| (t.clone(), t, "procedural".into()))
+        }
+        _ => None,
+    }
+}
+
+/// List the built-in memory templates.
+///
+/// GET /api/v1/memory-templates
+pub async fn memory_templates() -> Response {
+    api_ok(serde_json::json!({ "templates": template_catalog() }))
+}
+
+/// Create a memory from a template + fields.
+///
+/// POST /api/v1/memories/from-template  { "template": "preference", "fields": {...} }
+pub async fn memory_from_template(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<FromTemplateRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_from_template")
+        .increment(1);
+    let Some((content, subject, mem_type)) = render_template(&req.template, &req.fields) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "TEMPLATE_ERROR",
+            format!(
+                "unknown template '{}' or missing required fields",
+                req.template
+            ),
+        );
+    };
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let mut input = ecphoria_core::memory::cognition::MemoryInput::new(scope, content);
+    input.subject = Some(subject);
+    input.mem_type = Some(mem_type);
+    match engine.memory_add(input).await {
+        Ok(add) => api_ok(serde_json::to_value(&add).unwrap_or_default()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 fn parse_as_of(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
     s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc))
@@ -3425,6 +3628,33 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["deleted"], 7); // raw single-shard result, no "shards" wrapper
         assert!(body.get("shards").is_none());
+    }
+
+    #[test]
+    fn render_template_builds_or_rejects() {
+        let (c, s, t) = render_template(
+            "preference",
+            &serde_json::json!({"subject":"coffee","value":"espresso"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.as_str(), s.as_str(), t.as_str()),
+            ("coffee: espresso", "coffee", "semantic")
+        );
+
+        let (c, s, _) = render_template(
+            "person",
+            &serde_json::json!({"name":"Alice","detail":"engineer"}),
+        )
+        .unwrap();
+        assert_eq!((c.as_str(), s.as_str()), ("Alice — engineer", "Alice"));
+
+        let (c, _, t) = render_template("task", &serde_json::json!({"task":"deploy"})).unwrap();
+        assert_eq!((c.as_str(), t.as_str()), ("deploy", "procedural"));
+
+        // Missing required field → None; unknown template → None.
+        assert!(render_template("preference", &serde_json::json!({"subject":"x"})).is_none());
+        assert!(render_template("nope", &serde_json::json!({})).is_none());
     }
 
     #[test]

@@ -79,6 +79,28 @@ pub fn router_with_engine_and_auth(
         )
         .with_state(engine.clone());
 
+    // Opt-in public read-only publish (unauthenticated). Only mounted when explicitly enabled; the
+    // handlers serve ONLY memories marked `metadata.published = true` for the configured tenant.
+    if config.publish_enabled {
+        let tenant = config
+            .publish_tenant
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        tracing::warn!(
+            %tenant,
+            "PUBLIC PUBLISH ENABLED: /public and /public/memories serve published memories WITHOUT auth"
+        );
+        let public = Router::new()
+            .route("/public", axum::routing::get(handlers::public_index))
+            .route(
+                "/public/memories",
+                axum::routing::get(handlers::public_memories),
+            )
+            .layer(axum::Extension(handlers::PublishState { tenant }))
+            .with_state(engine.clone());
+        health_routes = health_routes.merge(public);
+    }
+
     // If cluster mode, provide the coordinator as an optional extension
     if let Some(handle) = cluster_handle {
         health_routes = health_routes.layer(axum::Extension(handle));
@@ -229,6 +251,14 @@ pub fn router_with_engine_and_auth(
         .route(
             "/memories/graph/communities",
             axum::routing::get(handlers::graph_communities),
+        )
+        .route(
+            "/memory-templates",
+            axum::routing::get(handlers::memory_templates),
+        )
+        .route(
+            "/memories/from-template",
+            axum::routing::post(handlers::memory_from_template),
         )
         .route(
             "/attachments",
