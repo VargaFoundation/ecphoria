@@ -214,6 +214,10 @@ pub fn router_with_engine_and_auth(
             "/memories/graph",
             axum::routing::get(handlers::memory_graph),
         )
+        .route(
+            "/memories/edges",
+            axum::routing::get(handlers::memory_edges),
+        )
         .route("/sessions", axum::routing::post(handlers::session_start))
         .route(
             "/sessions/{session_id}/end",

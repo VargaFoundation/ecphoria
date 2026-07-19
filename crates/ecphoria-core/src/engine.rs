@@ -3376,6 +3376,18 @@ impl EcphoriaEngine {
             .await
     }
 
+    /// List **all** active knowledge-graph edges for a tenant (capped), ordered deterministically.
+    /// The bulk-graph read behind the markdown/Obsidian export and whole-graph views.
+    pub async fn memory_edges(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::memory::cognition::Edge>> {
+        self.memory_store
+            .list_edges(tenant, limit.min(self.config.query.max_rows))
+            .await
+    }
+
     /// Multi-hop neighborhood: BFS from `entity` out to `depth` hops, returning the reachable edges
     /// (deduplicated), capped at `max_edges`.
     pub async fn memory_subgraph(

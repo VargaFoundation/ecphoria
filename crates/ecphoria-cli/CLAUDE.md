@@ -12,7 +12,8 @@ ecphoria status                          # server health check
 ecphoria doctor [--config ecphoria.toml]   # lint config for misconfigs (local, no server)
 ecphoria query "SELECT ..."              # execute SQL
 ecphoria ingest --source X --file Y      # bulk ingest
-ecphoria export --entity ID              # GDPR data export
+ecphoria export --entity ID              # GDPR data export (NDJSON)
+ecphoria export --to obsidian --path DIR # export memories → Obsidian markdown vault (round-trip)
 ecphoria search "text" -k 5              # semantic search
 ecphoria shell                           # interactive SQL REPL
 ecphoria schema                          # list sources / agent IDs

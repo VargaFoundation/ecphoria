@@ -314,6 +314,13 @@ pub struct MemoryGraphQuery {
     pub depth: Option<usize>,
 }
 
+/// Query params for listing all knowledge-graph edges (bulk export / whole-graph view).
+#[derive(Debug, serde::Deserialize)]
+pub struct MemoryEdgesQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Search memories within a scope.
 #[derive(Debug, Deserialize)]
 pub struct MemorySearchRequest {

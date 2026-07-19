@@ -2358,6 +2358,32 @@ pub async fn memory_link(
 }
 
 /// Get an entity's 1-hop neighborhood in the memory graph (tenant-scoped).
+/// List all knowledge-graph edges for the tenant (bulk graph view / export).
+///
+/// GET /api/v1/memories/edges?limit=N
+pub async fn memory_edges(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(params): axum::extract::Query<MemoryEdgesQuery>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_edges").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine
+        .memory_edges(&tenant, params.limit.unwrap_or(10_000))
+        .await
+    {
+        Ok(edges) => api_ok(serde_json::json!({ "edges": edges, "count": edges.len() })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn memory_graph(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,

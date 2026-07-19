@@ -31,11 +31,21 @@ pub enum Command {
         #[arg(long)]
         file: String,
     },
-    /// Export data for GDPR compliance
+    /// Export data: a GDPR entity dump (--entity), or memories to an Obsidian markdown vault
+    /// (--to obsidian --path <dir>)
     Export {
-        /// Entity ID to export
+        /// Entity ID to export (GDPR NDJSON dump)
         #[arg(long)]
-        entity: String,
+        entity: Option<String>,
+        /// Export target format: `obsidian` (write a markdown vault)
+        #[arg(long)]
+        to: Option<String>,
+        /// Destination directory (with --to obsidian)
+        #[arg(long)]
+        path: Option<String>,
+        /// Scope the export to this user id
+        #[arg(long)]
+        user: Option<String>,
     },
     /// Import an external knowledge store into memory (Obsidian vault, or a Mem0/Zep JSON export)
     Import {
@@ -162,7 +172,24 @@ pub async fn execute(cmd: Command, url: &str) -> anyhow::Result<()> {
         Command::Doctor { config } => doctor::run(config.as_deref()).await,
         Command::Query { sql } => query::run(url, &sql).await,
         Command::Ingest { source, file } => ingest::run(url, &source, &file).await,
-        Command::Export { entity } => export::run(url, &entity).await,
+        Command::Export {
+            entity,
+            to,
+            path,
+            user,
+        } => match (to.as_deref(), path.as_deref()) {
+            (Some("obsidian"), Some(p)) => export::run_obsidian(url, p, user.as_deref()).await,
+            (Some("obsidian"), None) => {
+                anyhow::bail!("--to obsidian requires --path <vault-dir>")
+            }
+            (Some(other), _) => {
+                anyhow::bail!("unknown export target '{other}' (supported: obsidian)")
+            }
+            (None, _) => match entity {
+                Some(e) => export::run(url, &e).await,
+                None => anyhow::bail!("provide --entity <id> or --to obsidian --path <dir>"),
+            },
+        },
         Command::Import { from, path, user } => {
             import::run(url, &from, &path, user.as_deref()).await
         }
