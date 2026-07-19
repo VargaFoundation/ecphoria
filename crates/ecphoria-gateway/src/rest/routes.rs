@@ -218,6 +218,14 @@ pub fn router_with_engine_and_auth(
             "/memories/edges",
             axum::routing::get(handlers::memory_edges),
         )
+        .route(
+            "/attachments",
+            axum::routing::post(handlers::attachment_upload).get(handlers::attachment_list),
+        )
+        .route(
+            "/attachments/{id}",
+            axum::routing::get(handlers::attachment_download).delete(handlers::attachment_delete),
+        )
         .route("/sessions", axum::routing::post(handlers::session_start))
         .route(
             "/sessions/{session_id}/end",

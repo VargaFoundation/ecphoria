@@ -124,6 +124,8 @@ pub struct EcphoriaEngine {
     /// `memory_grants` table); swappable for a richer/external policy engine via
     /// [`Self::set_authz_backend`].
     authz: parking_lot::RwLock<Arc<dyn crate::authz::AuthzBackend>>,
+    /// Storage backend for multimodal attachment blobs (local dir or S3, per `storage.engine`).
+    attachments: Arc<dyn crate::storage::StorageBackend>,
 }
 
 impl std::fmt::Debug for EcphoriaEngine {
@@ -442,6 +444,16 @@ impl EcphoriaEngine {
         let authz: Arc<dyn crate::authz::AuthzBackend> =
             Arc::new(crate::authz::LocalGrants::new(memory_store.clone()));
 
+        // Attachment blob storage: S3 when the storage engine is s3, else a local `attachments/`
+        // directory under the data dir. Uses the same backend abstraction as the rest of storage.
+        let attachments: Arc<dyn crate::storage::StorageBackend> =
+            if config.storage.engine.eq_ignore_ascii_case("s3") {
+                Arc::new(crate::storage::s3::S3Storage::from_config(&config.storage.s3).await?)
+            } else {
+                let dir = std::path::PathBuf::from(&config.storage.data_dir).join("attachments");
+                Arc::new(crate::storage::local::LocalStorage::new(dir))
+            };
+
         Ok(Self {
             config,
             episodic,
@@ -460,6 +472,7 @@ impl EcphoriaEngine {
             tool_executor: parking_lot::RwLock::new(None),
             run_replicator: parking_lot::RwLock::new(None),
             authz: parking_lot::RwLock::new(authz),
+            attachments,
         })
     }
 
@@ -3388,6 +3401,75 @@ impl EcphoriaEngine {
             .await
     }
 
+    /// Store a multimodal attachment (image / PDF / audio) — its blob goes to the configured storage
+    /// backend (local dir or S3), its metadata to the cognition DB — optionally linked to a memory.
+    /// Pair with a caption memory (`memory_add` citing the returned id in metadata) to make the
+    /// attachment's content retrievable via hybrid search; a native multimodal-embedding backend is a
+    /// future hook. Returns the attachment record.
+    pub async fn attachment_put(
+        &self,
+        tenant: &str,
+        memory_id: Option<uuid::Uuid>,
+        content_type: &str,
+        filename: Option<String>,
+        bytes: bytes::Bytes,
+    ) -> Result<crate::memory::cognition::AttachmentMeta> {
+        let id = uuid::Uuid::new_v4();
+        let key = format!("attachments/{tenant}/{id}");
+        let size = bytes.len() as u64;
+        self.attachments.put(&key, bytes).await?;
+        let meta = crate::memory::cognition::AttachmentMeta {
+            id,
+            tenant_id: tenant.to_string(),
+            memory_id,
+            content_type: content_type.to_string(),
+            filename,
+            size,
+            storage_key: key,
+            created_at: chrono::Utc::now(),
+        };
+        self.memory_store.attachment_insert(&meta).await?;
+        Ok(meta)
+    }
+
+    /// Fetch an attachment's metadata + bytes (tenant-scoped). None if absent or the blob is gone.
+    pub async fn attachment_get(
+        &self,
+        tenant: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<(crate::memory::cognition::AttachmentMeta, bytes::Bytes)>> {
+        let Some(meta) = self.memory_store.attachment_get(tenant, id).await? else {
+            return Ok(None);
+        };
+        match self.attachments.get(&meta.storage_key).await? {
+            Some(bytes) => Ok(Some((meta, bytes))),
+            None => Ok(None),
+        }
+    }
+
+    /// List a tenant's attachments, optionally only those linked to `memory_id`.
+    pub async fn attachment_list(
+        &self,
+        tenant: &str,
+        memory_id: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::memory::cognition::AttachmentMeta>> {
+        self.memory_store
+            .attachment_list(tenant, memory_id, limit.min(self.config.query.max_rows))
+            .await
+    }
+
+    /// Delete an attachment — its metadata and its blob. Returns whether it existed.
+    pub async fn attachment_delete(&self, tenant: &str, id: uuid::Uuid) -> Result<bool> {
+        match self.memory_store.attachment_delete(tenant, id).await? {
+            Some(key) => {
+                let _ = self.attachments.delete(&key).await;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Multi-hop neighborhood: BFS from `entity` out to `depth` hops, returning the reachable edges
     /// (deduplicated), capped at `max_edges`.
     pub async fn memory_subgraph(
@@ -4388,6 +4470,54 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn attachment_put_get_list_delete_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = inmem_config();
+        cfg.storage.data_dir = tmp.path().to_string_lossy().to_string();
+        let engine = EcphoriaEngine::new(cfg).await.unwrap();
+
+        let data = bytes::Bytes::from_static(b"\x89PNG\r\n fake image bytes");
+        let meta = engine
+            .attachment_put(
+                "t1",
+                None,
+                "image/png",
+                Some("shot.png".into()),
+                data.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta.size, data.len() as u64);
+        assert_eq!(meta.content_type, "image/png");
+
+        // Round-trips metadata + bytes.
+        let (m2, b2) = engine.attachment_get("t1", meta.id).await.unwrap().unwrap();
+        assert_eq!(m2.filename.as_deref(), Some("shot.png"));
+        assert_eq!(&b2[..], &data[..]);
+
+        // Tenant-scoped: another tenant can't read it.
+        assert!(engine
+            .attachment_get("other", meta.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            engine.attachment_list("t1", None, 10).await.unwrap().len(),
+            1
+        );
+
+        // Delete removes metadata (and blob).
+        assert!(engine.attachment_delete("t1", meta.id).await.unwrap());
+        assert!(engine
+            .attachment_get("t1", meta.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!engine.attachment_delete("t1", meta.id).await.unwrap());
     }
 
     #[tokio::test]

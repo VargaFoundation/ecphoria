@@ -386,6 +386,23 @@ pub struct Grant {
     pub grantor_user_id: String,
 }
 
+/// Metadata for a multimodal attachment — a binary blob (image/PDF/audio) stored in the configured
+/// storage backend at `storage_key`, optionally linked to a memory. The bytes live in storage; only
+/// this record lives in the cognition DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub id: Uuid,
+    pub tenant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<Uuid>,
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    pub size: u64,
+    pub storage_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What the cognition pipeline did with an added memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -758,6 +775,23 @@ impl MemoryStore {
                             created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
                           );
                           CREATE INDEX IF NOT EXISTS idx_grants_grantee ON memory_grants(tenant_id, grantee_user_id);",
+                },
+                super::migrations::Migration {
+                    version: 5,
+                    // Multimodal attachments: metadata for a binary blob (image/PDF/audio) stored in
+                    // the configured storage backend at `storage_key`, optionally linked to a memory.
+                    sql: "CREATE TABLE IF NOT EXISTS memory_attachments (
+                            id            VARCHAR PRIMARY KEY,
+                            tenant_id     VARCHAR NOT NULL DEFAULT 'default',
+                            memory_id     VARCHAR,
+                            content_type  VARCHAR NOT NULL DEFAULT 'application/octet-stream',
+                            filename      VARCHAR,
+                            size          BIGINT NOT NULL DEFAULT 0,
+                            storage_key   VARCHAR NOT NULL,
+                            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                          );
+                          CREATE INDEX IF NOT EXISTS idx_attach_tenant ON memory_attachments(tenant_id);
+                          CREATE INDEX IF NOT EXISTS idx_attach_memory ON memory_attachments(tenant_id, memory_id);",
                 },
             ],
         );
@@ -1229,6 +1263,130 @@ impl MemoryStore {
             )
             .map_err(|e| crate::Error::State(format!("revoke grant: {e}")))?;
         Ok(n > 0)
+    }
+
+    /// Record an attachment's metadata (the bytes are written to storage separately).
+    pub async fn attachment_insert(&self, m: &AttachmentMeta) -> crate::Result<()> {
+        let db = self.write_db.lock();
+        db.execute(
+            "INSERT INTO memory_attachments \
+             (id, tenant_id, memory_id, content_type, filename, size, storage_key, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                m.id.to_string(),
+                m.tenant_id,
+                m.memory_id.map(|i| i.to_string()),
+                m.content_type,
+                m.filename,
+                m.size as i64,
+                m.storage_key,
+                m.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| crate::Error::State(format!("attachment insert: {e}")))?;
+        Ok(())
+    }
+
+    /// Fetch one attachment's metadata, tenant-scoped (None if absent / wrong tenant).
+    pub async fn attachment_get(
+        &self,
+        tenant: &str,
+        id: Uuid,
+    ) -> crate::Result<Option<AttachmentMeta>> {
+        let db = self.read_conn();
+        let mut stmt = db
+            .prepare(
+                "SELECT id, tenant_id, memory_id, content_type, filename, size, storage_key, \
+                 created_at::VARCHAR FROM memory_attachments WHERE id = ? AND tenant_id = ?",
+            )
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let row = stmt
+            .query_row(
+                duckdb::params![id.to_string(), tenant],
+                Self::parse_attachment,
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// List a tenant's attachments, optionally filtered to those linked to `memory_id`.
+    pub async fn attachment_list(
+        &self,
+        tenant: &str,
+        memory_id: Option<Uuid>,
+        limit: usize,
+    ) -> crate::Result<Vec<AttachmentMeta>> {
+        let db = self.read_conn();
+        let (sql, mid) = match &memory_id {
+            Some(m) => (
+                "SELECT id, tenant_id, memory_id, content_type, filename, size, storage_key, \
+                 created_at::VARCHAR FROM memory_attachments WHERE tenant_id = ? AND memory_id = ? \
+                 ORDER BY created_at DESC LIMIT ?"
+                    .to_string(),
+                Some(m.to_string()),
+            ),
+            None => (
+                "SELECT id, tenant_id, memory_id, content_type, filename, size, storage_key, \
+                 created_at::VARCHAR FROM memory_attachments WHERE tenant_id = ? \
+                 ORDER BY created_at DESC LIMIT ?"
+                    .to_string(),
+                None,
+            ),
+        };
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = match mid {
+            Some(m) => stmt.query_map(
+                duckdb::params![tenant, m, limit as i64],
+                Self::parse_attachment,
+            ),
+            None => stmt.query_map(
+                duckdb::params![tenant, limit as i64],
+                Self::parse_attachment,
+            ),
+        }
+        .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Delete an attachment's metadata (tenant-scoped). Returns its `storage_key` so the caller can
+    /// delete the blob, or None if nothing matched.
+    pub async fn attachment_delete(&self, tenant: &str, id: Uuid) -> crate::Result<Option<String>> {
+        let db = self.write_db.lock();
+        let key: Option<String> = db
+            .query_row(
+                "SELECT storage_key FROM memory_attachments WHERE id = ? AND tenant_id = ?",
+                duckdb::params![id.to_string(), tenant],
+                |r| r.get(0),
+            )
+            .ok();
+        if key.is_some() {
+            db.execute(
+                "DELETE FROM memory_attachments WHERE id = ? AND tenant_id = ?",
+                duckdb::params![id.to_string(), tenant],
+            )
+            .map_err(|e| crate::Error::State(format!("attachment delete: {e}")))?;
+        }
+        Ok(key)
+    }
+
+    fn parse_attachment(r: &duckdb::Row) -> duckdb::Result<AttachmentMeta> {
+        Ok(AttachmentMeta {
+            id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or_default(),
+            tenant_id: r.get::<_, String>(1)?,
+            memory_id: r
+                .get::<_, Option<String>>(2)?
+                .and_then(|s| Uuid::parse_str(&s).ok()),
+            content_type: r.get::<_, String>(3)?,
+            filename: r.get::<_, Option<String>>(4)?,
+            size: r.get::<_, i64>(5)? as u64,
+            storage_key: r.get::<_, String>(6)?,
+            created_at: r
+                .get::<_, String>(7)?
+                .parse()
+                .unwrap_or_else(|_| Utc::now()),
+        })
     }
 
     /// Evict the lowest-importance active memories in a scope beyond `cap` (count-based forgetting /

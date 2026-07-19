@@ -2384,6 +2384,186 @@ pub async fn memory_edges(
     }
 }
 
+/// Upload a multimodal attachment — the raw request body is the blob, the `Content-Type` header its
+/// type. Optional query: `memory_id` (link to a memory), `filename`, and `caption` (also stores a
+/// searchable memory citing the attachment, so its content is retrievable via hybrid search).
+///
+/// POST /api/v1/attachments
+pub async fn attachment_upload(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(q): axum::extract::Query<AttachmentUploadQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "attachment_upload")
+        .increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    if body.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "EMPTY",
+            "attachment body is empty".into(),
+        );
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let memory_id = q
+        .memory_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    let meta = match engine
+        .attachment_put(&tenant, memory_id, &content_type, q.filename.clone(), body)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ATTACHMENT_ERROR",
+                e.to_string(),
+            )
+        }
+    };
+
+    // Optional caption → a searchable memory citing the attachment (the pragmatic "multimodal
+    // memory": the blob is stored, its caption/OCR text is recalled via the normal hybrid search).
+    if let Some(caption) = q.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+        let mut input = ecphoria_core::memory::cognition::MemoryInput::new(
+            ecphoria_core::memory::cognition::MemoryScope::tenant(&tenant),
+            caption.to_string(),
+        );
+        input.metadata = serde_json::json!({
+            "attachment_id": meta.id.to_string(),
+            "content_type": meta.content_type,
+        });
+        let _ = engine.memory_add(input).await;
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(&meta).unwrap_or_default()),
+    )
+        .into_response()
+}
+
+/// Download an attachment's bytes with its stored `Content-Type`.
+///
+/// GET /api/v1/attachments/{id}
+pub async fn attachment_download(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "attachment_download")
+        .increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_ID",
+            "invalid attachment id".into(),
+        );
+    };
+    match engine.attachment_get(&tenant, uuid).await {
+        Ok(Some((meta, bytes))) => {
+            let ct = axum::http::HeaderValue::from_str(&meta.content_type).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static("application/octet-stream")
+            });
+            let mut resp = (StatusCode::OK, bytes).into_response();
+            resp.headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, ct);
+            resp
+        }
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "attachment not found".into(),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ATTACHMENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// List the tenant's attachments (optionally only those linked to `?memory_id=`).
+///
+/// GET /api/v1/attachments
+pub async fn attachment_list(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(q): axum::extract::Query<AttachmentListQuery>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "attachment_list").increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    let memory_id = q
+        .memory_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    match engine
+        .attachment_list(&tenant, memory_id, q.limit.unwrap_or(100))
+        .await
+    {
+        Ok(items) => api_ok(serde_json::json!({ "attachments": items, "count": items.len() })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ATTACHMENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Delete an attachment (metadata + blob).
+///
+/// DELETE /api/v1/attachments/{id}
+pub async fn attachment_delete(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "attachment_delete")
+        .increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_ID",
+            "invalid attachment id".into(),
+        );
+    };
+    match engine.attachment_delete(&tenant, uuid).await {
+        Ok(true) => api_ok(serde_json::json!({ "deleted": id })),
+        Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "attachment not found".into(),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ATTACHMENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn memory_graph(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,

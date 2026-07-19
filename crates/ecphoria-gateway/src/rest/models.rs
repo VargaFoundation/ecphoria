@@ -321,6 +321,29 @@ pub struct MemoryEdgesQuery {
     pub limit: Option<usize>,
 }
 
+/// Query params for uploading a multimodal attachment (body = the blob bytes).
+#[derive(Debug, serde::Deserialize)]
+pub struct AttachmentUploadQuery {
+    /// Link the attachment to this memory id.
+    #[serde(default)]
+    pub memory_id: Option<String>,
+    /// Original filename.
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// If set, also store a searchable memory with this caption/OCR text citing the attachment.
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+/// Query params for listing attachments.
+#[derive(Debug, serde::Deserialize)]
+pub struct AttachmentListQuery {
+    #[serde(default)]
+    pub memory_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Search memories within a scope.
 #[derive(Debug, Deserialize)]
 pub struct MemorySearchRequest {
