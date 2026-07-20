@@ -516,3 +516,90 @@ async fn request_id_middleware(req: Request, next: Next) -> Response {
     }
     response
 }
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use tower::ServiceExt;
+
+    async fn seed_engine() -> Arc<EcphoriaEngine> {
+        let mut c = ecphoria_core::CoreConfig::default();
+        c.memory.episodic.db_path = ":memory:".into();
+        c.memory.state.db_path = ":memory:".into();
+        c.memory.cognition.db_path = ":memory:".into();
+        c.runtime.db_path = ":memory:".into();
+        let engine = Arc::new(EcphoriaEngine::new(c).await.unwrap());
+        use ecphoria_core::memory::cognition::{MemoryInput, MemoryScope};
+        let mut published = MemoryInput::new(MemoryScope::tenant("default"), "public fact");
+        published.metadata = serde_json::json!({ "published": true });
+        engine.memory_add(published).await.unwrap();
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::tenant("default"),
+                "private fact",
+            ))
+            .await
+            .unwrap();
+        engine
+    }
+
+    #[tokio::test]
+    async fn public_publish_disabled_by_default_is_404() {
+        let app = router_with_engine(seed_engine().await);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/public/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_publish_serves_only_published_subset() {
+        let mut cfg = crate::server::GatewayConfig::default();
+        cfg.publish_enabled = true;
+        cfg.publish_tenant = Some("default".into());
+        let app = router_with_engine_and_auth(seed_engine().await, None, None, None, &cfg);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/public/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["count"], 1, "only the published memory is exposed");
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("public fact"));
+        assert!(
+            !s.contains("private fact"),
+            "private memory must never be public"
+        );
+
+        // The HTML view is served too.
+        let html = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/public")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html.status(), StatusCode::OK);
+    }
+}

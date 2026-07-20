@@ -137,6 +137,22 @@ jobs:
           pip install --no-index --find-links dist ecphoria
           python -m pytest -q
 
+  admin-ui:
+    name: Admin console (JS logic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The console is a single HTML file baked via include_str! (no browser in CI). Syntax-check its
+      # script and unit-test the pure render helpers (esc/memRowsHTML/renderTimeline) under node.
+      - run: |
+          awk '/^<script>/{f=1;next} /^<\/script>/{f=0} f' \
+            crates/ecphoria-gateway/src/rest/admin_ui.html > /tmp/adminui.js
+          node --check /tmp/adminui.js
+      - run: node scripts/test-admin-ui.mjs
+
   typescript-sdk:
     name: TypeScript SDK (build + test)
     runs-on: ubuntu-latest
