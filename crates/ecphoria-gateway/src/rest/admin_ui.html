@@ -107,6 +107,7 @@
       <input id="g-asof" placeholder="as-of (RFC3339, optional)" title="temporal snapshot" />
       <button onclick="graphCentrality()">Centrality (PageRank)</button>
       <button onclick="graphCommunities()">Communities</button>
+      <button onclick="graphVisualize()">Visualize</button>
     </div>
     <div id="g-out"></div>
     <div class="card">
@@ -322,6 +323,92 @@ async function graphCommunities() {
     const comms = (j.communities || []);
     $("g-out").innerHTML = "<h3>Communities (" + comms.length + ")</h3>" +
       comms.map((c, i) => `<div class="card"><b>#${i + 1}</b> <span class="muted">(${c.length})</span><div>${c.map(esc).join(", ")}</div></div>`).join("");
+  } catch (e) { errBox($("g-out"), e); }
+}
+// Deterministic force-directed layout (no randomness → same graph renders identically, and it's
+// unit-testable). Seeds nodes on a circle, then relaxes with repulsion + edge springs.
+function graphLayout(nodeIds, edges, W = 720, H = 460, iters = 220) {
+  const n = nodeIds.length;
+  const pos = {};
+  nodeIds.forEach((id, i) => {
+    const a = (2 * Math.PI * i) / Math.max(n, 1);
+    pos[id] = { x: W / 2 + Math.cos(a) * H * 0.35, y: H / 2 + Math.sin(a) * H * 0.35 };
+  });
+  if (n < 2) return pos;
+  const k = Math.sqrt((W * H) / n); // ideal distance
+  for (let it = 0; it < iters; it++) {
+    const disp = {};
+    nodeIds.forEach((id) => (disp[id] = { x: 0, y: 0 }));
+    // Repulsion between every pair.
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = pos[nodeIds[i]], b = pos[nodeIds[j]];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        const f = (k * k) / d;
+        dx = (dx / d) * f; dy = (dy / d) * f;
+        disp[nodeIds[i]].x += dx; disp[nodeIds[i]].y += dy;
+        disp[nodeIds[j]].x -= dx; disp[nodeIds[j]].y -= dy;
+      }
+    }
+    // Attraction along edges.
+    for (const e of edges) {
+      const a = pos[e.src], b = pos[e.dst];
+      if (!a || !b) continue;
+      let dx = a.x - b.x, dy = a.y - b.y;
+      let d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const f = (d * d) / k;
+      dx = (dx / d) * f; dy = (dy / d) * f;
+      disp[e.src].x -= dx; disp[e.src].y -= dy;
+      disp[e.dst].x += dx; disp[e.dst].y += dy;
+    }
+    const t = 6 * (1 - it / iters); // cooling
+    for (const id of nodeIds) {
+      const dp = disp[id];
+      const len = Math.sqrt(dp.x * dp.x + dp.y * dp.y) || 0.01;
+      pos[id].x += (dp.x / len) * Math.min(len, t);
+      pos[id].y += (dp.y / len) * Math.min(len, t);
+      pos[id].x = Math.max(12, Math.min(W - 12, pos[id].x));
+      pos[id].y = Math.max(12, Math.min(H - 12, pos[id].y));
+    }
+  }
+  return pos;
+}
+// Build an SVG string from positions + per-node rank (radius) + community (color).
+function graphSvg(nodeIds, edges, pos, rank, comm, W = 720, H = 460) {
+  const palette = ["#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#db61a2", "#c9d1d9"];
+  const maxR = Math.max(0.0001, ...nodeIds.map((id) => rank[id] || 0));
+  const lines = edges
+    .filter((e) => pos[e.src] && pos[e.dst])
+    .map((e) => `<line x1="${pos[e.src].x.toFixed(1)}" y1="${pos[e.src].y.toFixed(1)}" x2="${pos[e.dst].x.toFixed(1)}" y2="${pos[e.dst].y.toFixed(1)}" stroke="#30363d" stroke-width="1"/>`)
+    .join("");
+  const nodes = nodeIds
+    .map((id) => {
+      const p = pos[id];
+      const r = 5 + 13 * Math.sqrt((rank[id] || 0) / maxR);
+      const color = palette[(comm[id] ?? 0) % palette.length];
+      return `<g><circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${color}" fill-opacity="0.85"/>` +
+        `<text x="${p.x.toFixed(1)}" y="${(p.y - r - 2).toFixed(1)}" font-size="10" fill="#c9d1d9" text-anchor="middle">${esc(id)}</text></g>`;
+    })
+    .join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="border:1px solid #30363d;border-radius:8px;background:#0f141a">${lines}${nodes}</svg>`;
+}
+async function graphVisualize() {
+  try {
+    const q = asofQ();
+    const [edgesR, centR, commR] = await Promise.all([
+      api("GET", "/api/v1/memories/edges?limit=2000"),
+      api("GET", "/api/v1/memories/graph/centrality" + q),
+      api("GET", "/api/v1/memories/graph/communities" + q),
+    ]);
+    const edges = (edgesR.edges || []).map((e) => ({ src: e.src, dst: e.dst }));
+    const rank = {}; (centR.nodes || []).forEach((n) => (rank[n.node] = n.pagerank));
+    const comm = {}; (commR.communities || []).forEach((c, i) => c.forEach((id) => (comm[id] = i)));
+    const ids = [...new Set(edges.flatMap((e) => [e.src, e.dst]))];
+    if (!ids.length) { $("g-out").innerHTML = '<p class="muted">no graph edges yet</p>'; return; }
+    const pos = graphLayout(ids, edges);
+    $("g-out").innerHTML = `<h3>Knowledge graph (${ids.length} nodes, ${edges.length} edges)</h3>` +
+      '<p class="muted">size = PageRank · color = community</p>' + graphSvg(ids, edges, pos, rank, comm);
   } catch (e) { errBox($("g-out"), e); }
 }
 async function graphLink() {

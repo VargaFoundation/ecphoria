@@ -55,10 +55,10 @@ vm.createContext(sandbox);
 
 // Run the console script, then capture the (const/function-scoped) helpers we want to test.
 vm.runInContext(
-  script + "\nglobalThis.__t = { esc, memRowsHTML, renderTimeline };",
+  script + "\nglobalThis.__t = { esc, memRowsHTML, renderTimeline, graphLayout, graphSvg };",
   sandbox,
 );
-const { esc, memRowsHTML, renderTimeline } = sandbox.__t;
+const { esc, memRowsHTML, renderTimeline, graphLayout, graphSvg } = sandbox.__t;
 
 // esc escapes HTML metacharacters.
 assert.strictEqual(esc("<b>&\"'"), "&lt;b&gt;&amp;&quot;&#39;");
@@ -85,5 +85,29 @@ assert.ok(tl.includes("tl-row active"), "active version flagged");
 assert.ok(tl.includes("→ now"), "open validity renders as 'now'");
 assert.ok(tl.includes("&lt;x&gt;"), "timeline escapes content");
 assert.ok(renderTimeline({ history: [] }).includes("no history"));
+
+// graphLayout: positions for every node, in-bounds, and deterministic (no randomness).
+const ids = ["a", "b", "c"];
+const edges = [{ src: "a", dst: "b" }, { src: "b", dst: "c" }];
+const p1 = graphLayout(ids, edges, 720, 460);
+const p2 = graphLayout(ids, edges, 720, 460);
+for (const id of ids) {
+  assert.ok(p1[id], `position for ${id}`);
+  assert.ok(p1[id].x >= 0 && p1[id].x <= 720 && p1[id].y >= 0 && p1[id].y <= 460, "in bounds");
+  assert.deepStrictEqual(p1[id], p2[id], "layout is deterministic");
+}
+
+// graphSvg: an <svg> with an edge line, node circles, and escaped labels.
+const svg = graphSvg(
+  ["a", "<x>"],
+  [{ src: "a", dst: "<x>" }],
+  { a: { x: 10, y: 20 }, "<x>": { x: 30, y: 40 } },
+  { a: 0.9, "<x>": 0.1 },
+  { a: 0, "<x>": 1 },
+);
+assert.ok(svg.startsWith("<svg"), "produces an svg");
+assert.ok(svg.includes("<line"), "edges rendered as lines");
+assert.ok((svg.match(/<circle/g) || []).length === 2, "one circle per node");
+assert.ok(svg.includes("&lt;x&gt;"), "node label escaped");
 
 console.log("admin-ui UI logic tests: all passed");
