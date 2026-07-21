@@ -1049,6 +1049,20 @@ impl MemoryStore {
         self.query_memories(&sql, &[tenant.to_string()])
     }
 
+    /// Active memories a tenant has explicitly marked published (`metadata.published == true`),
+    /// filtered **in SQL** so the LIMIT is applied *after* the published predicate — an older
+    /// published memory is never truncated away by newer unpublished ones (unlike fetch-then-filter).
+    pub async fn list_published(&self, tenant: &str, limit: usize) -> crate::Result<Vec<Memory>> {
+        let sql = format!(
+            "SELECT {} FROM memories WHERE tenant_id = ? AND state = 'active' \
+             AND json_extract_string(metadata, '$.published') = 'true' \
+             ORDER BY updated_at DESC LIMIT {}",
+            Self::SELECT_COLS,
+            limit.clamp(1, 100_000)
+        );
+        self.query_memories(&sql, &[tenant.to_string()])
+    }
+
     /// Full temporal history for a `(scope, subject)` — every version, oldest first.
     pub async fn history(&self, scope: &MemoryScope, subject: &str) -> crate::Result<Vec<Memory>> {
         let (where_sql, mut params) = scope.where_clause();

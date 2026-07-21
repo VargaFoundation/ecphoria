@@ -59,12 +59,28 @@ async fn main() -> anyhow::Result<()> {
         let engine = engine.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Persist the event semantic index at most every ~5 min (and whenever a reindex added
+            // vectors), so a file-backed server doesn't lose event embeddings on a crash. A graceful
+            // SIGTERM persists unconditionally (see the shutdown sequence below).
+            let mut since_persist = std::time::Instant::now();
             loop {
                 tick.tick().await;
-                match engine.reindex_unembedded(1000).await {
-                    Ok(n) if n > 0 => tracing::debug!(reindexed = n, "background reindex"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "background reindex failed"),
+                let added = match engine.reindex_unembedded(1000).await {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!(reindexed = n, "background reindex");
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "background reindex failed");
+                        false
+                    }
+                };
+                if added || since_persist.elapsed() >= std::time::Duration::from_secs(300) {
+                    if let Err(e) = engine.persist().await {
+                        tracing::warn!(error = %e, "periodic semantic-index persist failed");
+                    }
+                    since_persist = std::time::Instant::now();
                 }
             }
         });
@@ -178,10 +194,13 @@ async fn main() -> anyhow::Result<()> {
     tiering_handle.shutdown();
     coordinator.write().await.shutdown().await?;
     gateway.shutdown().await?;
-    Arc::try_unwrap(engine)
-        .map_err(|_| anyhow::anyhow!("engine still has active references"))?
-        .shutdown()
-        .await?;
+    // Persist the event semantic index on the live Arc. `persist(&self)` (not the self-consuming
+    // `shutdown`) so it can't fail on a lingering in-flight reference — the previous
+    // `Arc::try_unwrap(...).shutdown()` would error ("engine still has active references") and skip
+    // the save exactly when a request was still draining.
+    if let Err(e) = engine.persist().await {
+        tracing::warn!(error = %e, "failed to persist semantic index on shutdown");
+    }
 
     tracing::info!("Ecphoria shutdown complete");
     telemetry.shutdown();

@@ -2613,14 +2613,12 @@ impl EcphoriaEngine {
     }
 
     /// Memories a tenant has explicitly **published** (`metadata.published == true`) — the read set
-    /// behind the opt-in public read-only view. Only the published subset is ever returned.
+    /// behind the opt-in public read-only view. The published predicate is applied in SQL (see
+    /// [`MemoryStore::list_published`]) so the `limit` never truncates a published memory in favor of
+    /// unrelated newer ones. Only the published subset is ever returned.
     pub async fn memory_published(&self, tenant: &str, limit: usize) -> Result<Vec<Memory>> {
         let cap = limit.min(self.config.query.max_rows);
-        let all = self.memory_store.list_by_tenant(tenant, cap).await?;
-        Ok(all
-            .into_iter()
-            .filter(|m| m.metadata.get("published").and_then(|v| v.as_bool()) == Some(true))
-            .collect())
+        self.memory_store.list_published(tenant, cap).await
     }
 
     /// GDPR erasure: delete ALL of a tenant's data across every store — episodic events + sessions,
@@ -4231,16 +4229,28 @@ impl EcphoriaEngine {
 
     // ── Lifecycle ────────────────────────────────────────────────────
 
-    /// Gracefully shut down the engine, persisting semantic index.
+    /// Persist in-memory indexes that are NOT rebuilt from a durable store — currently the **event
+    /// semantic (USearch) index** (`self.semantic`, feeding `semantic_search`/RAG). It is loaded on
+    /// startup but otherwise only written by `backup()`/`shutdown()`; without periodic persistence a
+    /// file-backed server (or an embedded/Python user) loses event embeddings on exit. Takes `&self`
+    /// so it can be called on a live `Arc<Engine>` (periodically and on SIGTERM); no-op for an
+    /// in-memory index dir. (The memory-cognition vector index is rebuilt from DuckDB, so it's safe.)
+    pub async fn persist(&self) -> Result<()> {
+        let index_dir = self.config.memory.semantic.index_dir.clone();
+        if index_dir.is_empty() || index_dir == ":memory:" {
+            return Ok(());
+        }
+        let semantic = self.semantic.clone();
+        tokio::task::spawn_blocking(move || semantic.save(std::path::Path::new(&index_dir)))
+            .await
+            .map_err(|e| crate::Error::Internal(anyhow::anyhow!("persist join: {e}")))?
+    }
+
+    /// Gracefully shut down the engine, persisting the semantic index. (Consumes `self`; the server
+    /// calls [`Self::persist`] on its `Arc` instead — see `ecphoria-server`.)
     pub async fn shutdown(self) -> Result<()> {
-        // Save semantic index if index_dir is configured
-        let index_dir = &self.config.memory.semantic.index_dir;
-        if !index_dir.is_empty() && index_dir != ":memory:" {
-            if let Err(e) = self.semantic.save(std::path::Path::new(index_dir)) {
-                tracing::warn!(error = %e, "failed to save semantic index on shutdown");
-            } else {
-                tracing::info!(path = %index_dir, "semantic index saved");
-            }
+        if let Err(e) = self.persist().await {
+            tracing::warn!(error = %e, "failed to persist semantic index on shutdown");
         }
         tracing::info!("Ecphoria engine shutting down");
         Ok(())
@@ -4483,6 +4493,47 @@ mod tests {
         assert_eq!(results[0].entry.content, "Rust programming language");
     }
 
+    #[tokio::test]
+    async fn semantic_index_persists_across_reopen() {
+        // Regression: the event semantic index is loaded on startup but was only saved by a
+        // never-called shutdown(). `persist()` must write it so a file-backed reopen recovers it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = |f: &str| tmp.path().join(f).to_string_lossy().to_string();
+        // Fully file-backed: the index reload is (correctly) gated on episodic being file-backed too.
+        let cfg = || {
+            let mut c = CoreConfig::default();
+            c.memory.episodic.db_path = p("episodic.duckdb");
+            c.memory.state.db_path = p("state.db");
+            c.memory.cognition.db_path = p("mem.duckdb");
+            c.runtime.db_path = p("runtime.db");
+            c.memory.semantic.index_dir = p("vectors");
+            c.embedding.dimension = 4;
+            c
+        };
+        let vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+
+        {
+            let engine = EcphoriaEngine::new(cfg()).await.unwrap();
+            engine
+                .semantic_upsert(&SemanticEntry {
+                    id: uuid::Uuid::new_v4(),
+                    content: "persisted event".into(),
+                    embedding: vec.clone(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            engine.persist().await.unwrap(); // <- the fix under test
+        }
+        // Reopen: engine::new loads the saved index → the vector is still searchable.
+        {
+            let engine = EcphoriaEngine::new(cfg()).await.unwrap();
+            assert_eq!(engine.semantic_count(), 1, "index not recovered from disk");
+            let hits = engine.semantic_search(&vec, 1).await.unwrap();
+            assert_eq!(hits[0].entry.content, "persisted event");
+        }
+    }
+
     /// Deterministic in-process embedding provider for cognition tests. Every text embeds to the
     /// same unit vector, so any two memories in a scope are exact near-duplicates (cosine = 1.0) —
     /// which deterministically drives the semantic dedup/merge path without a network backend.
@@ -4633,6 +4684,29 @@ mod tests {
         let published = engine.memory_published("default", 50).await.unwrap();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].content, "public fact");
+    }
+
+    #[tokio::test]
+    async fn memory_published_survives_limit_with_newer_unpublished() {
+        // Regression: the published memory is the OLDEST; many newer unpublished ones follow. A small
+        // limit must NOT truncate the published memory away (the old fetch-then-limit-then-filter bug).
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        let mut pubd = MemoryInput::new(MemoryScope::tenant("default"), "the one published fact");
+        pubd.metadata = serde_json::json!({ "published": true });
+        engine.memory_add(pubd).await.unwrap();
+        for i in 0..10 {
+            engine
+                .memory_add(MemoryInput::new(
+                    MemoryScope::tenant("default"),
+                    format!("newer private fact {i}"),
+                ))
+                .await
+                .unwrap();
+        }
+        // limit=3 is far smaller than the 11 active memories; the published one is the oldest.
+        let published = engine.memory_published("default", 3).await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].content, "the one published fact");
     }
 
     #[tokio::test]

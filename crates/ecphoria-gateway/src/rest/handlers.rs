@@ -2386,21 +2386,49 @@ pub async fn memory_edges(
 
 // ── Public read-only publish (opt-in, unauthenticated) ─────────────────────
 
-/// State for the public publish endpoints — the tenant whose published memories are exposed.
-/// Only layered when `gateway.publish_enabled`, so the routes 404 otherwise.
+/// Cached rendered public items + when they were computed (short-TTL; see `PUBLISH_CACHE_TTL`).
+type PublishCache = std::sync::Arc<parking_lot::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>>>;
+
+/// State for the public publish endpoints — the tenant whose published memories are exposed, plus a
+/// short-TTL result cache. Only layered when `gateway.publish_enabled`, so the routes 404 otherwise.
 #[derive(Clone)]
 pub struct PublishState {
     pub tenant: String,
+    /// Bounds the expensive tenant scan to once per TTL under an unauthenticated request flood (these
+    /// routes bypass the auth-layer rate limiter).
+    cache: PublishCache,
 }
 
-/// The published memories as `{subject, content, updated_at}` (never scope/metadata) — the read set
-/// shared by the JSON and HTML public views.
+impl PublishState {
+    pub fn new(tenant: String) -> Self {
+        Self {
+            tenant,
+            cache: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+}
+
+/// How long a `/public` scan result is reused before recomputing.
+const PUBLISH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The published memories as `{subject, content, updated_at}` (never scope/metadata), served from a
+/// short-TTL cache. A burst of unauthenticated `/public` hits triggers at most one full tenant scan
+/// per TTL — the DoS-amplifier mitigation for these unauthenticated routes. (Per-client rate limiting
+/// is best applied at the ingress/CDN in front of a public deployment.)
 async fn published_items(
     engine: &EcphoriaEngine,
-    tenant: &str,
+    state: &PublishState,
 ) -> Result<Vec<serde_json::Value>, Response> {
-    match engine.memory_published(tenant, 500).await {
-        Ok(mems) => Ok(mems
+    {
+        let guard = state.cache.lock();
+        if let Some((at, items)) = guard.as_ref() {
+            if at.elapsed() < PUBLISH_CACHE_TTL {
+                return Ok(items.clone());
+            }
+        }
+    }
+    let items: Vec<serde_json::Value> = match engine.memory_published(&state.tenant, 500).await {
+        Ok(mems) => mems
             .iter()
             .map(|m| {
                 serde_json::json!({
@@ -2409,13 +2437,25 @@ async fn published_items(
                     "updated_at": m.updated_at,
                 })
             })
-            .collect()),
-        Err(e) => Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PUBLISH_ERROR",
-            e.to_string(),
-        )),
-    }
+            .collect(),
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PUBLISH_ERROR",
+                e.to_string(),
+            ))
+        }
+    };
+    *state.cache.lock() = Some((std::time::Instant::now(), items.clone()));
+    Ok(items)
+}
+
+/// `Cache-Control` for public responses — lets browsers/CDNs cache too, compounding the in-process cache.
+fn public_cache_header(resp: &mut Response) {
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=15"),
+    );
 }
 
 /// Public read-only list of published memories (JSON). No auth.
@@ -2433,8 +2473,12 @@ pub async fn public_memories(
             "publishing is disabled".into(),
         );
     };
-    match published_items(&engine, &p.tenant).await {
-        Ok(items) => api_ok(serde_json::json!({ "memories": items, "count": items.len() })),
+    match published_items(&engine, &p).await {
+        Ok(items) => {
+            let mut resp = api_ok(serde_json::json!({ "memories": items, "count": items.len() }));
+            public_cache_header(&mut resp);
+            resp
+        }
         Err(resp) => resp,
     }
 }
@@ -2450,7 +2494,7 @@ pub async fn public_index(
     let Some(Extension(p)) = publish else {
         return (StatusCode::NOT_FOUND, "publishing is disabled").into_response();
     };
-    let items = match published_items(&engine, &p.tenant).await {
+    let items = match published_items(&engine, &p).await {
         Ok(i) => i,
         Err(resp) => return resp,
     };
@@ -2481,11 +2525,13 @@ pub async fn public_index(
         if cards.is_empty() { "<p>Nothing published yet.</p>".into() } else { cards },
         items.len()
     );
-    (
+    let mut resp = (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
     )
-        .into_response()
+        .into_response();
+    public_cache_header(&mut resp);
+    resp
 }
 
 // ── Memory templates (structured memory creation) ──────────────────────────
@@ -2732,10 +2778,11 @@ pub async fn attachment_upload(
     // Optional caption → a searchable memory citing the attachment (the pragmatic "multimodal
     // memory": the blob is stored, its caption/OCR text is recalled via the normal hybrid search).
     if let Some(caption) = q.caption.as_deref().filter(|c| !c.trim().is_empty()) {
-        let mut input = ecphoria_core::memory::cognition::MemoryInput::new(
-            ecphoria_core::memory::cognition::MemoryScope::tenant(&tenant),
-            caption.to_string(),
-        );
+        // Scope the caption to the uploader's user (if given) so their user-scoped search surfaces it
+        // — not just a tenant-wide scope. Tenant still comes from the auth context.
+        let scope = scope_from(&auth, None, q.user_id.as_deref(), None, None);
+        let mut input =
+            ecphoria_core::memory::cognition::MemoryInput::new(scope, caption.to_string());
         input.metadata = serde_json::json!({
             "attachment_id": meta.id.to_string(),
             "content_type": meta.content_type,
@@ -2786,7 +2833,60 @@ pub async fn attachment_search_image(
     }
 }
 
-/// Download an attachment's bytes with its stored `Content-Type`.
+/// Attachment blobs are user-supplied and served from the SAME origin as the `/ui` console, so an
+/// uploaded `text/html`/SVG must never render/execute. Only a small allowlist of inert types is
+/// served inline with its real type; everything else is forced to `application/octet-stream` +
+/// `attachment`. Returns `(served_content_type, inline?)`.
+fn safe_download_content_type(stored: &str) -> (String, bool) {
+    // Inert, non-scriptable types safe to render inline. NOTE: image/svg+xml, text/html, text/xml,
+    // application/xml, and any *script* type are deliberately excluded (SVG/HTML can carry script).
+    const INLINE_SAFE: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp",
+        "image/x-icon",
+        "application/pdf",
+        "text/plain",
+    ];
+    let base = stored
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if INLINE_SAFE.contains(&base.as_str()) {
+        (base, true)
+    } else {
+        ("application/octet-stream".to_string(), false)
+    }
+}
+
+/// A filesystem-name value safe to place inside a `Content-Disposition` header (no quotes, control
+/// chars, or path separators that could enable header injection).
+fn cd_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '"' | '\\' | '/' | '\r' | '\n' => '_',
+            c => c,
+        })
+        .take(200)
+        .collect();
+    let t = cleaned.trim();
+    if t.is_empty() {
+        "download".into()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Download an attachment's bytes. Hardened against stored-XSS: untrusted content-types are served as
+/// a non-executing `octet-stream` attachment, and `nosniff` + a locked-down CSP are always set.
 ///
 /// GET /api/v1/attachments/{id}
 pub async fn attachment_download(
@@ -2809,12 +2909,35 @@ pub async fn attachment_download(
     };
     match engine.attachment_get(&tenant, uuid).await {
         Ok(Some((meta, bytes))) => {
-            let ct = axum::http::HeaderValue::from_str(&meta.content_type).unwrap_or_else(|_| {
-                axum::http::HeaderValue::from_static("application/octet-stream")
-            });
+            use axum::http::header;
+            let (served_ct, inline) = safe_download_content_type(&meta.content_type);
+            let disposition = if inline { "inline" } else { "attachment" };
+            let cd = match &meta.filename {
+                Some(f) => format!("{disposition}; filename=\"{}\"", cd_filename(f)),
+                None => disposition.to_string(),
+            };
+            let octet = || axum::http::HeaderValue::from_static("application/octet-stream");
             let mut resp = (StatusCode::OK, bytes).into_response();
-            resp.headers_mut()
-                .insert(axum::http::header::CONTENT_TYPE, ct);
+            let h = resp.headers_mut();
+            h.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(&served_ct).unwrap_or_else(|_| octet()),
+            );
+            // Defense in depth: no MIME sniffing, and a CSP that blocks any script/embed even if a
+            // browser were to render the response anyway.
+            h.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            h.insert(
+                header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_static("default-src 'none'; sandbox"),
+            );
+            h.insert(
+                header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_str(&cd)
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+            );
             resp
         }
         Ok(None) => api_error(
@@ -3664,6 +3787,47 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["deleted"], 7); // raw single-shard result, no "shards" wrapper
         assert!(body.get("shards").is_none());
+    }
+
+    #[test]
+    fn attachment_download_content_type_is_xss_safe() {
+        // Inert types render inline with their real type.
+        assert_eq!(
+            safe_download_content_type("image/png"),
+            ("image/png".into(), true)
+        );
+        assert_eq!(
+            safe_download_content_type("application/pdf"),
+            ("application/pdf".into(), true)
+        );
+        assert_eq!(
+            safe_download_content_type("text/plain; charset=utf-8"),
+            ("text/plain".into(), true)
+        );
+        // Scriptable / unknown types are forced to a non-executing attachment.
+        for dangerous in [
+            "text/html",
+            "image/svg+xml",
+            "application/xml",
+            "text/xml",
+            "application/javascript",
+            "weird/thing",
+        ] {
+            assert_eq!(
+                safe_download_content_type(dangerous),
+                ("application/octet-stream".into(), false),
+                "{dangerous} must not be served inline"
+            );
+        }
+        // Case-insensitive.
+        assert_eq!(
+            safe_download_content_type("TEXT/HTML"),
+            ("application/octet-stream".into(), false)
+        );
+        // Content-Disposition filename is header-injection safe: control chars dropped, quotes and
+        // path separators neutralized.
+        assert_eq!(cd_filename("a\"b\r\n/c"), "a_b_c");
+        assert_eq!(cd_filename("   "), "download");
     }
 
     #[test]

@@ -111,6 +111,12 @@ impl Ecphoria {
             Ok(mems.into_iter().map(|m| m.content).collect())
         })
     }
+
+    /// Persist on-disk indexes (the event search index) before exit — call on a file-backed instance
+    /// so ingest/search embeddings aren't lost. No-op for `open_in_memory`.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.rt.block_on(self.inner.flush()).map_err(err))
+    }
 }
 
 #[pymodule]

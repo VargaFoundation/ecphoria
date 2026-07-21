@@ -96,7 +96,7 @@ pub fn router_with_engine_and_auth(
                 "/public/memories",
                 axum::routing::get(handlers::public_memories),
             )
-            .layer(axum::Extension(handlers::PublishState { tenant }))
+            .layer(axum::Extension(handlers::PublishState::new(tenant)))
             .with_state(engine.clone());
         health_routes = health_routes.merge(public);
     }
@@ -562,9 +562,11 @@ mod publish_tests {
 
     #[tokio::test]
     async fn public_publish_serves_only_published_subset() {
-        let mut cfg = crate::server::GatewayConfig::default();
-        cfg.publish_enabled = true;
-        cfg.publish_tenant = Some("default".into());
+        let cfg = crate::server::GatewayConfig {
+            publish_enabled: true,
+            publish_tenant: Some("default".into()),
+            ..Default::default()
+        };
         let app = router_with_engine_and_auth(seed_engine().await, None, None, None, &cfg);
 
         let resp = app

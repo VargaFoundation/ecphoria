@@ -104,6 +104,13 @@ impl Ecphoria {
             .memory_all(&MemoryScope::user(user), limit)
             .await
     }
+
+    /// Persist on-disk indexes that aren't rebuilt on load (the event semantic index). Call before
+    /// dropping a file-backed instance so `search`/ingest embeddings survive process exit — memories
+    /// from `remember`/`add` are already durable. No-op for `open_in_memory`.
+    pub async fn flush(&self) -> Result<()> {
+        self.engine.persist().await
+    }
 }
 
 #[cfg(test)]

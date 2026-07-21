@@ -368,6 +368,9 @@ pub struct AttachmentUploadQuery {
     /// If set, also store a searchable memory with this caption/OCR text citing the attachment.
     #[serde(default)]
     pub caption: Option<String>,
+    /// Scope the caption memory to this user id (so the uploader's user-scoped search finds it).
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// Query params for listing attachments.
