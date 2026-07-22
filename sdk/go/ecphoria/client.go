@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -462,6 +463,231 @@ func (c *Client) MemoryDelete(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// ── Cognition (provenance / feedback / contradictions) ──────────────
+
+// MemoryProvenance returns a memory's source events + supersession chain.
+func (c *Client) MemoryProvenance(ctx context.Context, id string) (map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories/"+url.PathEscape(id)+"/provenance", nil)
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode provenance: %w", err)
+	}
+	return r, nil
+}
+
+// MemoryFeedback gives feedback so ranking learns: "helpful" reinforces, "wrong"/"obsolete" retires.
+func (c *Client) MemoryFeedback(ctx context.Context, id, verdict string) (map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/memories/"+url.PathEscape(id)+"/feedback", map[string]any{"verdict": verdict})
+	if err != nil {
+		return nil, err
+	}
+	return decodeMap(data, "feedback")
+}
+
+// MemoryContradictions lists subjects with more than one active memory (the review queue).
+func (c *Client) MemoryContradictions(ctx context.Context, userID string) ([]map[string]any, error) {
+	path := "/api/v1/memories/contradictions"
+	if userID != "" {
+		path += "?user_id=" + url.QueryEscape(userID)
+	}
+	return c.getList(ctx, path, "contradictions")
+}
+
+// ── Knowledge graph ─────────────────────────────────────────────────
+
+// MemoryLink adds a graph edge (src -[relation]-> dst). supersede closes the prior (src, relation).
+func (c *Client) MemoryLink(ctx context.Context, src, relation, dst string, supersede bool) (map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/memories/link", map[string]any{
+		"src": src, "relation": relation, "dst": dst, "supersede": supersede,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeMap(data, "link")
+}
+
+// GraphNeighbors returns the edges around an entity (depth>1 expands the subgraph).
+func (c *Client) GraphNeighbors(ctx context.Context, entity string, depth, limit int) ([]map[string]any, error) {
+	q := url.Values{"entity": {entity}, "depth": {strconv.Itoa(depth)}, "limit": {strconv.Itoa(limit)}}
+	return c.getList(ctx, "/api/v1/memories/graph?"+q.Encode(), "edges")
+}
+
+// GraphEdges returns all knowledge-graph edges (bulk view).
+func (c *Client) GraphEdges(ctx context.Context, limit int) ([]map[string]any, error) {
+	return c.getList(ctx, "/api/v1/memories/edges?limit="+strconv.Itoa(limit), "edges")
+}
+
+// GraphCentrality ranks nodes by degree + PageRank, optionally as-of a time (RFC3339, empty for now).
+func (c *Client) GraphCentrality(ctx context.Context, asOf string, limit int) ([]map[string]any, error) {
+	q := url.Values{}
+	if asOf != "" {
+		q.Set("as_of", asOf)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/api/v1/memories/graph/centrality"
+	if e := q.Encode(); e != "" {
+		path += "?" + e
+	}
+	return c.getList(ctx, path, "nodes")
+}
+
+// GraphPath returns the shortest directed path between two entities (nil if unreachable).
+func (c *Client) GraphPath(ctx context.Context, src, dst, asOf string) ([]string, error) {
+	q := url.Values{"src": {src}, "dst": {dst}}
+	if asOf != "" {
+		q.Set("as_of", asOf)
+	}
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories/graph/path?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Path []string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode graph_path: %w", err)
+	}
+	return r.Path, nil
+}
+
+// GraphCommunities detects communities (connected clusters), optionally as-of a time.
+func (c *Client) GraphCommunities(ctx context.Context, asOf string) ([][]string, error) {
+	path := "/api/v1/memories/graph/communities"
+	if asOf != "" {
+		path += "?as_of=" + url.QueryEscape(asOf)
+	}
+	data, _, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Communities [][]string `json:"communities"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode graph_communities: %w", err)
+	}
+	return r.Communities, nil
+}
+
+// ── Templates ───────────────────────────────────────────────────────
+
+// MemoryTemplates lists the built-in memory templates.
+func (c *Client) MemoryTemplates(ctx context.Context) ([]map[string]any, error) {
+	return c.getList(ctx, "/api/v1/memory-templates", "templates")
+}
+
+// MemoryFromTemplate creates a memory from a template + field values.
+func (c *Client) MemoryFromTemplate(ctx context.Context, template string, fields map[string]any, userID string) (map[string]any, error) {
+	body := map[string]any{"template": template, "fields": fields}
+	if userID != "" {
+		body["user_id"] = userID
+	}
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/memories/from-template", body)
+	if err != nil {
+		return nil, err
+	}
+	return decodeMap(data, "from_template")
+}
+
+// ── Attachments (multimodal) ────────────────────────────────────────
+
+// AttachmentUpload uploads a blob (image/PDF/audio). caption (optional) stores a searchable memory.
+func (c *Client) AttachmentUpload(ctx context.Context, data []byte, contentType, filename, memoryID, caption string) (map[string]any, error) {
+	q := url.Values{}
+	for k, v := range map[string]string{"filename": filename, "memory_id": memoryID, "caption": caption} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	path := "/api/v1/attachments"
+	if e := q.Encode(); e != "" {
+		path += "?" + e
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("ecphoria: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ecphoria: do request: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ecphoria: attachment upload: HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	return decodeMap(respBody, "attachment")
+}
+
+// AttachmentList lists attachments (optionally for one memory).
+func (c *Client) AttachmentList(ctx context.Context, memoryID string) ([]map[string]any, error) {
+	path := "/api/v1/attachments"
+	if memoryID != "" {
+		path += "?memory_id=" + url.QueryEscape(memoryID)
+	}
+	return c.getList(ctx, path, "attachments")
+}
+
+// AttachmentDelete deletes an attachment; returns false if it didn't exist.
+func (c *Client) AttachmentDelete(ctx context.Context, id string) (bool, error) {
+	_, status, err := c.doRequest(ctx, http.MethodDelete, "/api/v1/attachments/"+url.PathEscape(id), nil)
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MemoryReembed re-embeds active memories with the current provider (after a model change).
+func (c *Client) MemoryReembed(ctx context.Context, limit int) (map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodPost, "/api/v1/admin/memory/reembed", map[string]any{"limit": limit})
+	if err != nil {
+		return nil, err
+	}
+	return decodeMap(data, "reembed")
+}
+
+// getList GETs `path` and returns the array under `key`.
+func (c *Client) getList(ctx context.Context, path, key string) ([]map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]json.RawMessage
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode %s: %w", key, err)
+	}
+	var out []map[string]any
+	if raw, ok := r[key]; ok {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("ecphoria: decode %s list: %w", key, err)
+		}
+	}
+	return out, nil
+}
+
+func decodeMap(data []byte, what string) (map[string]any, error) {
+	var r map[string]any
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode %s: %w", what, err)
+	}
+	return r, nil
 }
 
 // ── Sessions ────────────────────────────────────────────────────────
