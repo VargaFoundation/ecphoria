@@ -58,7 +58,7 @@ config:
     webhookSecrets: []                      # ["github=<hmac>", "slack=<signing-secret>", ...]
     llmCacheSimilarity: false               # semantic (vs exact-match) LLM-proxy response cache
     toolGatewayAllowPrivateNetworks: false  # let the MCP tool-gateway reach RFC1918 (disables SSRF guard)
-    cdcSinkUrl: ""                          # outbound CDC: POST every memory change to this URL
+    cdcSinkUrl: ""                          # outbound CDC: POST every memory + state change to this URL
     publishEnabled: false                   # UNAUTH read-only /public + /public/memories
     publishTenant: "default"                # tenant whose metadata.published=true memories are exposed
     # JWT HS256 signing secret. Prefer a pre-created Secret over a plaintext value:

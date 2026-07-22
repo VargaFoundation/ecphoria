@@ -247,7 +247,7 @@ All optional; empty / `0` / `false` means "off / use default". Comma-separated l
 | `gateway.webhook_require_signature` | `ECPHORIA_GATEWAY__WEBHOOK_REQUIRE_SIGNATURE` | `false` | Fail-closed: reject webhook sources with no configured secret |
 | `gateway.llm_cache_similarity` | `ECPHORIA_GATEWAY__LLM_CACHE_SIMILARITY` | `false` | Semantic (vs exact-match) LLM-proxy response cache |
 | `gateway.tool_gateway_allow_private_networks` | `ECPHORIA_GATEWAY__TOOL_GATEWAY_ALLOW_PRIVATE_NETWORKS` | `false` | Let the MCP tool-gateway reach RFC1918 addresses (disables the SSRF guard) |
-| `gateway.cdc_sink_url` | `ECPHORIA_GATEWAY__CDC_SINK_URL` | | Outbound CDC: POST every memory change to this URL (leader-gated in cluster mode) |
+| `gateway.cdc_sink_url` | `ECPHORIA_GATEWAY__CDC_SINK_URL` | | Outbound CDC: POST every memory + state change to this URL, each tagged with a `stream`/`event` (leader-gated in cluster mode) |
 | `gateway.publish_enabled` | `ECPHORIA_GATEWAY__PUBLISH_ENABLED` | `false` | Serve UNAUTH read-only `/public` + `/public/memories` |
 | `gateway.publish_tenant` | `ECPHORIA_GATEWAY__PUBLISH_TENANT` | `default` | Tenant whose `metadata.published=true` memories are exposed at `/public` |
 | `gateway.oidc.enabled` | `ECPHORIA_GATEWAY__OIDC__ENABLED` | `false` | Enable OIDC (RS256/JWKS) auth |

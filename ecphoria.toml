@@ -74,8 +74,10 @@ auth_enabled = false
 # Webhook signature verification (per vendor: github/slack/sentry/pagerduty):
 #   webhook_secrets = ["github=<hmac>", "slack=<signing-secret>"]
 #   webhook_require_signature = true   # fail-closed: reject sources with no configured secret
-# Outbound CDC: mirror every memory change (upserted/superseded/expired) as JSON POST to a
-# downstream system (search index, warehouse, event bus). Leader-gated in cluster mode.
+# Outbound CDC: mirror every memory change (upserted/superseded/expired) AND state change (set/
+# deleted) as a JSON POST to a downstream system (search index, warehouse, event bus). Each payload
+# is tagged with a "stream" ("memory"|"state") + normalized "event". Leader-gated in cluster mode.
+# (Episodic event ingest is not mirrored — read it via /query or the memories/watch WebSocket.)
 #   cdc_sink_url = "https://collector.internal/ecphoria-cdc"
 # Public read-only publish (like Obsidian Publish) — UNAUTHENTICATED. Off by default. When on, only
 # memories marked metadata.published=true for publish_tenant are exposed at /public + /public/memories.
