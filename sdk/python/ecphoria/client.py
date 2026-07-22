@@ -505,6 +505,203 @@ class EcphoriaClient:
         resp.raise_for_status()
         return True
 
+    async def _get_json(self, path: str, params: Any = None) -> dict[str, Any]:
+        resp = await self._request("GET", path, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _post_json(self, path: str, body: Any) -> dict[str, Any]:
+        resp = await self._request("POST", path, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Cognition (provenance / feedback / contradictions) ───────────
+
+    async def memory_provenance(self, memory_id: str) -> dict[str, Any]:
+        """A memory's source events + supersession chain (the audit trail behind a fact)."""
+        return await self._get_json(f"/api/v1/memories/{memory_id}/provenance")
+
+    async def memory_feedback(self, memory_id: str, verdict: str) -> dict[str, Any]:
+        """Give feedback so ranking learns: 'helpful' reinforces, 'wrong'/'obsolete' retires."""
+        return await self._post_json(
+            f"/api/v1/memories/{memory_id}/feedback", {"verdict": verdict}
+        )
+
+    async def memory_contradictions(
+        self, user_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Subjects with more than one active memory (the review queue)."""
+        params = {"user_id": user_id} if user_id else None
+        return (await self._get_json("/api/v1/memories/contradictions", params)).get(
+            "contradictions", []
+        )
+
+    async def memory_resolve_contradiction(
+        self, subject: str, keep_id: str, user_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Resolve a contradiction: keep `keep_id`, supersede the rest for `subject`."""
+        body: dict[str, Any] = {"subject": subject, "keep_id": keep_id}
+        if user_id:
+            body["user_id"] = user_id
+        return await self._post_json("/api/v1/memories/contradictions/resolve", body)
+
+    # ── Knowledge graph ──────────────────────────────────────────────
+
+    async def memory_link(
+        self, src: str, relation: str, dst: str, supersede: bool = False
+    ) -> dict[str, Any]:
+        """Add a graph edge (src -[relation]-> dst). supersede closes the prior (src, relation)."""
+        return await self._post_json(
+            "/api/v1/memories/link",
+            {"src": src, "relation": relation, "dst": dst, "supersede": supersede},
+        )
+
+    async def graph_neighbors(
+        self, entity: str, depth: int = 1, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Edges around an entity (depth>1 expands the subgraph)."""
+        return (
+            await self._get_json(
+                "/api/v1/memories/graph",
+                {"entity": entity, "depth": depth, "limit": limit},
+            )
+        ).get("edges", [])
+
+    async def graph_edges(self, limit: int = 10000) -> list[dict[str, Any]]:
+        """All knowledge-graph edges (bulk view)."""
+        return (
+            await self._get_json("/api/v1/memories/edges", {"limit": limit})
+        ).get("edges", [])
+
+    async def graph_centrality(
+        self, as_of: Optional[str] = None, limit: Optional[int] = None
+    ) -> list[dict[str, Any]]:
+        """Degree + PageRank per node, optionally as-of a time."""
+        params: dict[str, Any] = {}
+        if as_of:
+            params["as_of"] = as_of
+        if limit:
+            params["limit"] = limit
+        return (await self._get_json("/api/v1/memories/graph/centrality", params)).get(
+            "nodes", []
+        )
+
+    async def graph_path(
+        self, src: str, dst: str, as_of: Optional[str] = None
+    ) -> Optional[list[str]]:
+        """Shortest directed path between two entities (None if unreachable)."""
+        params: dict[str, Any] = {"src": src, "dst": dst}
+        if as_of:
+            params["as_of"] = as_of
+        return (await self._get_json("/api/v1/memories/graph/path", params)).get("path")
+
+    async def graph_communities(
+        self, as_of: Optional[str] = None
+    ) -> list[list[str]]:
+        """Community detection (connected clusters), optionally as-of a time."""
+        params = {"as_of": as_of} if as_of else None
+        return (
+            await self._get_json("/api/v1/memories/graph/communities", params)
+        ).get("communities", [])
+
+    # ── Templates ────────────────────────────────────────────────────
+
+    async def memory_templates(self) -> list[dict[str, Any]]:
+        """Built-in memory templates."""
+        return (await self._get_json("/api/v1/memory-templates")).get("templates", [])
+
+    async def memory_from_template(
+        self,
+        template: str,
+        fields: dict[str, Any],
+        user_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a memory from a template + field values."""
+        body: dict[str, Any] = {"template": template, "fields": fields}
+        if user_id:
+            body["user_id"] = user_id
+        return await self._post_json("/api/v1/memories/from-template", body)
+
+    # ── Attachments (multimodal) ─────────────────────────────────────
+
+    async def attachment_upload(
+        self,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+        filename: Optional[str] = None,
+        memory_id: Optional[str] = None,
+        caption: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Upload a blob (image/PDF/audio). Optional caption stores a searchable memory."""
+        params: dict[str, Any] = {}
+        for k, v in (
+            ("filename", filename),
+            ("memory_id", memory_id),
+            ("caption", caption),
+        ):
+            if v is not None:
+                params[k] = v
+        # Raw bytes with the caller's content-type (not JSON), so httpx.post is used directly.
+        resp = await self._client.post(
+            "/api/v1/attachments",
+            params=params or None,
+            content=data,
+            headers={"content-type": content_type},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def attachment_get(self, attachment_id: str) -> bytes:
+        """Download an attachment's bytes."""
+        resp = await self._request("GET", f"/api/v1/attachments/{attachment_id}")
+        resp.raise_for_status()
+        return resp.content
+
+    async def attachment_list(
+        self, memory_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """List attachments (optionally for one memory)."""
+        params = {"memory_id": memory_id} if memory_id else None
+        return (await self._get_json("/api/v1/attachments", params)).get(
+            "attachments", []
+        )
+
+    async def attachment_delete(self, attachment_id: str) -> bool:
+        """Delete an attachment. False if it didn't exist."""
+        resp = await self._request("DELETE", f"/api/v1/attachments/{attachment_id}")
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+
+    # ── Cross-scope sharing (grants) ─────────────────────────────────
+
+    async def grant_create(self, grantee: str, grantor: str) -> dict[str, Any]:
+        """Let `grantee` additionally read `grantor`'s memories (tenant-strict)."""
+        return await self._post_json(
+            "/api/v1/memories/grants", {"grantee": grantee, "grantor": grantor}
+        )
+
+    async def grant_list(self, grantee: str) -> list[dict[str, Any]]:
+        """List the grantors a user may additionally read."""
+        return (
+            await self._get_json("/api/v1/memories/grants", {"grantee": grantee})
+        ).get("grants", [])
+
+    async def grant_revoke(self, grant_id: str) -> bool:
+        """Revoke a grant. False if it didn't exist."""
+        resp = await self._request("DELETE", f"/api/v1/memories/grants/{grant_id}")
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+
+    # ── Admin memory ops ─────────────────────────────────────────────
+
+    async def memory_reembed(self, limit: int = 1000) -> dict[str, Any]:
+        """Re-embed active memories with the current provider (after a model change)."""
+        return await self._post_json("/api/v1/admin/memory/reembed", {"limit": limit})
+
     # ── Sessions ─────────────────────────────────────────────────────
 
     async def session_start(
@@ -543,6 +740,10 @@ class EcphoriaClient:
         resp = await self._request("GET", f"/api/v1/sessions/{session_id}/recall")
         resp.raise_for_status()
         return resp.json().get("events", [])
+
+    async def session_distill(self, session_id: str) -> dict[str, Any]:
+        """Consolidate a session's events into memory."""
+        return await self._post_json(f"/api/v1/sessions/{session_id}/distill", {})
 
     # ── Agentic platform (runs, agents, triggers, tools) ─────────────
 

@@ -188,3 +188,58 @@ def test_events_escapes_source_and_validates_order_limit():
     # order is whitelisted to ASC/DESC (the injected tail is dropped); limit is an int.
     assert "ORDER BY ts DESC LIMIT 5" in sql
     assert sql.count("DROP TABLE episodic") == 1  # only inside the escaped literal, not executable
+
+
+def test_graph_and_cognition_methods_hit_right_endpoints():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, req.url.path))
+        p = req.url.path
+        if p == "/api/v1/memories/graph/centrality":
+            return httpx.Response(200, json={"nodes": [{"node": "a", "pagerank": 0.5}], "count": 1})
+        if p == "/api/v1/memories/graph/path":
+            return httpx.Response(200, json={"path": ["a", "b"], "reachable": True})
+        if p == "/api/v1/memories/graph/communities":
+            return httpx.Response(200, json={"communities": [["a", "b"]], "count": 1})
+        if p == "/api/v1/memories/m1/provenance":
+            return httpx.Response(200, json={"memory": {"id": "m1"}, "source_events": []})
+        if p == "/api/v1/memories/m1/feedback":
+            return httpx.Response(200, json={"id": "m1", "applied": True})
+        if p == "/api/v1/memory-templates":
+            return httpx.Response(200, json={"templates": [{"name": "preference"}]})
+        return httpx.Response(200, json={})
+
+    client = make_client(handler)
+    try:
+        nodes = run(client.graph_centrality(limit=5))
+        assert nodes[0]["node"] == "a"
+        assert run(client.graph_path("a", "b")) == ["a", "b"]
+        assert run(client.graph_communities())[0] == ["a", "b"]
+        assert run(client.memory_provenance("m1"))["memory"]["id"] == "m1"
+        assert run(client.memory_feedback("m1", "helpful"))["applied"] is True
+        assert run(client.memory_templates())[0]["name"] == "preference"
+    finally:
+        run(client.close())
+
+    paths = [p for _, p in calls]
+    assert "/api/v1/memories/graph/centrality" in paths
+    assert ("POST", "/api/v1/memories/m1/feedback") in calls
+
+
+def test_attachment_upload_sends_raw_bytes_with_content_type():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["ct"] = req.headers.get("content-type")
+        seen["body"] = req.content
+        return httpx.Response(201, json={"id": "att1", "content_type": "image/png"})
+
+    client = make_client(handler)
+    try:
+        meta = run(client.attachment_upload(b"\x89PNG", content_type="image/png", caption="shot"))
+    finally:
+        run(client.close())
+    assert meta["id"] == "att1"
+    assert seen["ct"] == "image/png"
+    assert seen["body"] == b"\x89PNG"
