@@ -436,6 +436,102 @@ impl Ecphoria for EcphoriaGrpcService {
             .collect();
         Ok(Response::new(proto::RecallSessionResponse { events }))
     }
+
+    // ── Knowledge-graph analytics (tenant-scoped; mirror of the REST /memories/graph/* routes) ──
+
+    async fn graph_centrality(
+        &self,
+        request: Request<proto::GraphAnalyticsRequest>,
+    ) -> Result<Response<proto::StructList>, Status> {
+        let tenant = self
+            .tenant_from(&request)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        let req = request.into_inner();
+        let mut nodes = self
+            .engine
+            .graph_centrality(&tenant, parse_as_of_opt(req.as_of.as_deref()))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if req.limit > 0 {
+            nodes.truncate(req.limit as usize);
+        }
+        let items = nodes
+            .into_iter()
+            .map(|n| super::convert::json_to_struct(serde_json::to_value(n).unwrap_or_default()))
+            .collect();
+        Ok(Response::new(proto::StructList { items }))
+    }
+
+    async fn graph_path(
+        &self,
+        request: Request<proto::GraphPathRequest>,
+    ) -> Result<Response<proto::GraphPathResponse>, Status> {
+        let tenant = self
+            .tenant_from(&request)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        let req = request.into_inner();
+        let path = self
+            .engine
+            .graph_path(
+                &tenant,
+                &req.src,
+                &req.dst,
+                parse_as_of_opt(req.as_of.as_deref()),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let (path, found) = match path {
+            Some(p) => (p, true),
+            None => (vec![], false),
+        };
+        Ok(Response::new(proto::GraphPathResponse { path, found }))
+    }
+
+    async fn graph_communities(
+        &self,
+        request: Request<proto::GraphAnalyticsRequest>,
+    ) -> Result<Response<proto::CommunityList>, Status> {
+        let tenant = self
+            .tenant_from(&request)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        let req = request.into_inner();
+        let communities = self
+            .engine
+            .graph_communities(&tenant, parse_as_of_opt(req.as_of.as_deref()))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|members| proto::Community { members })
+            .collect();
+        Ok(Response::new(proto::CommunityList { communities }))
+    }
+
+    async fn memory_provenance(
+        &self,
+        request: Request<proto::MemoryProvenanceRequest>,
+    ) -> Result<Response<prost_types::Struct>, Status> {
+        let tenant = self.tenant_from(&request).await?;
+        let req = request.into_inner();
+        let id = uuid::Uuid::parse_str(&req.id)
+            .map_err(|_| Status::invalid_argument("invalid memory id"))?;
+        let prov = self
+            .engine
+            .memory_provenance(id, tenant.as_deref())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("memory not found"))?;
+        let v = serde_json::to_value(prov).unwrap_or_default();
+        Ok(Response::new(super::convert::json_to_struct(v)))
+    }
+}
+
+/// Parse an optional RFC3339 `as_of` timestamp (lenient: unparseable → None, matching the REST path).
+fn parse_as_of_opt(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
 }
 
 /// Build a cognition scope from a proto scope + the caller's authenticated tenant (which always
@@ -821,5 +917,113 @@ mod tests {
             .into_inner();
         // A fresh session has no events yet — the call succeeds.
         assert_eq!(recalled.events.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn grpc_graph_and_provenance_rpcs() {
+        let service = svc().await;
+        let scope = || {
+            Some(proto::MemoryScope {
+                user_id: "alice".into(),
+                ..Default::default()
+            })
+        };
+
+        // Add a memory (tenant-a) and recover its id from the returned struct.
+        let added = service
+            .add_memory(authed(
+                proto::AddMemoryRequest {
+                    content: "Paris is the capital of France".into(),
+                    scope: scope(),
+                    subject: None,
+                    importance: None,
+                },
+                "tenant-a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = crate::grpc::convert::struct_to_json(added)["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Provenance round-trips for the owning tenant (carries the memory + its history).
+        let prov = service
+            .memory_provenance(authed(
+                proto::MemoryProvenanceRequest { id: id.clone() },
+                "tenant-a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let prov_json = crate::grpc::convert::struct_to_json(prov);
+        assert!(prov_json.get("memory").is_some());
+        assert!(prov_json.get("history").is_some());
+
+        // Cross-tenant provenance is isolated → NotFound (tenant-b can't see tenant-a's memory).
+        let err = service
+            .memory_provenance(authed(
+                proto::MemoryProvenanceRequest { id: id.clone() },
+                "tenant-b",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // A malformed id is rejected before any lookup.
+        let err = service
+            .memory_provenance(authed(
+                proto::MemoryProvenanceRequest {
+                    id: "not-a-uuid".into(),
+                },
+                "tenant-a",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Graph analytics RPCs wire through. This tenant has one edge-less memory, so the graph is
+        // empty and the two nodes are unreachable — the calls still succeed.
+        let cent = service
+            .graph_centrality(authed(
+                proto::GraphAnalyticsRequest {
+                    as_of: None,
+                    limit: 0,
+                },
+                "tenant-a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cent.items.is_empty());
+
+        let path = service
+            .graph_path(authed(
+                proto::GraphPathRequest {
+                    src: "x".into(),
+                    dst: "y".into(),
+                    as_of: None,
+                },
+                "tenant-a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!path.found);
+        assert!(path.path.is_empty());
+
+        let comms = service
+            .graph_communities(authed(
+                proto::GraphAnalyticsRequest {
+                    as_of: None,
+                    limit: 0,
+                },
+                "tenant-a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(comms.communities.is_empty());
     }
 }

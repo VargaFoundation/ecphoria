@@ -34,6 +34,14 @@ service Ecphoria {
   rpc StartSession(StartSessionRequest) returns (SessionResponse);
   rpc EndSession(EndSessionRequest) returns (SessionResponse);
   rpc RecallSession(RecallSessionRequest) returns (RecallSessionResponse);
+
+  // ── Knowledge-graph analytics (tenant-scoped; optional as-of RFC3339 timestamp) ──
+  rpc GraphCentrality(GraphAnalyticsRequest) returns (StructList);
+  rpc GraphPath(GraphPathRequest) returns (GraphPathResponse);
+  rpc GraphCommunities(GraphAnalyticsRequest) returns (CommunityList);
+
+  // ── Memory provenance (source events + supersession chain) ──
+  rpc MemoryProvenance(MemoryProvenanceRequest) returns (google.protobuf.Struct);
 }
 
 // Scope tuple for the memory cognition layer. The server overrides tenant_id with the caller's
@@ -100,6 +108,40 @@ message RecallSessionRequest {
 
 message RecallSessionResponse {
   repeated google.protobuf.Struct events = 1;
+}
+
+// Graph analytics request. `as_of` (RFC3339) rewinds the bi-temporal graph; empty = now.
+message GraphAnalyticsRequest {
+  optional string as_of = 1;
+  uint32 limit = 2;  // centrality only: keep the top-N ranked nodes (0 = all)
+}
+
+// Generic list of structured objects (e.g. per-node centrality rows).
+message StructList {
+  repeated google.protobuf.Struct items = 1;
+}
+
+message GraphPathRequest {
+  string src = 1;
+  string dst = 2;
+  optional string as_of = 3;
+}
+
+message GraphPathResponse {
+  repeated string path = 1;  // ordered node ids from src to dst
+  bool found = 2;            // false = unreachable
+}
+
+message CommunityList {
+  repeated Community communities = 1;
+}
+
+message Community {
+  repeated string members = 1;
+}
+
+message MemoryProvenanceRequest {
+  string id = 1;
 }
 
 message QueryRequest {
