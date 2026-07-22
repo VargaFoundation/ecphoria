@@ -1,4 +1,4 @@
-"""Ecphoria client — async HTTP client for the Ecphoria context lake API."""
+"""Ecphoria client — async HTTP client for the Ecphoria agentic memory platform API."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ _DEFAULT_BACKOFF_MAX = 30.0
 
 
 class EcphoriaClient:
-    """Async client for the Ecphoria context lake REST API.
+    """Async client for the Ecphoria agentic memory platform REST API.
 
     Features retry logic with exponential backoff on 429 (rate-limited) and
     503 (service unavailable) responses.

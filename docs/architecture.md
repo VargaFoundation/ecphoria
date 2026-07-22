@@ -292,6 +292,21 @@ apply on all nodes.
 
 ---
 
+## 10. Additional subsystems (recent)
+
+- **SQL over memories** — the cognition tables (`memories`/`memory_edges`/`memory_grants`/
+  `memory_attachments`) are reachable from `SELECT` via `query::sql_guard` (read-only, per-tenant
+  view rewrite), so bi-temporal `SELECT … FROM memories` works over PG-wire/REST/gRPC/MCP.
+- **Multimodal attachments** — binary blobs (image/PDF/audio) in the configured storage backend +
+  metadata in cognition; optional image embedding (`ImageEmbeddingProvider`, `embed-image`) for
+  image-similarity search.
+- **Graph analytics** (`memory::graph_analytics`) — degree + PageRank centrality, community
+  detection, shortest path, all with temporal (as-of) snapshots.
+- **Embedded mode** (`embedded::Ecphoria`) — the engine in-process, no server ("the SQLite of agent
+  memory"); a **Python binding** (`bindings/python`, pyo3) wraps it.
+- **Public publish** (`/public`, opt-in) — read-only view of `metadata.published=true` memories.
+- **Memory templates**; **Obsidian round-trip** (import/export + live `--watch` sync).
+
 ## Related docs
 - [Agentic platform](agentic-platform.md) — the run/agent/HITL/workflow/trigger/tool API.
 - [Benchmarks](benchmarks-locomo.md) + [`ops/bench/`](../ops/bench/) — memory-quality evaluation.

@@ -5,7 +5,7 @@ mod commands;
 mod output;
 
 #[derive(Parser)]
-#[command(name = "ecphoria", about = "Ecphoria context lake CLI", version)]
+#[command(name = "ecphoria", about = "Ecphoria agentic memory platform CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: commands::Command,

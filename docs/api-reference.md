@@ -2,6 +2,11 @@
 
 Ecphoria exposes multiple protocol interfaces. All access the same underlying engine.
 
+> **This page covers the core surface.** For the authoritative, complete REST contract (including
+> memories, graph analytics, attachments, templates, sessions, the agentic runtime, and admin
+> endpoints) see [`docs/openapi.yaml`](./openapi.yaml) and the route table in the gateway crate's
+> `CLAUDE.md`.
+
 ## REST API
 
 Base URL: `http://localhost:8432`
@@ -282,14 +287,19 @@ Add to Claude Desktop, VS Code, Cursor, or any MCP client:
 
 ### Tools
 
+The MCP server advertises a broader tool set than shown here (query/ingest/search/state/embed, plus
+sessions and the memory + graph tools). Call `tools/list` for the authoritative, current list.
+
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `query` | Execute SQL query | `sql` (string) |
 | `ingest` | Ingest events | `source` (string), `events` (array) |
-| `search` | Semantic search | `query` (string), `k` (number) |
+| `search` | Semantic search | `text` (string), `k` (number) |
 | `get_state` | Get agent state | `agent_id` (string), `key` (string) |
 | `set_state` | Set agent state | `agent_id` (string), `key` (string), `value` (any) |
 | `embed` | Compute embedding | `text` (string) |
+| `add_memory` / `search_memory` / `get_memories` / `memory_history` / `delete_memory` / `remember` | Cognition memory tools | see `tools/list` |
+| `link_memory` / `graph_neighbors` | Knowledge-graph tools | see `tools/list` |
 
 ### Prompts
 
@@ -333,12 +343,16 @@ Provider detection:
 
 ```bash
 ecphoria status                          # Server health check
-ecphoria query "SELECT ..."              # Execute SQL
+ecphoria query "SELECT ..."              # Execute SQL (incl. SELECT ... FROM memories)
 ecphoria ingest --source X --file Y      # Bulk ingest from file
 ecphoria export --entity ID              # GDPR data export
-ecphoria backup --target s3://...        # Trigger backup
-ecphoria restore --from s3://...         # Restore from backup
+ecphoria export --to obsidian --path DIR # Export memories to an Obsidian vault
+ecphoria import --from obsidian --path DIR [--watch]  # Import a vault (live sync with --watch)
+ecphoria backup                          # Trigger a server-side backup (to the data dir)
+ecphoria restore --path <dir>            # Restore from a server-local backup dir (DESTRUCTIVE)
 ```
+
+See `ecphoria --help` for the full command set (retention, audit, tenant, memory, reindex, rebalance).
 
 ### Global Options
 

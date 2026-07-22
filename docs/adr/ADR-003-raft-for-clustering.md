@@ -55,4 +55,4 @@ Implementation details:
 - **Write throughput**: All writes go through the leader and require majority acknowledgment. Write latency is bounded by the slowest majority node's network RTT. For Ecphoria's workload (agent events, not financial transactions), this is acceptable.
 - **Odd-number clusters**: Raft requires a majority quorum, so 3 or 5 nodes are optimal. 2-node clusters cannot tolerate any failure. Operators must understand this constraint.
 - **Snapshot complexity**: As the Raft log grows, snapshots must be taken and transferred to lagging followers. Our in-memory MemStore means snapshots include the full state, which grows with event count. Mitigated by periodic compaction.
-- **Leader bottleneck**: All writes route to a single node. Horizontal write scaling requires sharding (not yet implemented), not just adding Raft members.
+- **Leader bottleneck**: All writes route to a single node per group. Horizontal write scaling uses sharding — multiple independent Raft groups with consistent-hash tenant routing (shipped; see `docs/deployment.md`) — not just adding members to one group.

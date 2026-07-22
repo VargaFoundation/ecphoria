@@ -4,7 +4,7 @@ package ecphoria;
 
 import "google/protobuf/struct.proto";
 
-// Ecphoria Context Lake gRPC Service
+// Ecphoria agentic memory platform gRPC Service
 service Ecphoria {
   // Execute a SQL query
   rpc Query(QueryRequest) returns (QueryResponse);

@@ -53,7 +53,7 @@ This starts Ecphoria, Ollama (for embeddings), and all three agents.
 ```bash
 # Start Ecphoria
 docker run -d --name ecphoria -p 8432:8432 -p 5432:5432 \
-  ghcr.io/varga-foundation/ecphoria:latest
+  ghcr.io/vargafoundation/ecphoria:latest
 
 # Install deps
 pip install -r requirements.txt

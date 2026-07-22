@@ -1,4 +1,4 @@
-// Package ecphoria provides an HTTP client for the Ecphoria context lake API.
+// Package ecphoria provides an HTTP client for the Ecphoria agentic memory platform API.
 //
 // Zero external dependencies — uses only the standard library (net/http, encoding/json).
 //
@@ -42,7 +42,7 @@ type ClientOptions struct {
 	HTTPClient *http.Client
 }
 
-// Client is an HTTP client for the Ecphoria context lake REST API.
+// Client is an HTTP client for the Ecphoria agentic memory platform REST API.
 type Client struct {
 	baseURL    string
 	apiKey     string

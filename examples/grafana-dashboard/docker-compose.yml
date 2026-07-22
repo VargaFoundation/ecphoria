@@ -1,6 +1,6 @@
 services:
   ecphoria:
-    image: ghcr.io/varga-foundation/ecphoria:latest
+    image: ghcr.io/vargafoundation/ecphoria:latest
     ports:
       - "8432:8432"
       - "5432:5432"

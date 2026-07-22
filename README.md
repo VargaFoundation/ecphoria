@@ -1,6 +1,6 @@
 <h1 align="center">Ecphoria</h1>
 <p align="center">
-  <strong>The open-source memory engine for AI agents — self-hostable and benchmarkable.</strong><br>
+  <strong>The open-source agentic memory platform for AI agents — self-hostable and benchmarkable.</strong><br>
   Bi-temporal memories with dedup, contradiction resolution, and hybrid search — in a single Rust binary.
 </p>
 
@@ -44,6 +44,7 @@ the smarts run in your own single Rust binary, on your own infrastructure.
 | Memory | What it stores | Backend | Query |
 |--------|---------------|---------|-------|
 | **Episodic** | Events, logs, actions | DuckDB (columnar SQL) | Full SQL |
+| **Memories (cognition)** | Distilled bi-temporal facts + knowledge graph | DuckDB | Full SQL (`SELECT … FROM memories`, incl. `valid_from`/`valid_to`) + hybrid retrieval |
 | **Semantic** | Embeddings, knowledge | USearch (HNSW vectors) | k-NN similarity |
 | **State** | Live agent state, decisions | SQLite + DashMap (KV with TTL) | Get/Set/CAS |
 

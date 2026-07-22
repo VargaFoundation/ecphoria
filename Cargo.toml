@@ -18,7 +18,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 repository = "https://github.com/VargaFoundation/ecphoria"
-description = "The open-source context lake for AI agents"
+description = "The open-source agentic memory platform for AI agents"
 
 [workspace.dependencies]
 # Internal crates

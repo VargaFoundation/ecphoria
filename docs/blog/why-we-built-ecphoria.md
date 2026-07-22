@@ -49,7 +49,7 @@ curl -X PUT http://localhost:8432/api/v1/state/my-agent/context \
 All three share the same process, the same config, the same API. One `docker run`:
 
 ```bash
-docker run -p 8432:8432 -p 5432:5432 ghcr.io/varga-foundation/ecphoria:latest
+docker run -p 8432:8432 -p 5432:5432 ghcr.io/vargafoundation/ecphoria:latest
 ```
 
 ## What Makes It Different
@@ -68,7 +68,7 @@ Try it in 30 seconds:
 
 ```bash
 # Start Ecphoria
-docker run -d -p 8432:8432 -p 5432:5432 ghcr.io/varga-foundation/ecphoria:latest
+docker run -d -p 8432:8432 -p 5432:5432 ghcr.io/vargafoundation/ecphoria:latest
 
 # Ingest an event
 curl -X POST http://localhost:8432/api/v1/ingest \
@@ -85,4 +85,4 @@ Then explore the [examples](../../examples/) — a Claude agent with persistent 
 
 Ecphoria is open source under the Apache 2.0 license. Star the repo, try it out, and tell us what you build.
 
-[GitHub](https://github.com/varga-foundation/ecphoria) | [Documentation](https://docs.ecphoria.dev) | [Discord](https://discord.gg/ecphoria)
+[GitHub](https://github.com/VargaFoundation/ecphoria) | [Documentation](https://docs.ecphoria.dev) | [Discord](https://discord.gg/ecphoria)

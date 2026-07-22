@@ -13,7 +13,7 @@ pub fn print() {
   ___) | |_| | | (_| | || (_| |
  |____/ \__|_|  \__,_|\__\__,_|
 
-  The open-source context lake for AI agents
+  The open-source agentic memory platform for AI agents
   Version: {version}
 "#
     );

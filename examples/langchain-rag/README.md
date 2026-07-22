@@ -39,7 +39,7 @@ A complete Retrieval-Augmented Generation pipeline that ingests documents into E
 docker run -d --name ecphoria -p 8432:8432 -p 5432:5432 \
   -e ECPHORIA_EMBEDDING__PROVIDER=ollama \
   -e ECPHORIA_EMBEDDING__OLLAMA_URL=http://host.docker.internal:11434 \
-  ghcr.io/varga-foundation/ecphoria:latest
+  ghcr.io/vargafoundation/ecphoria:latest
 ```
 
 **2. Install dependencies**
@@ -110,7 +110,7 @@ For OpenAI embeddings on the Ecphoria side:
 docker run -d --name ecphoria -p 8432:8432 -p 5432:5432 \
   -e ECPHORIA_EMBEDDING__PROVIDER=openai \
   -e ECPHORIA_EMBEDDING__OPENAI_API_KEY=sk-... \
-  ghcr.io/varga-foundation/ecphoria:latest
+  ghcr.io/vargafoundation/ecphoria:latest
 ```
 
 ## Customization

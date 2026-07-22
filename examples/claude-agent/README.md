@@ -34,7 +34,7 @@ A conversational AI agent that **remembers everything** — powered by Claude fo
 ```bash
 docker run -d --name ecphoria \
   -p 8432:8432 -p 5432:5432 \
-  ghcr.io/varga-foundation/ecphoria:latest
+  ghcr.io/vargafoundation/ecphoria:latest
 ```
 
 **2. Install dependencies**

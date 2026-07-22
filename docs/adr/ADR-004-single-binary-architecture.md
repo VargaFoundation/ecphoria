@@ -53,7 +53,7 @@ All subsystems share the same Tokio runtime, the same configuration file, and th
 
 ### Negative
 
-- **Vertical scaling limits**: A single process can only use one machine's resources. For workloads exceeding one node's capacity, cluster mode (Raft) distributes the load, but sharding is not yet implemented. Very large deployments may need a different architecture.
+- **Vertical scaling limits**: A single process can only use one machine's resources. For workloads exceeding one node's capacity, cluster mode (Raft) distributes the load and sharding (multiple independent Raft groups + operator) scales writes horizontally. Very large deployments may still need a different architecture. *(Update: sharding shipped — see the sharded deployment section in `docs/deployment.md`.)*
 - **All-or-nothing updates**: Upgrading the vector search engine also upgrades the SQL engine and the KV store. There's no way to update one component independently. Mitigated by semantic versioning and comprehensive integration tests.
 - **Larger binary**: Embedding three storage engines plus four protocol servers produces a ~60MB binary. Acceptable for a server-side tool but larger than a typical microservice.
 - **Memory contention**: DuckDB, USearch, and SQLite all manage their own memory. Under heavy load, they could compete for the same physical memory. Mitigated by configuring memory limits per subsystem and monitoring via Prometheus metrics.

@@ -1,5 +1,12 @@
-# PRODUCT SPEC — Context Lake Open Source
-# Document de référence produit — v1.0
+> ⚠️ **ARCHIVED — historical pre-launch planning document. Not a current product reference.**
+> Written before launch (and before the Strata→Ecphoria rename), it predates the cognition/
+> bi-temporal memory layer, the agent runtime (runs/agents/triggers/HITL), attachments, graph
+> analytics, and clustering. Its §10 naming study was mangled by the mechanical rename and no longer
+> makes sense. Kept only for history. For current docs see `docs/architecture.md`, the crate
+> `CLAUDE.md` files, and `docs/openapi.yaml`.
+
+# PRODUCT SPEC — Context Lake Open Source (ARCHIVED)
+# Document de référence produit — v1.0 (historique)
 # À ingérer par Claude Code pour le développement du projet
 
 ---

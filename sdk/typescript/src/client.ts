@@ -19,7 +19,7 @@ import type {
 } from "./types.js";
 
 /**
- * Ecphoria client — fetch-based HTTP client for the Ecphoria context lake API.
+ * Ecphoria client — fetch-based HTTP client for the Ecphoria agentic memory platform API.
  *
  * Zero runtime dependencies. Uses the global `fetch` API (Node 18+, Deno, Bun, browsers).
  *

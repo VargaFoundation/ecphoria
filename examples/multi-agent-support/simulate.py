@@ -126,7 +126,7 @@ async def main() -> None:
     if not await client.health():
         print("Error: cannot reach Ecphoria. Is it running?")
         print("Start it with: docker run -d -p 8432:8432 -p 5432:5432 "
-              "ghcr.io/varga-foundation/ecphoria:latest")
+              "ghcr.io/vargafoundation/ecphoria:latest")
         return
 
     log.info("Connected to Ecphoria — generating %d sample tickets", len(SAMPLE_TICKETS))
