@@ -2430,6 +2430,7 @@ async fn published_items(
         let guard = state.cache.lock();
         if let Some((at, items)) = guard.as_ref() {
             if at.elapsed() < PUBLISH_CACHE_TTL {
+                metrics::counter!("ecphoria_publish_cache_total", "result" => "hit").increment(1);
                 return Ok(items.clone());
             }
         }
@@ -2453,6 +2454,9 @@ async fn published_items(
             ))
         }
     };
+    // Domain signal: cache effectiveness + the size of the public surface (per full scan).
+    metrics::counter!("ecphoria_publish_cache_total", "result" => "miss").increment(1);
+    metrics::histogram!("ecphoria_publish_items").record(items.len() as f64);
     *state.cache.lock() = Some((std::time::Instant::now(), items.clone()));
     Ok(items)
 }
@@ -2631,7 +2635,12 @@ pub async fn memory_from_template(
     input.subject = Some(subject);
     input.mem_type = Some(mem_type);
     match engine.memory_add(input).await {
-        Ok(add) => api_ok(serde_json::to_value(&add).unwrap_or_default()),
+        Ok(add) => {
+            // Domain signal: which built-in templates get used (name is validated → bounded label).
+            metrics::counter!("ecphoria_templates_instantiated_total", "template" => req.template.clone())
+                .increment(1);
+            api_ok(serde_json::to_value(&add).unwrap_or_default())
+        }
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "MEMORY_ERROR",
@@ -2768,6 +2777,7 @@ pub async fn attachment_upload(
         .as_deref()
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
+    let byte_len = body.len();
     let meta = match engine
         .attachment_put(&tenant, memory_id, &content_type, q.filename.clone(), body)
         .await
@@ -2781,6 +2791,9 @@ pub async fn attachment_upload(
             )
         }
     };
+    // Domain signal: attachment volume + payload-size distribution (unlabeled → bounded cardinality).
+    metrics::counter!("ecphoria_attachments_uploaded_total").increment(1);
+    metrics::histogram!("ecphoria_attachment_bytes").record(byte_len as f64);
 
     // Optional caption → a searchable memory citing the attachment (the pragmatic "multimodal
     // memory": the blob is stored, its caption/OCR text is recalled via the normal hybrid search).

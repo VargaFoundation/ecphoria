@@ -442,6 +442,20 @@ curl http://localhost:8432/metrics
 For Docker, the built-in HEALTHCHECK uses `curl http://localhost:8432/health`.
 For Kubernetes, liveness and readiness probes are configured in the Helm chart.
 
+Notable series (all `ecphoria_`-prefixed) beyond the per-endpoint request/duration counters:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ecphoria_rest_requests_total{endpoint}` | counter | Requests per REST endpoint |
+| `ecphoria_rest_request_duration_seconds{endpoint}` | histogram | Latency per REST endpoint |
+| `ecphoria_episodic_events_ingested_total` | counter | Episodic events appended |
+| `ecphoria_webhook_rejected_total{reason}` | counter | Webhooks rejected (bad_signature / no_secret) |
+| `ecphoria_attachments_uploaded_total` | counter | Attachment blobs uploaded |
+| `ecphoria_attachment_bytes` | histogram | Uploaded attachment size distribution |
+| `ecphoria_publish_cache_total{result}` | counter | `/public` scan cache hits vs misses |
+| `ecphoria_publish_items` | histogram | Published-memory count per full `/public` scan |
+| `ecphoria_templates_instantiated_total{template}` | counter | Memories created per built-in template |
+
 ### Distributed tracing (OTLP)
 
 Metrics ship to Prometheus out of the box. For **traces**, build with the `otlp` feature and point
