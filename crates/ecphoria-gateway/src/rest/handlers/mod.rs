@@ -2177,7 +2177,6 @@ pub async fn memory_graph(
     }
 }
 
-
 pub async fn memory_decay(State(engine): State<Arc<EcphoriaEngine>>) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_decay").increment(1);
     match engine.memory_enforce_decay().await {
