@@ -2387,7 +2387,8 @@ pub async fn memory_edges(
 // ── Public read-only publish (opt-in, unauthenticated) ─────────────────────
 
 /// Cached rendered public items + when they were computed (short-TTL; see `PUBLISH_CACHE_TTL`).
-type PublishCache = std::sync::Arc<parking_lot::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>>>;
+type PublishCache =
+    std::sync::Arc<parking_lot::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>>>;
 
 /// State for the public publish endpoints — the tenant whose published memories are exposed, plus a
 /// short-TTL result cache. Only layered when `gateway.publish_enabled`, so the routes 404 otherwise.

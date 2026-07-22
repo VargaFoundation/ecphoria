@@ -1478,15 +1478,16 @@ impl EcphoriaEngine {
             self.semantic.clone(),
             self.state.clone(),
             self.embedding.clone(),
-        );
+        )
+        .with_memory(self.memory_store.clone());
 
         tokio::time::timeout(timeout, executor.execute(plan, max_rows))
             .await
             .map_err(|_| crate::Error::Query("query timed out".into()))?
     }
 
-    /// Execute SQL scoped to a single tenant — every `episodic` reference is rewritten to a
-    /// per-tenant filtered view, so the caller can only read its own rows (row-level isolation).
+    /// Execute SQL scoped to a single tenant — every `episodic`/`memories`/… reference is rewritten
+    /// to a per-tenant filtered view, so the caller can only read its own rows (row-level isolation).
     pub async fn query_sql_for_tenant(
         &self,
         sql: &str,
@@ -1502,6 +1503,7 @@ impl EcphoriaEngine {
             self.state.clone(),
             self.embedding.clone(),
         )
+        .with_memory(self.memory_store.clone())
         .with_tenant(tenant);
 
         tokio::time::timeout(timeout, executor.execute(plan, max_rows))
@@ -4665,6 +4667,70 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn sql_over_memories_visible_scoped_and_readonly() {
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::tenant("acme"),
+                "acme likes rust",
+            ))
+            .await
+            .unwrap();
+        engine
+            .memory_add(MemoryInput::new(
+                MemoryScope::tenant("globex"),
+                "globex likes go",
+            ))
+            .await
+            .unwrap();
+
+        // The `memories` table is now reachable from SQL (bi-temporal columns included).
+        let rows = engine
+            .query_sql(
+                "SELECT content, valid_from, valid_to FROM memories WHERE valid_to IS NULL ORDER BY content",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["content"], "acme likes rust");
+        // valid_from must serialize as a real timestamp string (not null) — the bi-temporal story.
+        assert!(
+            rows[0]["valid_from"]
+                .as_str()
+                .is_some_and(|s| s.contains('T')),
+            "valid_from did not serialize: {:?}",
+            rows[0]["valid_from"]
+        );
+        assert!(rows[0]["valid_to"].is_null());
+
+        // Tenant-scoped SQL only sees its own rows — the other tenant's content must not leak.
+        let a = engine
+            .query_sql_for_tenant("SELECT content FROM memories", "acme")
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["content"], "acme likes rust");
+        let g = engine
+            .query_sql_for_tenant("SELECT content FROM memories", "globex")
+            .await
+            .unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["content"], "globex likes go");
+
+        // Read-only: writes to the memory tables are rejected.
+        assert!(engine.query_sql("DELETE FROM memories").await.is_err());
+        assert!(engine
+            .query_sql("INSERT INTO memories (id) VALUES ('x')")
+            .await
+            .is_err());
+        // A query spanning both stores is rejected (they are separate databases).
+        assert!(engine
+            .query_sql("SELECT * FROM memories m JOIN episodic e ON e.id = m.id")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

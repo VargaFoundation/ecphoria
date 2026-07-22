@@ -600,7 +600,7 @@ impl EpisodicStore {
     /// the same instance the backup path `EXPORT DATABASE`s through), we can't disable it at the
     /// connection level without breaking backup/restore — so we reject these functions in the
     /// untrusted-SQL validator instead. Fails **closed**.
-    fn validate_read_only(sql: &str) -> crate::Result<()> {
+    pub(crate) fn validate_read_only(sql: &str) -> crate::Result<()> {
         use sqlparser::ast::{visit_expressions, visit_relations, Expr};
         use sqlparser::dialect::DuckDbDialect;
         use sqlparser::parser::Parser;
@@ -795,7 +795,7 @@ impl EpisodicStore {
 
     /// Deterministic, collision-resistant, SQL-safe per-tenant view name for `table`
     /// (`<table>__t_<sanitized-tenant>_<fnv1a-hash>`).
-    fn tenant_scoped_view_name(table: &str, tenant: &str) -> String {
+    pub(crate) fn tenant_scoped_view_name(table: &str, tenant: &str) -> String {
         let mut sani: String = tenant
             .chars()
             .map(|c| {
@@ -1123,7 +1123,7 @@ impl Default for EpisodicStore {
 /// a JSON number and a `DOUBLE` stays a number, while VARCHAR/JSON/TIMESTAMP columns come back as
 /// strings. Previously every column was coerced via `get::<String>`, which returned "" for any
 /// non-VARCHAR column (e.g. aggregates).
-fn column_to_json(row: &duckdb::Row<'_>, i: usize) -> serde_json::Value {
+pub(crate) fn column_to_json(row: &duckdb::Row<'_>, i: usize) -> serde_json::Value {
     // Match the column's ACTUAL type (via ValueRef) rather than trying Rust types in sequence —
     // DuckDB's FromSql coerces between numeric types (DOUBLE→i64 truncates, integer→bool), so a
     // try-in-order approach would mangle values. This preserves each column's real type in JSON.
@@ -1144,8 +1144,22 @@ fn column_to_json(row: &duckdb::Row<'_>, i: usize) -> serde_json::Value {
         Ok(V::Float(f)) => serde_json::json!(f),
         Ok(V::Double(f)) => serde_json::json!(f),
         Ok(V::Text(t)) => serde_json::json!(String::from_utf8_lossy(t).into_owned()),
-        // Decimal / Timestamp / Date / Time / Interval / Blob → stringify (readable, lossless enough
-        // for a query result). Reuse the String getter for a clean rendering where available.
+        // Timestamps (e.g. `valid_from`/`valid_to`/`ts`) → RFC3339 string. The `String` getter
+        // returns Err for TIMESTAMPTZ, so without this they'd serialize as null — which would defeat
+        // the bi-temporal SQL story (`SELECT valid_from FROM memories`).
+        Ok(V::Timestamp(unit, v)) => {
+            let micros = match unit {
+                duckdb::types::TimeUnit::Second => v.saturating_mul(1_000_000),
+                duckdb::types::TimeUnit::Millisecond => v.saturating_mul(1_000),
+                duckdb::types::TimeUnit::Microsecond => v,
+                duckdb::types::TimeUnit::Nanosecond => v / 1_000,
+            };
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+                .map(|dt| serde_json::json!(dt.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null)
+        }
+        // Decimal / Date / Time / Interval / Blob → stringify (readable, lossless enough for a query
+        // result). Reuse the String getter for a clean rendering where available.
         Ok(_) => row
             .get::<_, String>(i)
             .map(serde_json::Value::String)

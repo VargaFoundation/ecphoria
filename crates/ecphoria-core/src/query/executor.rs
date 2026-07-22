@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
+use crate::memory::cognition::MemoryStore;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::SemanticStore;
 use crate::memory::state::StateStore;
@@ -15,6 +16,9 @@ pub struct QueryExecutor {
     semantic: Arc<SemanticStore>,
     state: Arc<StateStore>,
     embedding: Option<Arc<dyn EmbeddingProvider>>,
+    /// The cognition store, so `SELECT … FROM memories` (and the other cognition tables) can be
+    /// served from the connection that owns them (a separate DuckDB from episodic).
+    memory: Option<Arc<MemoryStore>>,
     /// When set, SQL queries are scoped to this tenant (row-level isolation).
     tenant: Option<String>,
 }
@@ -31,6 +35,7 @@ impl QueryExecutor {
             semantic,
             state,
             embedding,
+            memory: None,
             tenant: None,
         }
     }
@@ -38,6 +43,13 @@ impl QueryExecutor {
     /// Scope all SQL execution to a single tenant (row-level isolation).
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Wire the cognition store so SQL over `memories`/`memory_edges`/`memory_grants`/
+    /// `memory_attachments` is routed to the connection that owns those tables.
+    pub fn with_memory(mut self, memory: Arc<MemoryStore>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -65,6 +77,25 @@ impl QueryExecutor {
                     Ok(Some(rewritten)) => rewritten,
                     _ => sql,
                 };
+                // Route by which store owns the referenced tables: cognition tables go to the memory
+                // store (a separate DuckDB), everything else to episodic. A query spanning both
+                // stores can't be one statement (distinct databases) — reject it clearly.
+                if let Some(mem) = &self.memory {
+                    let tables =
+                        super::sql_guard::referenced_tables(&effective).unwrap_or_default();
+                    let cognitive = tables
+                        .iter()
+                        .any(|t| MemoryStore::SQL_TABLES.contains(&t.as_str()));
+                    if cognitive {
+                        if tables.iter().any(|t| t == "episodic" || t == "sessions") {
+                            return Err(crate::Error::Query(
+                                "a single SQL query cannot span the episodic and memory stores"
+                                    .into(),
+                            ));
+                        }
+                        return mem.query_sql(&effective, self.tenant.as_deref(), max_rows);
+                    }
+                }
                 // Scope to the tenant if one is set (row-level isolation), else run as-is.
                 match &self.tenant {
                     Some(t) => self.episodic.query_sql_for_tenant(&effective, t, max_rows),

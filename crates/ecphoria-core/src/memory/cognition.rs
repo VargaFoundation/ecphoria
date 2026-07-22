@@ -639,6 +639,9 @@ pub struct MemoryStore {
     write_db: Arc<Mutex<Connection>>,
     read_pool: Vec<Mutex<Connection>>,
     read_next: AtomicUsize,
+    /// Tenants for which the per-tenant SQL views already exist (see `query_sql`) — avoids the
+    /// catalog write on every scoped read.
+    tenant_views_created: dashmap::DashSet<String>,
 }
 
 impl std::fmt::Debug for MemoryStore {
@@ -698,6 +701,7 @@ impl MemoryStore {
             write_db: Arc::new(Mutex::new(write_conn)),
             read_pool,
             read_next: AtomicUsize::new(0),
+            tenant_views_created: dashmap::DashSet::new(),
         })
     }
 
@@ -1047,6 +1051,86 @@ impl MemoryStore {
             limit.clamp(1, 1_000_000)
         );
         self.query_memories(&sql, &[tenant.to_string()])
+    }
+
+    /// The tenant-owned tables this store exposes to SQL (all carry a `tenant_id` column).
+    pub(crate) const SQL_TABLES: &'static [&'static str] = &[
+        "memories",
+        "memory_edges",
+        "memory_grants",
+        "memory_attachments",
+    ];
+
+    /// Execute a **read-only** SQL query against the cognition tables (`memories`, `memory_edges`,
+    /// `memory_grants`, `memory_attachments`) — the path that makes `SELECT … FROM memories` (incl.
+    /// bi-temporal `valid_from`/`valid_to`) work over REST/PG-wire/gRPC/MCP. SELECT-only (writes and
+    /// filesystem/network functions rejected). When `tenant` is `Some`, every cognition table is
+    /// rewritten to a per-tenant view so a tenant only ever reads its own rows (fails closed).
+    pub fn query_sql(
+        &self,
+        sql: &str,
+        tenant: Option<&str>,
+        max_rows: usize,
+    ) -> crate::Result<Vec<serde_json::Value>> {
+        crate::query::sql_guard::validate_read_only(sql)?;
+
+        let effective = match tenant {
+            Some(t) => {
+                // Rewrite BEFORE touching the catalog, then ensure the per-tenant views exist.
+                let rewritten = crate::query::sql_guard::scope_tables(sql, t, Self::SQL_TABLES)?;
+                if !self.tenant_views_created.contains(t) {
+                    let escaped = t.replace('\'', "''");
+                    let mut batch = String::new();
+                    for table in Self::SQL_TABLES {
+                        let view =
+                            super::episodic::EpisodicStore::tenant_scoped_view_name(table, t);
+                        batch.push_str(&format!(
+                            "CREATE OR REPLACE VIEW {view} AS SELECT * FROM {table} WHERE tenant_id = '{escaped}';"
+                        ));
+                    }
+                    self.write_db
+                        .lock()
+                        .execute_batch(&batch)
+                        .map_err(|e| crate::Error::Query(format!("create tenant view: {e}")))?;
+                    self.tenant_views_created.insert(t.to_string());
+                }
+                rewritten
+            }
+            None => sql.to_string(),
+        };
+
+        let db = self.read_conn();
+        let mut stmt = db
+            .prepare(&effective)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let mut rows_iter = stmt
+            .query([])
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let column_count = rows_iter.as_ref().unwrap().column_count();
+        let column_names: Vec<String> = (0..column_count)
+            .map(|i| {
+                rows_iter
+                    .as_ref()
+                    .unwrap()
+                    .column_name(i)
+                    .map_or("?".to_string(), |v| v.to_string())
+            })
+            .collect();
+        let mut results = Vec::new();
+        while let Some(row) = rows_iter
+            .next()
+            .map_err(|e| crate::Error::Query(e.to_string()))?
+        {
+            if results.len() >= max_rows {
+                break;
+            }
+            let mut obj = serde_json::Map::new();
+            for (i, name) in column_names.iter().enumerate() {
+                obj.insert(name.clone(), super::episodic::column_to_json(row, i));
+            }
+            results.push(serde_json::Value::Object(obj));
+        }
+        Ok(results)
     }
 
     /// Active memories a tenant has explicitly marked published (`metadata.published == true`),

@@ -23,7 +23,7 @@ or clustering (Raft).
 | `OpenAiProvider` | **Working** | HTTP POST to OpenAI /v1/embeddings, auto-wired from config |
 | `S3Storage` | **Working** | aws-sdk-s3, put/get/delete/list, MinIO-compatible |
 | `MaterializedViews` | **Working** | DuckDB CREATE TABLE AS, refresh, drop, list, SQL-injection-safe (name validation + SELECT whitelist) |
-| `QueryPlanner` | **Working** | Routes SQL to DuckDB, intercepts ecphoria_search() and ecphoria_state() calls, hybrid query rewriting via CTE injection for JOINs/subqueries |
+| `QueryPlanner` | **Working** | Routes SQL to DuckDB, intercepts ecphoria_search() and ecphoria_state() calls, hybrid query rewriting via CTE injection for JOINs/subqueries. **Routes cognition-table SQL** (`memories`/`memory_edges`/`memory_grants`/`memory_attachments`) to the MemoryStore connection (shared read-only guard + per-tenant view rewrite via `query::sql_guard`), so `SELECT … FROM memories` (incl. bi-temporal `valid_from`/`valid_to`) works over PG-wire/REST/gRPC/MCP. Cross-store (episodic+memories) single statements are rejected. |
 | `TenantContext` | **Working** | Struct for multi-tenancy scoping, `resolve_secret()` helper for _FILE convention |
 
 ## Public API Surface
