@@ -1683,8 +1683,26 @@ pub async fn memory_list(
         params.agent_id.as_deref(),
         params.session_id.as_deref(),
     );
-    match engine.memory_all(&scope, params.limit).await {
-        Ok(mems) => api_ok(serde_json::json!({ "memories": mems, "count": mems.len() })),
+    let filter = ecphoria_core::memory::cognition::MemoryFilter {
+        mem_type: params.mem_type.clone(),
+        min_importance: params.min_importance,
+        updated_after: parse_as_of(params.updated_after.as_deref()),
+        updated_before: parse_as_of(params.updated_before.as_deref()),
+        metadata: match (params.metadata_key.clone(), params.metadata_value.clone()) {
+            (Some(k), Some(v)) => Some((k, v)),
+            _ => None,
+        },
+    };
+    match engine
+        .memory_list(&scope, params.limit, params.offset, &filter)
+        .await
+    {
+        Ok(mems) => api_ok(serde_json::json!({
+            "memories": mems,
+            "count": mems.len(),
+            "limit": params.limit,
+            "offset": params.offset,
+        })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "MEMORY_ERROR",
@@ -1755,6 +1773,92 @@ pub async fn memory_delete(
     match outcome {
         Ok(true) => api_ok(serde_json::json!({ "id": id, "deleted": true })),
         Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            format!("memory '{id}' not found"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Partially correct a memory by id — only the provided fields change (content / importance /
+/// mem_type / metadata). Scoped to the caller's tenant. In cluster mode the change-set is
+/// materialized on the leader and replicated via the Raft log (`MemoryUpsert`), like memory add.
+///
+/// PATCH /api/v1/memories/{id}
+pub async fn memory_update(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
+    >,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryPatchRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_update").increment(1);
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ID",
+                format!("'{id}' is not a valid memory id"),
+            )
+        }
+    };
+    let patch = ecphoria_core::memory::cognition::MemoryPatch {
+        content: req.content,
+        importance: req.importance,
+        mem_type: req.mem_type,
+        metadata: req.metadata,
+    };
+    if patch.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "EMPTY_PATCH",
+            "provide at least one of content / importance / mem_type / metadata".into(),
+        );
+    }
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+
+    // Cluster mode: materialize the update on the leader, then replicate via the Raft log so every
+    // node applies the identical row (never mutate off-leader). Followers replay MemoryUpsert.
+    if let Some(Extension(coord)) = cluster {
+        let plan = match engine
+            .memory_update_plan(uuid, patch, tenant.as_deref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "MEMORY_ERROR",
+                    e.to_string(),
+                )
+            }
+        };
+        let Some((updated, rows)) = plan else {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                format!("memory '{id}' not found"),
+            );
+        };
+        let coord = coord.read().await;
+        let ar = ecphoria_cluster::raft::types::AppRequest::MemoryUpsert { rows };
+        return match coord.client_write(ar).await {
+            Ok(_) => api_ok(serde_json::to_value(updated).unwrap_or_default()),
+            Err(e) => cluster_write_error(e),
+        };
+    }
+
+    match engine.memory_update(uuid, patch, tenant.as_deref()).await {
+        Ok(Some(m)) => api_ok(serde_json::to_value(m).unwrap_or_default()),
+        Ok(None) => api_error(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
             format!("memory '{id}' not found"),

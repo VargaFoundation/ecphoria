@@ -421,10 +421,45 @@ pub struct GrantListParams {
 pub struct MemoryListParams {
     #[serde(default = "default_memory_limit")]
     pub limit: usize,
+    /// Offset for pagination (rows to skip; stable order = importance, then recency).
+    #[serde(default)]
+    pub offset: usize,
     pub tenant_id: Option<String>,
     pub user_id: Option<String>,
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
+    // ── Optional filters (all conjunctive) ──
+    /// Exact `mem_type` match (`semantic` | `episodic` | `procedural`).
+    #[serde(default)]
+    pub mem_type: Option<String>,
+    /// Keep memories with importance ≥ this.
+    #[serde(default)]
+    pub min_importance: Option<f32>,
+    /// Keep memories updated at/after this RFC3339 instant.
+    #[serde(default)]
+    pub updated_after: Option<String>,
+    /// Keep memories updated strictly before this RFC3339 instant.
+    #[serde(default)]
+    pub updated_before: Option<String>,
+    /// Exact match on a top-level metadata key — pair with `metadata_value`.
+    #[serde(default)]
+    pub metadata_key: Option<String>,
+    #[serde(default)]
+    pub metadata_value: Option<String>,
+}
+
+/// Body for a partial memory correction (PATCH /api/v1/memories/{id}) — only the provided fields
+/// change. `subject` is not patchable (it's the contradiction key; add a new memory instead).
+#[derive(Debug, Deserialize)]
+pub struct MemoryPatchRequest {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub importance: Option<f32>,
+    #[serde(default)]
+    pub mem_type: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_memory_limit() -> usize {

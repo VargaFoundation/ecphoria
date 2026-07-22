@@ -173,7 +173,9 @@ pub fn router_with_engine_and_auth(
         )
         .route(
             "/memories/{id}",
-            axum::routing::get(handlers::memory_get).delete(handlers::memory_delete),
+            axum::routing::get(handlers::memory_get)
+                .patch(handlers::memory_update)
+                .delete(handlers::memory_delete),
         )
         .route(
             "/memories/{id}/history",

@@ -778,3 +778,168 @@ async fn retention_policies_crud() {
     assert_eq!(policies[0]["source"], "logs");
     assert_eq!(policies[0]["retention_days"], 30);
 }
+
+#[tokio::test]
+async fn memory_update_and_filtered_list_via_rest() {
+    let app = engine_router().await;
+
+    async fn add(app: &axum::Router, body: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/memories")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_body(resp).await["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    // Seed three memories for "alice" (distinct subjects → no supersession).
+    let id_a = add(
+        &app,
+        r#"{"content":"a","user_id":"alice","subject":"sa","importance":0.9,"mem_type":"semantic"}"#,
+    )
+    .await;
+    add(
+        &app,
+        r#"{"content":"b","user_id":"alice","subject":"sb","importance":0.5,"mem_type":"episodic"}"#,
+    )
+    .await;
+    add(
+        &app,
+        r#"{"content":"c","user_id":"alice","subject":"sc","importance":0.2,"mem_type":"semantic"}"#,
+    )
+    .await;
+
+    // PATCH: correct content + importance of A.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/memories/{id_a}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"content":"a-corrected","importance":0.95}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["content"], "a-corrected");
+
+    // Persisted on read-back.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/memories/{id_a}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["content"], "a-corrected");
+
+    // Empty patch → 400.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/memories/{id_a}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Invalid id → 400.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/memories/not-a-uuid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"importance":0.1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Filter mem_type=semantic → a-corrected + c.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/memories?user_id=alice&mem_type=semantic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["count"], 2);
+
+    // min_importance=0.6 → only a-corrected (0.95).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/memories?user_id=alice&min_importance=0.6")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["memories"][0]["content"], "a-corrected");
+
+    // Pagination: limit=1, offset advances the page (importance-desc order).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/memories?user_id=alice&limit=1&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let p0 = json_body(resp).await;
+    assert_eq!(p0["offset"], 0);
+    let first = p0["memories"][0]["id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/memories?user_id=alice&limit=1&offset=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let p1 = json_body(resp).await;
+    assert_ne!(
+        p1["memories"][0]["id"].as_str().unwrap(),
+        first,
+        "offset advances the page"
+    );
+}
