@@ -30,6 +30,7 @@ service Ecphoria {
   rpc GetMemories(GetMemoriesRequest) returns (MemoryList);
   rpc UpdateMemory(UpdateMemoryRequest) returns (google.protobuf.Struct);
   rpc DeleteMemory(DeleteMemoryRequest) returns (DeleteMemoryResponse);
+  rpc MemoryScopes(MemoryScopesRequest) returns (StructList);
 
   // ── Sessions ──
   rpc StartSession(StartSessionRequest) returns (SessionResponse);
@@ -100,6 +101,10 @@ message UpdateMemoryRequest {
 message DeleteMemoryRequest {
   string id = 1;
 }
+
+// Distinct memory scopes (user/agent/session) with counts for the caller's tenant. No fields —
+// the tenant comes from the authenticated caller. Returns rows in the shared StructList.
+message MemoryScopesRequest {}
 
 message DeleteMemoryResponse {
   bool deleted = 1;

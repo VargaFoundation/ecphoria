@@ -256,6 +256,8 @@ pub enum MemoryCmd {
     Consolidate,
     /// Re-embed memories with the current provider (after a model/dimension change)
     Reembed,
+    /// List distinct memory scopes (user/agent/session) with counts
+    Scopes,
 }
 
 #[derive(Subcommand)]

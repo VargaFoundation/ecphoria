@@ -410,6 +410,19 @@ pub struct MemoryFilter {
     pub metadata: Option<(String, String)>,
 }
 
+/// A distinct active-memory scope (user/agent/session tuple) with its memory count — the memory
+/// counterpart of the state/episodic scope enumerators.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryScopeCount {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub count: u64,
+}
+
 /// A memory search hit with similarity score (0.0 when ranked by recency fallback).
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryHit {
@@ -1648,6 +1661,40 @@ impl MemoryStore {
             .query_row("SELECT count(*) FROM memories", [], |row| row.get(0))
             .map_err(|e| crate::Error::Query(e.to_string()))?;
         Ok(count as u64)
+    }
+
+    /// Distinct active-memory scopes (user/agent/session) with counts, most-populated first.
+    /// Tenant-scoped when `tenant` is `Some`. Complements state/episodic scope enumeration.
+    pub async fn scopes(&self, tenant: Option<&str>) -> crate::Result<Vec<MemoryScopeCount>> {
+        let db = self.read_conn();
+        let (filter, params): (&str, Vec<String>) = match tenant {
+            Some(t) => ("AND tenant_id = ?", vec![t.to_string()]),
+            None => ("", vec![]),
+        };
+        let sql = format!(
+            "SELECT user_id, agent_id, session_id, COUNT(*) AS n FROM memories \
+             WHERE state = 'active' {filter} \
+             GROUP BY user_id, agent_id, session_id ORDER BY n DESC LIMIT 10000"
+        );
+        let mut stmt = db
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let boxed: Vec<Box<dyn duckdb::ToSql>> = params
+            .iter()
+            .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
+            .collect();
+        let refs: Vec<&dyn duckdb::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok(MemoryScopeCount {
+                    user_id: row.get::<_, Option<String>>(0)?,
+                    agent_id: row.get::<_, Option<String>>(1)?,
+                    session_id: row.get::<_, Option<String>>(2)?,
+                    count: row.get::<_, i64>(3)? as u64,
+                })
+            })
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Forget (expire) active memories whose time-decayed importance has fallen below

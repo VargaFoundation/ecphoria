@@ -259,6 +259,14 @@ pub fn list_tools() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "memory_scopes".into(),
+            description: "List the distinct memory scopes (user/agent/session) that have memories in your tenant, with per-scope counts (most-populated first) — a directory of who/what has memory.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        McpTool {
             name: "remember".into(),
             description: "Remember free-form text about a user/agent. With LLM extraction enabled it distills atomic facts (deduplicated and contradiction-resolved); otherwise it stores the text as a single memory.".into(),
             input_schema: serde_json::json!({
@@ -384,7 +392,7 @@ mod tests {
         let tools = list_tools();
         // 6 core + 3 session + 6 memory + 2 graph + 6 cognition/graph-analytics (provenance,
         // feedback, contradictions, centrality, path, communities).
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
     }
 
     #[test]

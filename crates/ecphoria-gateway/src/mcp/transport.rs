@@ -652,6 +652,12 @@ async fn call_tool(
                 .map(|m| serde_json::to_value(m).unwrap_or_default())
         }
 
+        "memory_scopes" => engine
+            .memory_scopes(tenant)
+            .await
+            .map(|scopes| serde_json::json!({"scopes": scopes, "count": scopes.len()}))
+            .map_err(|e| e.to_string()),
+
         "remember" => {
             let text = args
                 .get("text")

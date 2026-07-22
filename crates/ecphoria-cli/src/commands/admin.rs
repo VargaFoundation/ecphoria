@@ -171,6 +171,7 @@ pub async fn memory(url: &str, action: MemoryCmd) -> anyhow::Result<()> {
             c.post_json("/api/v1/admin/memory/reembed", serde_json::json!({}))
                 .await?
         }
+        MemoryCmd::Scopes => c.get_json("/api/v1/schema/memory-scopes").await?,
     };
     show(&res)
 }

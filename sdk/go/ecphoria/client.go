@@ -467,6 +467,21 @@ func (c *Client) MemoryList(ctx context.Context, limit int, scope MemoryScope) (
 	return c.MemoryListWith(ctx, MemoryListOptions{Limit: limit, Scope: scope})
 }
 
+// MemoryScopes lists distinct memory scopes (user/agent/session) with per-scope counts.
+func (c *Client) MemoryScopes(ctx context.Context) ([]map[string]any, error) {
+	data, _, err := c.doRequest(ctx, http.MethodGet, "/api/v1/schema/memory-scopes", nil)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Scopes []map[string]any `json:"scopes"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("ecphoria: decode memory_scopes: %w", err)
+	}
+	return r.Scopes, nil
+}
+
 // MemoryGet returns a memory by id, or nil if not found (or not in your tenant).
 func (c *Client) MemoryGet(ctx context.Context, id string) (map[string]any, error) {
 	data, status, err := c.doRequest(ctx, http.MethodGet, "/api/v1/memories/"+url.PathEscape(id), nil)

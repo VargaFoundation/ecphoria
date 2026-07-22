@@ -131,6 +131,10 @@ pub fn router_with_engine_and_auth(
             axum::routing::get(handlers::schema_agents),
         )
         .route(
+            "/schema/memory-scopes",
+            axum::routing::get(handlers::schema_memory_scopes),
+        )
+        .route(
             "/admin/retention",
             axum::routing::post(handlers::enforce_retention),
         )

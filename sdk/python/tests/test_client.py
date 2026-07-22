@@ -309,3 +309,19 @@ def test_memory_list_sends_filters_and_offset():
     assert p["min_importance"] == "0.5"
     assert p["metadata_key"] == "tag"
     assert p["metadata_value"] == "vip"
+
+
+def test_memory_scopes_lists_directory():
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET"
+        assert req.url.path == "/api/v1/schema/memory-scopes"
+        return httpx.Response(
+            200, json={"count": 1, "scopes": [{"user_id": "alice", "count": 3}]}
+        )
+
+    client = make_client(handler)
+    try:
+        scopes = run(client.memory_scopes())
+    finally:
+        run(client.close())
+    assert scopes == [{"user_id": "alice", "count": 3}]

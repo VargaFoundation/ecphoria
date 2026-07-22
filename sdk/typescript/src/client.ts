@@ -378,6 +378,14 @@ export class EcphoriaClient {
     }
   }
 
+  /** Distinct memory scopes (user/agent/session) with per-scope counts, most-populated first. */
+  async memoryScopes(): Promise<Record<string, unknown>[]> {
+    const data = await this.get<{ scopes: Record<string, unknown>[] }>(
+      "/api/v1/schema/memory-scopes",
+    );
+    return data.scopes ?? [];
+  }
+
   /** Bi-temporal history for a memory's subject (oldest first). */
   async memoryHistory(id: string): Promise<Record<string, unknown>[]> {
     const data = await this.get<{ history: Record<string, unknown>[] }>(

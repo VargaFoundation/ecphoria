@@ -540,8 +540,8 @@ async fn mcp_tools_list_has_all_tools() {
     let tools = json["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        24,
-        "expected 24 tools (6 core + 3 session + 7 memory + 2 graph + 6 cognition/analytics)"
+        25,
+        "expected 25 tools (6 core + 3 session + 8 memory + 2 graph + 6 cognition/analytics)"
     );
 
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -942,4 +942,21 @@ async fn memory_update_and_filtered_list_via_rest() {
         first,
         "offset advances the page"
     );
+
+    // Scope directory: one scope (alice) holding all three memories.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/schema/memory-scopes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let scopes = json_body(resp).await;
+    assert_eq!(scopes["count"], 1);
+    assert_eq!(scopes["scopes"][0]["user_id"], "alice");
+    assert_eq!(scopes["scopes"][0]["count"], 3);
 }

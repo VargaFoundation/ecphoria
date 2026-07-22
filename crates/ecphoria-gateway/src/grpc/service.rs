@@ -379,6 +379,22 @@ impl Ecphoria for EcphoriaGrpcService {
         Ok(Response::new(super::convert::json_to_struct(v)))
     }
 
+    async fn memory_scopes(
+        &self,
+        request: Request<proto::MemoryScopesRequest>,
+    ) -> Result<Response<proto::StructList>, Status> {
+        let tenant = self.tenant_from(&request).await?;
+        let items = self
+            .engine
+            .memory_scopes(tenant.as_deref())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|s| super::convert::json_to_struct(serde_json::to_value(s).unwrap_or_default()))
+            .collect();
+        Ok(Response::new(proto::StructList { items }))
+    }
+
     async fn delete_memory(
         &self,
         request: Request<proto::DeleteMemoryRequest>,
@@ -1166,5 +1182,13 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(list.memories.len(), 1);
+
+        // Scope directory: one scope (alice) for this tenant.
+        let scopes = service
+            .memory_scopes(authed(proto::MemoryScopesRequest {}, "t"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(scopes.items.len(), 1);
     }
 }

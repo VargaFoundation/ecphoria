@@ -3000,6 +3000,15 @@ impl EcphoriaEngine {
         self.memory_store.count().await
     }
 
+    /// Distinct memory scopes (user/agent/session) with active-memory counts, most-populated first —
+    /// the memory counterpart of [`Self::list_agents`]/schema enumeration. Tenant-scoped when set.
+    pub async fn memory_scopes(
+        &self,
+        tenant: Option<&str>,
+    ) -> Result<Vec<crate::memory::cognition::MemoryScopeCount>> {
+        self.memory_store.scopes(tenant).await
+    }
+
     /// Export all active memories for a tenant (for moving a tenant between shards on a reshard).
     pub async fn export_tenant_memories(&self, tenant: &str) -> Result<Vec<Memory>> {
         self.memory_store
@@ -5448,6 +5457,31 @@ mod tests {
             .await
             .unwrap();
         assert!(inj.is_empty(), "unsafe metadata key must match nothing");
+    }
+
+    #[tokio::test]
+    async fn memory_scopes_enumerates_distinct_scopes_with_counts() {
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        // alice: 2 memories, bob: 1 — distinct subjects so nothing supersedes.
+        for (u, s) in [("alice", "s1"), ("alice", "s2"), ("bob", "s3")] {
+            let mut input = MemoryInput::new(MemoryScope::user(u), format!("{u}-{s}"));
+            input.subject = Some(s.into());
+            engine.memory_add(input).await.unwrap();
+        }
+        let scopes = engine.memory_scopes(Some("default")).await.unwrap();
+        // Two distinct user scopes (alice, bob), most-populated first.
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].user_id.as_deref(), Some("alice"));
+        assert_eq!(scopes[0].count, 2);
+        let bob = scopes.iter().find(|s| s.user_id.as_deref() == Some("bob"));
+        assert_eq!(bob.map(|s| s.count), Some(1));
+
+        // Another tenant sees nothing.
+        assert!(engine
+            .memory_scopes(Some("other"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

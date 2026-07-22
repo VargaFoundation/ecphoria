@@ -540,6 +540,12 @@ class EcphoriaClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def memory_scopes(self) -> list[dict[str, Any]]:
+        """List distinct memory scopes (user/agent/session) with per-scope counts (most first)."""
+        resp = await self._request("GET", "/api/v1/schema/memory-scopes")
+        resp.raise_for_status()
+        return resp.json().get("scopes", [])
+
     async def memory_history(self, memory_id: str) -> list[dict[str, Any]]:
         """Bi-temporal history for a memory's subject (oldest first)."""
         resp = await self._request("GET", f"/api/v1/memories/{memory_id}/history")

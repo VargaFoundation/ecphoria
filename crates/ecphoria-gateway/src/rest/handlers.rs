@@ -3726,6 +3726,25 @@ pub async fn schema_agents(
     }
 }
 
+/// GET /api/v1/schema/memory-scopes — distinct memory scopes (user/agent/session) + counts for the
+/// caller's tenant. The memory counterpart of `/schema/agents` (which only enumerates episodic).
+pub async fn schema_memory_scopes(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "schema_memory_scopes")
+        .increment(1);
+    let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
+    match engine.memory_scopes(tenant.as_deref()).await {
+        Ok(scopes) => api_ok(serde_json::json!({ "count": scopes.len(), "scopes": scopes })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SCHEMA_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// GET /api/v1/memories/watch → upgrades to WebSocket.
 /// Streams a JSON message for each memory lifecycle change (upserted/superseded/expired) in the
 /// caller's tenant — the memory CDC stream, for reactive UIs / integrations without polling.
