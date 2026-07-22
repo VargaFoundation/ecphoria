@@ -4022,6 +4022,43 @@ impl EcphoriaEngine {
         Ok(())
     }
 
+    /// Prune old local backup directories under `backups_dir`, keeping the newest
+    /// `backup.max_backups` (by directory name — the timestamped names sort chronologically). Returns
+    /// how many were removed. No-op when `max_backups == 0` (keep all). Only removes directories that
+    /// look like a backup (contain a `manifest.json`), so a stray file is never deleted.
+    pub async fn prune_backups(&self, backups_dir: &std::path::Path) -> Result<usize> {
+        let max = self.config.backup.max_backups as usize;
+        if max == 0 || !backups_dir.is_dir() {
+            return Ok(0);
+        }
+        let dir = backups_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .map_err(|e| crate::Error::Storage(format!("read backups dir: {e}")))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir() && p.join("manifest.json").exists())
+                .collect();
+            if entries.len() <= max {
+                return Ok(0);
+            }
+            // Oldest first (timestamp names sort lexicographically = chronologically).
+            entries.sort();
+            let to_remove = entries.len() - max;
+            let mut removed = 0;
+            for p in entries.into_iter().take(to_remove) {
+                match std::fs::remove_dir_all(&p) {
+                    Ok(()) => removed += 1,
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e, "backup prune failed")
+                    }
+                }
+            }
+            Ok(removed)
+        })
+        .await
+        .map_err(|e| crate::Error::Internal(anyhow::anyhow!("prune join: {e}")))?
+    }
+
     /// Restore all stores from a backup directory produced by [`Self::backup`].
     ///
     /// Used by the Raft snapshot-install path and for disaster recovery. Episodic and memories
@@ -4731,6 +4768,44 @@ mod tests {
             .query_sql("SELECT * FROM memories m JOIN episodic e ON e.id = m.id")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn prune_backups_keeps_newest_and_ignores_non_backups() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backups = tmp.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        // Five backups, oldest→newest by timestamp name (which sort lexicographically).
+        for name in [
+            "20260101T000000Z",
+            "20260102T000000Z",
+            "20260103T000000Z",
+            "20260104T000000Z",
+            "20260105T000000Z",
+        ] {
+            let d = backups.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("manifest.json"), "{}").unwrap();
+        }
+        // A stray dir without a manifest must never be pruned.
+        std::fs::create_dir_all(backups.join("notabackup")).unwrap();
+
+        let mut cfg = inmem_config();
+        cfg.backup.max_backups = 3;
+        let engine = EcphoriaEngine::new(cfg).await.unwrap();
+
+        assert_eq!(engine.prune_backups(&backups).await.unwrap(), 2);
+        assert!(!backups.join("20260101T000000Z").exists());
+        assert!(!backups.join("20260102T000000Z").exists());
+        assert!(backups.join("20260103T000000Z").exists());
+        assert!(backups.join("20260105T000000Z").exists());
+        assert!(backups.join("notabackup").exists(), "stray dir untouched");
+
+        // max_backups = 0 → keep all (no-op).
+        let mut cfg0 = inmem_config();
+        cfg0.backup.max_backups = 0;
+        let engine0 = EcphoriaEngine::new(cfg0).await.unwrap();
+        assert_eq!(engine0.prune_backups(&backups).await.unwrap(), 0);
     }
 
     #[tokio::test]

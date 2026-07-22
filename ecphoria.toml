@@ -13,6 +13,12 @@ access_key = ""
 secret_key = ""
 region = "us-east-1"
 
+[backup]
+auto_enabled = false           # background S3 backups in the tiering task
+interval_hours = 24
+s3_prefix = "backups/"
+max_backups = 7                # keep the newest N local backups under <data_dir>/backups; 0 = keep all
+
 [memory.episodic]
 default_retention_days = 365
 

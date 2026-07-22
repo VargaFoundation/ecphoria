@@ -430,6 +430,10 @@ pub struct BackupConfig {
     pub interval_hours: u32,
     /// S3 key prefix for backup objects (e.g. "backups/").
     pub s3_prefix: String,
+    /// Retention: keep at most this many local backup directories under `<data_dir>/backups`; the
+    /// oldest beyond this are pruned after each new backup. `0` = keep all (unbounded — the previous
+    /// behaviour). Guards against backups silently filling the disk.
+    pub max_backups: u32,
 }
 
 impl Default for BackupConfig {
@@ -438,6 +442,7 @@ impl Default for BackupConfig {
             auto_enabled: false,
             interval_hours: 24,
             s3_prefix: "backups/".into(),
+            max_backups: 7,
         }
     }
 }

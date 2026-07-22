@@ -1064,11 +1064,17 @@ pub async fn backup(
     let target = backup_dir.join(&timestamp);
 
     let local = match engine.backup(&target).await {
-        Ok(()) => serde_json::json!({
-            "status": "ok",
-            "path": target.to_string_lossy(),
-            "timestamp": timestamp,
-        }),
+        Ok(()) => {
+            // Retention: prune the oldest backups beyond backup.max_backups so they can't fill the
+            // disk (best-effort — a prune failure never fails the backup itself).
+            let pruned = engine.prune_backups(&backup_dir).await.unwrap_or(0);
+            serde_json::json!({
+                "status": "ok",
+                "path": target.to_string_lossy(),
+                "timestamp": timestamp,
+                "pruned": pruned,
+            })
+        }
         Err(e) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
