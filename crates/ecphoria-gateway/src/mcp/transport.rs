@@ -694,8 +694,110 @@ async fn call_tool(
             Ok(serde_json::json!({ "entity": entity, "edges": edges, "count": edges.len() }))
         }
 
+        "memory_provenance" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'id' parameter")?;
+            let uuid = uuid::Uuid::parse_str(id).map_err(|_| "invalid 'id'".to_string())?;
+            engine
+                .memory_provenance(uuid, tenant)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|p| serde_json::to_value(p).unwrap_or_default())
+                .ok_or_else(|| "memory not found".to_string())
+        }
+
+        "list_contradictions" => engine
+            .memory_contradictions(&scoped_for(args, tenant))
+            .await
+            .map(|g| serde_json::json!({ "contradictions": g, "count": g.len() }))
+            .map_err(|e| e.to_string()),
+
+        "memory_feedback" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'id' parameter")?;
+            let uuid = uuid::Uuid::parse_str(id).map_err(|_| "invalid 'id'".to_string())?;
+            let verdict = args
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .and_then(ecphoria_core::MemoryFeedback::from_str_loose)
+                .ok_or("verdict must be one of helpful|wrong|obsolete")?;
+            let Some((_mem, action)) = engine
+                .memory_feedback_plan(uuid, tenant, verdict)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Err("memory not found".to_string());
+            };
+            if let Some(coord) = &cluster {
+                match action {
+                    ecphoria_core::FeedbackAction::Reinforce(rows) => {
+                        mcp_cluster_write(coord, AppRequest::MemoryUpsert { rows }).await?;
+                    }
+                    ecphoria_core::FeedbackAction::Retire(ids) => {
+                        mcp_cluster_write(coord, AppRequest::MemoryExpire { ids }).await?;
+                    }
+                }
+                return Ok(serde_json::json!({ "id": id, "applied": true }));
+            }
+            engine
+                .memory_feedback_apply(action)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "id": id, "applied": true }))
+        }
+
+        "graph_centrality" => {
+            let as_of = parse_as_of_arg(args);
+            let mut nodes = engine
+                .graph_centrality(tenant.unwrap_or("default"), as_of)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                nodes.truncate(l as usize);
+            }
+            Ok(serde_json::json!({ "nodes": nodes, "count": nodes.len() }))
+        }
+
+        "graph_path" => {
+            let src = args
+                .get("src")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'src' parameter")?;
+            let dst = args
+                .get("dst")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'dst' parameter")?;
+            let path = engine
+                .graph_path(tenant.unwrap_or("default"), src, dst, parse_as_of_arg(args))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(
+                serde_json::json!({ "src": src, "dst": dst, "path": path, "reachable": path.is_some() }),
+            )
+        }
+
+        "graph_communities" => {
+            let comms = engine
+                .graph_communities(tenant.unwrap_or("default"), parse_as_of_arg(args))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "communities": comms, "count": comms.len() }))
+        }
+
         _ => Err(format!("unknown tool: {name}")),
     }
+}
+
+/// Parse the optional `as_of` (RFC3339) argument for the graph-analytics tools.
+fn parse_as_of_arg(args: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    args.get("as_of")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
 }
 
 #[cfg(test)]
@@ -732,6 +834,92 @@ mod tests {
         };
         let resp = handle_mcp(State(engine().await), None, None, Json(req)).await;
         assert!(resp.headers().get("Mcp-Session-Id").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_analytics_and_feedback_tools() {
+        let e = engine().await;
+        let add = call_tool(
+            &e,
+            None,
+            Some("t"),
+            "add_memory",
+            &serde_json::json!({"content":"Alice works at Acme","subject":"alice.job"}),
+        )
+        .await
+        .unwrap();
+        let id = add["memory"]["id"].as_str().unwrap().to_string();
+
+        for (s, d) in [("Alice", "Acme"), ("Bob", "Acme")] {
+            call_tool(
+                &e,
+                None,
+                Some("t"),
+                "link_memory",
+                &serde_json::json!({"src": s, "relation":"works_at", "dst": d}),
+            )
+            .await
+            .unwrap();
+        }
+
+        // graph_centrality ranks the entities.
+        let cent = call_tool(
+            &e,
+            None,
+            Some("t"),
+            "graph_centrality",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(cent["count"].as_u64().unwrap() >= 3);
+        // graph_path finds Alice → Acme.
+        let path = call_tool(
+            &e,
+            None,
+            Some("t"),
+            "graph_path",
+            &serde_json::json!({"src":"Alice","dst":"Acme"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(path["reachable"], true);
+        // graph_communities returns clusters.
+        assert!(
+            call_tool(
+                &e,
+                None,
+                Some("t"),
+                "graph_communities",
+                &serde_json::json!({})
+            )
+            .await
+            .unwrap()["count"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+
+        // provenance + feedback on the memory.
+        assert!(call_tool(
+            &e,
+            None,
+            Some("t"),
+            "memory_provenance",
+            &serde_json::json!({"id": id}),
+        )
+        .await
+        .is_ok());
+        let fb = call_tool(
+            &e,
+            None,
+            Some("t"),
+            "memory_feedback",
+            &serde_json::json!({"id": id, "verdict":"helpful"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fb["applied"], true);
     }
 
     #[tokio::test]

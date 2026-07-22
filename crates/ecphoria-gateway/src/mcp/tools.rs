@@ -277,6 +277,70 @@ pub fn list_tools() -> Vec<McpTool> {
                 "required": ["entity"]
             }),
         },
+        McpTool {
+            name: "memory_provenance".into(),
+            description: "Explain why a memory exists: its source events and the supersession chain (what it replaced / what replaced it). The audit trail behind a distilled fact.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "id": {"type": "string", "description": "Memory id"} },
+                "required": ["id"]
+            }),
+        },
+        McpTool {
+            name: "memory_feedback".into(),
+            description: "Give feedback on a retrieved memory so ranking learns without an LLM: 'helpful' reinforces it (importance up), 'wrong'/'obsolete' retires it. Use after acting on a recalled memory.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory id"},
+                    "verdict": {"type": "string", "description": "helpful | wrong | obsolete"}
+                },
+                "required": ["id", "verdict"]
+            }),
+        },
+        McpTool {
+            name: "list_contradictions".into(),
+            description: "List subjects that currently have more than one active memory (the human/agent review queue) — where the memory holds conflicting beliefs about the same key.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Optional user scope"},
+                    "agent_id": {"type": "string", "description": "Optional agent scope"}
+                }
+            }),
+        },
+        McpTool {
+            name: "graph_centrality".into(),
+            description: "Rank the most central entities in the knowledge graph by degree + PageRank. Optional as_of (RFC3339) for a bi-temporal snapshot.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "as_of": {"type": "string", "description": "RFC3339 timestamp for a temporal snapshot"},
+                    "limit": {"type": "integer", "description": "Max nodes to return"}
+                }
+            }),
+        },
+        McpTool {
+            name: "graph_path".into(),
+            description: "Shortest directed path between two entities in the knowledge graph. Optional as_of for a temporal snapshot.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Start entity"},
+                    "dst": {"type": "string", "description": "End entity"},
+                    "as_of": {"type": "string", "description": "RFC3339 timestamp"}
+                },
+                "required": ["src", "dst"]
+            }),
+        },
+        McpTool {
+            name: "graph_communities".into(),
+            description: "Detect communities (connected clusters) in the knowledge graph. Optional as_of for a temporal snapshot.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "as_of": {"type": "string", "description": "RFC3339 timestamp"} }
+            }),
+        },
     ]
 }
 
@@ -296,7 +360,9 @@ mod tests {
     #[test]
     fn list_tools_returns_expected_count() {
         let tools = list_tools();
-        assert_eq!(tools.len(), 17); // 6 core + 3 session + 6 memory + 2 graph tools
+        // 6 core + 3 session + 6 memory + 2 graph + 6 cognition/graph-analytics (provenance,
+        // feedback, contradictions, centrality, path, communities).
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]

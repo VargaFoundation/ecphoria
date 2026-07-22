@@ -67,9 +67,12 @@ memory — "what did we believe, and when".
 
 Ecphoria exposes an MCP **Streamable HTTP** endpoint at `/mcp`: `POST` for JSON-RPC 2.0
 (`initialize` — which returns an `Mcp-Session-Id` header — `tools/list`, `tools/call`,
-`resources/list`, `prompts/list`) and `GET` for the server→client SSE stream. It includes 6
-memory tools — `add_memory`, `search_memory`, `get_memories`, `memory_history`, `delete_memory`,
-`remember` — plus query / ingest / state / session tools.
+`resources/list`, `prompts/list`) and `GET` for the server→client SSE stream. It advertises **23
+tools** — memory (`add_memory`, `search_memory`, `get_memories`, `memory_history`, `delete_memory`,
+`remember`), graph (`link_memory`, `graph_neighbors`) + analytics (`graph_centrality`, `graph_path`,
+`graph_communities`), cognition (`memory_provenance`, `memory_feedback`, `list_contradictions`), and
+`query` (incl. `SELECT … FROM memories`) / ingest / state / session / embed. Call `tools/list` for
+the current set.
 
 **Claude Code** (HTTP MCP) — add to your MCP config:
 ```json
