@@ -128,6 +128,20 @@ Re-import is idempotent and cheap: unchanged sections are `Confirmed` with no wr
 paragraph reports `0 new, 1 updated, 478 unchanged` and supersedes exactly that section; the
 previous text stays queryable. A section deleted from the file is expired, not orphaned.
 
+
+> **Vendored trees are skipped.** Committed dependency directories (`node_modules`, `vendor`,
+> `third_party`, `.venv`, `target`, `dist`) are tracked files, so `git ls-files` returns them and
+> somebody else's `README.md` competes with your own — observed in practice, with Microsoft's
+> `typescript/SECURITY.md` reaching rank 1 on a policy question. `ECPHORIA_IMPORT_ALL=1` disables
+> the skip.
+
+> **Deleted files are retracted.** After each run the importer reports the full set of documents it
+> sent, and anything else in the project is expired. The per-document sweep only removes *sections*
+> of a file it was given; a file that vanished is never mentioned again, and silence cannot be told
+> from "not imported this run". Without this the corpus keeps answering from documentation that no
+> longer exists. Only `mem_type = 'chunk'` in that project is touched, so hand-written facts and
+> promoted tickets are never swept by a documentation import.
+
 > Backfill runs oldest-first. Replaying history in reverse pushes every version to now rather than
 > splitting intervals around it — out-of-order valid-time insertion is not supported.
 

@@ -159,6 +159,55 @@ pub async fn document_ingest(
     }
 }
 
+/// Expire documents that vanished from a source repository.
+///
+/// POST /api/v1/documents/prune { "project": "platform", "keep_paths": ["platform/README.md", …] }
+///
+/// The per-document sweep in `POST /documents` only removes *sections* of a file it was given; a
+/// file deleted from the repository is simply never mentioned again, and silence cannot be told
+/// from "not imported this run". An importer that knows the full set closes that loop.
+pub async fn document_prune(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<DocumentPruneRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "document_prune").increment(1);
+    if req.project.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "project is required".into(),
+        );
+    }
+    // An empty keep list would expire the project's entire documentation. That is almost certainly
+    // a client bug (a failed enumeration), not an intent, so refuse it rather than obey it.
+    if req.keep_paths.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "keep_paths must not be empty — refusing to expire an entire project".into(),
+        );
+    }
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    match engine
+        .document_prune(&scope, &req.project, &req.keep_paths)
+        .await
+    {
+        Ok(expired) => api_ok(serde_json::json!({ "project": req.project, "expired": expired })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DOCUMENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// Add many memories in one request — the bulk-import path for a document corpus.
 ///
 /// POST /api/v1/memories/batch { "memories": [ {...}, {...} ] }

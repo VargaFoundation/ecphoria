@@ -176,6 +176,10 @@ pub fn router_with_engine_and_auth(
             axum::routing::post(handlers::memory_add_batch),
         )
         .route("/documents", axum::routing::post(handlers::document_ingest))
+        .route(
+            "/documents/prune",
+            axum::routing::post(handlers::document_prune),
+        )
         // Static segment must be registered alongside `/memories/{id}` — axum prefers the literal.
         .route(
             "/memories/history",

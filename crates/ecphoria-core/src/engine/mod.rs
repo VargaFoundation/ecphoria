@@ -2807,6 +2807,66 @@ impl EcphoriaEngine {
         }
     }
 
+    /// Expire every document in `project` that the caller did not just import.
+    ///
+    /// `document_ingest`'s sweep is per-document: it removes sections that vanished from a file it
+    /// was given. Nothing removes a *whole* file that vanished — deleted from the repository, moved,
+    /// or newly excluded from import — because the importer simply stops mentioning it, and silence
+    /// is indistinguishable from "not imported this run". The corpus then keeps answering from
+    /// documentation that no longer exists.
+    ///
+    /// This closes that loop: the importer reports the full set of document paths it sent, and
+    /// anything else in the project is expired (kept as history, as everywhere else).
+    ///
+    /// Only touches `mem_type = 'chunk'` in the given project, so hand-written facts and promoted
+    /// tickets sharing the project are never swept by a documentation import.
+    pub async fn document_prune(
+        &self,
+        scope: &MemoryScope,
+        project: &str,
+        keep_paths: &[String],
+    ) -> Result<usize> {
+        let keep: std::collections::HashSet<String> = keep_paths
+            .iter()
+            .map(|p| crate::memory::cognition::normalize_subject(p))
+            .collect();
+        let active = self
+            .memory_store
+            .list_project_chunks(scope, project)
+            .await?;
+        let now = chrono::Utc::now();
+        let stale: Vec<MemoryRow> = active
+            .into_iter()
+            .filter(|m| {
+                // A chunk's subject is `<doc path>#<heading trail>`; the document identity is the
+                // part before the first `#`.
+                m.subject
+                    .as_deref()
+                    .map(|s| s.split_once('#').map_or(s, |(p, _)| p))
+                    .is_some_and(|path| !keep.contains(path))
+            })
+            .map(|mut m| {
+                m.state = MemoryState::Expired;
+                m.valid_to = Some(now);
+                m.updated_at = now;
+                MemoryRow {
+                    memory: m,
+                    embedding: None,
+                }
+            })
+            .collect();
+        let n = stale.len();
+        if n > 0 {
+            self.memory_apply_rows_batch(stale).await?;
+            tracing::info!(
+                project,
+                expired = n,
+                "pruned documents no longer in the source"
+            );
+        }
+        Ok(n)
+    }
+
     /// CDC: publish a memory's lifecycle change. Best-effort — no receivers means dropped.
     fn publish_memory_change(&self, memory: &Memory) {
         let event = match memory.state {

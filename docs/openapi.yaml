@@ -227,6 +227,32 @@ paths:
       responses:
         '200': { description: '{ path, chunks, inserted, superseded, confirmed, removed }' }
         '400': { description: missing path or content }
+  /api/v1/documents/prune:
+    post:
+      summary: Expire the documents of a project that were not in the caller's latest import
+      description: >
+        The per-document sweep in POST /documents removes sections of a file it was given; a file
+        deleted from the source is never mentioned again, and silence cannot be distinguished from
+        "not imported this run". An importer that knows the full set closes that loop. Only
+        mem_type='chunk' in the project is affected, so facts and promoted tickets are untouched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project, keep_paths]
+              properties:
+                project: { type: string }
+                keep_paths:
+                  type: array
+                  items: { type: string }
+                  minItems: 1
+                  description: Every document path just imported. Anything else is expired.
+                user_id: { type: string }
+      responses:
+        '200': { description: '{ project, expired: N }' }
+        '400': { description: missing project, or an empty keep_paths (refused — it would expire the whole project) }
   /api/v1/memories/history:
     get:
       summary: Version history of a subject (every version, oldest first)

@@ -3989,3 +3989,94 @@ async fn the_same_subject_in_two_projects_is_two_facts() {
         .unwrap();
     assert!(platform[0].memory.content.contains("EKS cluster"));
 }
+
+/// A document deleted from its source must stop answering.
+///
+/// `document_ingest`'s sweep removes *sections* of a file it was given. A whole file that vanished
+/// — deleted, renamed, or newly excluded from import — is simply never mentioned again, and silence
+/// cannot be distinguished from "not imported this run". Without a project-level reconcile the
+/// corpus keeps confidently answering from documentation that no longer exists. Found in practice:
+/// a live search returned a vendored `node_modules/typescript/SECURITY.md` at rank 1, still active
+/// after the importer had started excluding it.
+#[tokio::test]
+async fn pruning_expires_documents_that_left_the_source() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+
+    for path in ["docs/kept.md", "docs/removed.md", "vendor/theirs.md"] {
+        engine
+            .document_ingest(
+                DocumentIngest {
+                    path,
+                    content: "# Title\n\n## Section\n\nSome body text worth indexing.\n",
+                    project: Some("platform"),
+                    ..Default::default()
+                },
+                &scope,
+                &opts,
+            )
+            .await
+            .unwrap();
+    }
+    // A hand-written fact and a promoted ticket share the project — a documentation prune must not
+    // touch them, or an import would silently erase everything else the project knows.
+    engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "We deploy on Tuesdays.")
+                .with_subject("deploy.day")
+                .with_project("platform"),
+        )
+        .await
+        .unwrap();
+
+    let expired = engine
+        .document_prune(&scope, "platform", &["docs/kept.md".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        expired, 2,
+        "expected the removed and vendored documents to go"
+    );
+
+    let subjects: Vec<String> = engine
+        .memory_all(&scope, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| m.subject)
+        .collect();
+    assert!(subjects.iter().any(|s| s.starts_with("docs/kept.md")));
+    assert!(!subjects.iter().any(|s| s.starts_with("docs/removed.md")));
+    assert!(!subjects.iter().any(|s| s.starts_with("vendor/theirs.md")));
+    assert!(
+        subjects.iter().any(|s| s == "deploy.day"),
+        "a documentation prune erased a non-document memory: {subjects:?}"
+    );
+
+    // Another project is never in scope for this prune.
+    engine
+        .document_ingest(
+            DocumentIngest {
+                path: "docs/other.md",
+                content: "# Other\n\n## Section\n\nBody.\n",
+                project: Some("payments"),
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    let expired = engine
+        .document_prune(&scope, "platform", &["docs/kept.md".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(expired, 0, "a second prune should be a no-op");
+    assert!(engine
+        .memory_all(&scope, 100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|m| m.subject.as_deref() == Some("docs/other.md#other > section")));
+}

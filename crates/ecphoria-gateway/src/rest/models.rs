@@ -130,6 +130,22 @@ pub struct DocumentIngestRequest {
     pub session_id: Option<String>,
 }
 
+/// Expire the documents of a project that were not in the caller's latest import.
+#[derive(Debug, Deserialize)]
+pub struct DocumentPruneRequest {
+    pub project: String,
+    /// Every document path the caller just imported. Anything else in the project is expired.
+    pub keep_paths: Vec<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Add many memories in one request — the bulk-import path for a document corpus.
 #[derive(Debug, Deserialize)]
 pub struct MemoryBatchAddRequest {

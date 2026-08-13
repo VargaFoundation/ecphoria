@@ -1415,6 +1415,23 @@ impl MemoryStore {
         self.query_memories(&sql, &params)
     }
 
+    /// Active document chunks belonging to one project — the candidate set for a prune.
+    pub async fn list_project_chunks(
+        &self,
+        scope: &MemoryScope,
+        project: &str,
+    ) -> crate::Result<Vec<Memory>> {
+        let (where_sql, mut params) = scope.where_clause();
+        params.push(project.to_string());
+        let sql = format!(
+            "SELECT {} FROM memories WHERE {} AND project = ? AND mem_type = 'chunk' \
+             AND state = 'active'",
+            Self::SELECT_COLS,
+            where_sql
+        );
+        self.query_memories(&sql, &params)
+    }
+
     /// Hydrate an ordered list of candidate ids into active, in-scope memories.
     ///
     /// This is the safety half of the advisory-index contract used by the lexical (FTS5) arm: the

@@ -527,6 +527,33 @@ fn git(repo: &str, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Directory names whose contents are somebody else's documentation.
+///
+/// Committed dependency trees are tracked files, so `git ls-files` returns them — and a vendored
+/// `README.md` competes for retrieval against your own. Observed in practice: a search for a retry
+/// policy returned Microsoft's `typescript/SECURITY.md` at rank 1, from a committed `node_modules`.
+const VENDORED: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "third_party",
+    "site-packages",
+    ".venv",
+    "venv",
+    "target",
+    "dist",
+];
+
+/// Is this path inside a vendored dependency tree? `ECPHORIA_IMPORT_ALL=1` disables the skip.
+fn is_vendored(path: &str) -> bool {
+    if matches!(
+        std::env::var("ECPHORIA_IMPORT_ALL").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        return false;
+    }
+    path.split('/').any(|seg| VENDORED.contains(&seg))
+}
+
 /// Last commit date (RFC 3339) per tracked Markdown file.
 ///
 /// One `git log` pass rather than one per file: `--name-only` lists the files each commit touched
@@ -580,6 +607,7 @@ async fn import_git(url: &str, repo: &str, user: Option<&str>) -> anyhow::Result
         .lines()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+        .filter(|p| !is_vendored(p))
         .collect();
     if files.is_empty() {
         anyhow::bail!("no tracked Markdown files under {repo}");
@@ -593,6 +621,7 @@ async fn import_git(url: &str, repo: &str, user: Option<&str>) -> anyhow::Result
     let client = EcphoriaClient::new(url);
     let mut totals = (0u64, 0u64, 0u64, 0u64, 0u64); // chunks, inserted, superseded, confirmed, removed
     let mut failed = 0usize;
+    let mut imported_paths: Vec<String> = Vec::new();
     for rel in &files {
         let abs = std::path::Path::new(&root).join(rel);
         let Ok(content) = std::fs::read_to_string(&abs) else {
@@ -622,12 +651,36 @@ async fn import_git(url: &str, repo: &str, user: Option<&str>) -> anyhow::Result
                 totals.2 += r.2;
                 totals.3 += r.3;
                 totals.4 += r.4;
+                imported_paths.push(doc_path);
             }
             Err(e) => {
                 eprintln!("  {rel}: {e}");
                 failed += 1;
             }
         }
+    }
+    // Close the lifecycle: a file deleted from the repository (or newly excluded) is never
+    // mentioned again, so the per-document sweep cannot retract it. Reporting the full set lets the
+    // server expire the difference.
+    let expired = if imported_paths.is_empty() {
+        0
+    } else {
+        match client
+            .post_json(
+                "/api/v1/documents/prune",
+                serde_json::json!({ "project": project, "keep_paths": imported_paths }),
+            )
+            .await
+        {
+            Ok(r) => r.get("expired").and_then(|v| v.as_u64()).unwrap_or(0),
+            Err(e) => {
+                eprintln!("  prune failed: {e}");
+                0
+            }
+        }
+    };
+    if expired > 0 {
+        println!("  expired {expired} section(s) from documents no longer in the repository");
     }
     println!(
         "Imported {} files → {} sections ({} new, {} updated, {} unchanged, {} removed)",
@@ -1105,5 +1158,44 @@ mod github_tests {
             None
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod vendored_tests {
+    use super::*;
+
+    /// Committed dependency trees must not enter the corpus.
+    ///
+    /// They are tracked files, so `git ls-files` returns them, and a vendored `README.md` competes
+    /// for retrieval against the team's own documentation. This was not theoretical: a live search
+    /// for a retry policy returned Microsoft's `typescript/SECURITY.md` at rank 1, out of a
+    /// committed `node_modules`.
+    #[test]
+    fn vendored_trees_are_skipped() {
+        for p in [
+            "sdk/typescript/node_modules/typescript/README.md",
+            "node_modules/x/README.md",
+            "third_party/lib/docs/guide.md",
+            "python/.venv/lib/site-packages/pkg/README.md",
+            "target/doc/index.md",
+        ] {
+            assert!(is_vendored(p), "should skip {p}");
+        }
+    }
+
+    /// A path that merely *mentions* a vendored name is not vendored — the match is per segment,
+    /// so a legitimate document about dependencies is still imported.
+    #[test]
+    fn only_whole_path_segments_match() {
+        for p in [
+            "docs/node_modules-policy.md",
+            "docs/vendored-deps.md",
+            "docs/how-we-vendor.md",
+            "README.md",
+            "crates/ecphoria-core/CLAUDE.md",
+        ] {
+            assert!(!is_vendored(p), "should keep {p}");
+        }
     }
 }
