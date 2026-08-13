@@ -147,7 +147,8 @@ This is the read path an agent hits on every recall. Hybrid, read-only (no Raft/
 ```
 query ──► tokenize (lowercase · drop stop-words · light stemming: run(ning)→run, agenc(ies)→agency)
        │
-       ├─ (A) LEXICAL  BM25 over the candidate universe          [list_active(scope, retrieval_scan_cap=2048)]
+       ├─ (A) LEXICAL  two-stage:  FTS5 inverted index over the WHOLE scope   [memory/lexical.rs]
+       │                        →  BM25 re-score of those candidates          [keep retrieval_scan_cap=2048]
        ├─ (B) VECTOR   embed(query) → HNSW k-NN                    [fetch ~retrieval_pool candidates]
        └─ (C) GRAPH    query entities → edges → linked memories    [optional: cognition.graph_expansion]
                           │
@@ -164,9 +165,20 @@ query ──► tokenize (lowercase · drop stop-words · light stemming: run(ni
         top-k  ──►  MemoryHit[]  (returned to the agent / caller)
 ```
 
+**Why the lexical arm has two stages.** It used to be one: BM25 in Rust over
+`list_active(scope, retrieval_scan_cap)`, the top-N memories by importance then recency. That made
+`retrieval_scan_cap` a *recall ceiling* rather than a tuning knob — past it, memories were
+unreachable by keyword however well they matched, and a growing corpus buried its own history
+(measured: recall@5 fell from 83% at 2k memories to **0%** at 5k). The FTS5 index now decides
+*which* memories are considered, over the whole scope; the same in-Rust BM25 decides *in what
+order*. Recall is flat from 50 to 200k memories. The index is advisory — candidates are re-read
+from DuckDB under the `state='active'` + exact-scope filter, so a stale entry can never surface a
+superseded or out-of-scope memory. See `docs/benchmarks-kb.md`.
+
 Widths are **configurable** (`cognition.retrieval_scan_cap`, `retrieval_pool`) — read-path knobs for
-tuning/A-B. *Measured note:* widening the pool alone is neutral on recall@5; the levers that move it
-are `extraction=llm` (atomic facts) and reranking. See `docs/benchmarks-locomo.md` and `ops/bench/`.
+tuning/A-B. *Measured note:* widening the pool alone is neutral on recall@5 on LoCoMo; the levers
+that move it are `extraction=llm` (atomic facts) and reranking. See `docs/benchmarks-locomo.md`,
+`docs/benchmarks-kb.md` and `ops/bench/`.
 
 ### 4.2 Ingest
 

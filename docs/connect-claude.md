@@ -63,20 +63,40 @@ memory — "what did we believe, and when".
 
 ---
 
-## 2. MCP  ✅ Streamable HTTP — Claude Code and Claude Desktop both connect natively
+## 2. MCP  ✅ Streamable HTTP — Claude Code, OpenCode and Claude Desktop all connect natively
 
 Ecphoria exposes an MCP **Streamable HTTP** endpoint at `/mcp`: `POST` for JSON-RPC 2.0
 (`initialize` — which returns an `Mcp-Session-Id` header — `tools/list`, `tools/call`,
-`resources/list`, `prompts/list`) and `GET` for the server→client SSE stream. It advertises **23
+`resources/list`, `prompts/list`) and `GET` for the server→client SSE stream. It advertises **25
 tools** — memory (`add_memory`, `search_memory`, `get_memories`, `memory_history`, `delete_memory`,
 `remember`), graph (`link_memory`, `graph_neighbors`) + analytics (`graph_centrality`, `graph_path`,
 `graph_communities`), cognition (`memory_provenance`, `memory_feedback`, `list_contradictions`), and
 `query` (incl. `SELECT … FROM memories`) / ingest / state / session / embed. Call `tools/list` for
 the current set.
 
-**Claude Code** (HTTP MCP) — add to your MCP config:
+**Claude Code** — the `--transport http` flag is required; the CLI defaults to stdio and Ecphoria
+serves MCP over HTTP:
+```bash
+claude mcp add --transport http --scope user ecphoria http://localhost:8432/mcp \
+  --header "Authorization: Bearer $ECPHORIA_API_KEY"     # only when auth is enabled
+```
+
+**OpenCode** — add an `mcp` block to `opencode.json` (globally at
+`~/.config/opencode/opencode.json`, or in the project root to scope it to one repository). Note
+`"type": "remote"`: `"local"` is for stdio servers launched as a subprocess, which is not how
+Ecphoria is served.
 ```json
-{ "mcpServers": { "ecphoria": { "url": "http://localhost:8432/mcp" } } }
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ecphoria": {
+      "type": "remote",
+      "url": "http://localhost:8432/mcp",
+      "enabled": true,
+      "headers": { "Authorization": "Bearer sk-your-key" }
+    }
+  }
+}
 ```
 
 **Claude Desktop** — it speaks MCP Streamable HTTP (HTTP GET + SSE + `Mcp-Session-Id`), which
@@ -86,6 +106,11 @@ Ecphoria now serves, so point it at the URL directly. (If your client only suppo
 
 > Note: Ecphoria is a stateless tool server, so the GET/SSE stream is an idle keep-alive (no
 > server-initiated notifications) — sufficient for the request/response tool calls clients make.
+> `resources/read` and `prompts/get` are **not** implemented: resources and prompts are enumerable
+> but not fetchable, so a client that depends on reading them will not work.
+
+For the one-command setup (MCP registration plus optional session capture), see
+[`ops/daily/`](../ops/daily/).
 
 ---
 

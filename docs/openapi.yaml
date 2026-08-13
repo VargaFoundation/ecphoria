@@ -147,6 +147,11 @@ paths:
                 agent_id: { type: string }
                 session_id: { type: string }
                 metadata: { type: object }
+                project:
+                  type: string
+                  description: >
+                    Project this memory belongs to, within its scope. Facts with the same subject in
+                    different projects are distinct, and a later search can narrow to one project.
       responses: { '200': { description: MemoryAdd (memory + outcome) } }
     get:
       summary: List active memories in a scope
@@ -156,6 +161,86 @@ paths:
         - { name: agent_id, in: query, schema: { type: string } }
         - { name: session_id, in: query, schema: { type: string } }
       responses: { '200': { description: '{ memories: [...], count: N }' } }
+  /api/v1/memories/batch:
+    post:
+      summary: Bulk-add memories (same cognition, batched I/O — ~4.8x faster than a loop)
+      description: >
+        Applied in order, so a later memory can supersede an earlier one in the same batch.
+        Max 10000 per request. In cluster mode this falls back to per-memory Raft replication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [memories]
+              properties:
+                memories:
+                  type: array
+                  maxItems: 10000
+                  items:
+                    type: object
+                    required: [content]
+                    properties:
+                      content: { type: string }
+                      subject: { type: string }
+                      importance: { type: number }
+                      user_id: { type: string }
+                      agent_id: { type: string }
+                      session_id: { type: string }
+                      metadata: { type: object }
+                      mem_type: { type: string }
+                      project: { type: string }
+      responses:
+        '200': { description: '{ added: N, memories: [MemoryAdd] }' }
+        '400': { description: empty batch, or a memory with blank content }
+        '413': { description: more than 10000 memories }
+  /api/v1/documents:
+    post:
+      summary: Ingest one Markdown document as independently-addressed sections
+      description: >
+        Chunks on the heading hierarchy server-side (the removal sweep must compare against what is
+        already stored, so a client cannot do it correctly). Re-posting the same path supersedes the
+        sections whose text changed, confirms the rest, and expires any that vanished.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content]
+              properties:
+                path:
+                  type: string
+                  description: Stable document identity, normally its repo-relative path
+                content: { type: string, description: Raw Markdown }
+                valid_from:
+                  type: string
+                  format: date-time
+                  description: Valid-time for this version, e.g. the source commit date. Defaults to now.
+                metadata: { type: object }
+                target_chars: { type: integer, default: 1500 }
+                project: { type: string, description: Project this document belongs to }
+                user_id: { type: string }
+                agent_id: { type: string }
+                session_id: { type: string }
+      responses:
+        '200': { description: '{ path, chunks, inserted, superseded, confirmed, removed }' }
+        '400': { description: missing path or content }
+  /api/v1/memories/history:
+    get:
+      summary: Version history of a subject (every version, oldest first)
+      description: >
+        The by-id variant needs a memory id, which a caller only has after searching. A subject is
+        the stable key a client actually holds.
+      parameters:
+        - { name: subject, in: query, required: true, schema: { type: string } }
+        - { name: user_id, in: query, schema: { type: string } }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+      responses:
+        '200': { description: '{ subject, count, memories: [...] }' }
+        '400': { description: missing subject }
   /api/v1/memories/search:
     post:
       summary: Hybrid (BM25 + vector) memory search, re-ranked by importance + recency
@@ -170,6 +255,11 @@ paths:
                 query: { type: string }
                 k: { type: integer, default: 5 }
                 user_id: { type: string }
+                project:
+                  type: string
+                  description: >
+                    Restrict to one project. Omit to search every project in the scope at once,
+                    fused into a single ranking.
                 agent_id: { type: string }
                 session_id: { type: string }
       responses: { '200': { description: Ranked memory hits } }

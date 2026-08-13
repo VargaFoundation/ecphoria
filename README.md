@@ -18,6 +18,33 @@ Most "agent memory" intelligence (Mem0, Zep) lives behind a cloud API or a paywa
 graph. Ecphoria is the **genuinely open, self-hostable, benchmarkable** alternative:
 the smarts run in your own single Rust binary, on your own infrastructure.
 
+### What it replaces: the half of `CLAUDE.md` that rots
+
+Instruction files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`) do two jobs, and only one of them
+they do well.
+
+|  | `CLAUDE.md` — **pushed** | Ecphoria — **pulled** |
+|---|---|---|
+| How it reaches the agent | Injected into every session's context, always present | The agent queries it when a question needs it |
+| Best for | *Instructions* — build commands, conventions, rules, "always do X" | *Knowledge* — why a decision was made, what broke last quarter, which ticket covered this |
+| Cost of growth | Every token is paid on every request, forever | Nothing until asked |
+| Staleness | Someone has to remember to edit it | Re-imported from git, tickets and incidents; contradictions supersede automatically |
+| Sharing | Copied between repos, drifts | One server, many projects, tenant-scoped |
+
+The knowledge half is what makes instruction files grow, go stale, and get skimmed. Move it here
+and keep the instruction file short — plus one line telling the agent the knowledge exists:
+
+```markdown
+## Memory
+
+An Ecphoria server holds this project's documentation, ADRs, closed tickets and past incidents.
+Search it (`search_memory`) before answering *why* something is built the way it is, and record
+durable decisions with `add_memory` — give a `subject` so a later decision supersedes it rather
+than duplicating it.
+```
+
+That is the whole integration. See [Connect an editor](docs/connect-claude.md).
+
 ### Memory intelligence (the part that's hard)
 
 - **First-class, bi-temporal memories** — every fact has `valid_from`/`valid_to`, so you
@@ -294,9 +321,12 @@ Ecphoria automatically:
 
 ## Documentation
 
+- [Daily use with Claude Code](ops/daily/) — MCP tools + session capture, one setup script
+- [Knowledge base guide](docs/knowledge-base.md) — docs, ADRs, incidents and tickets in one searchable, bi-temporal store
 - [Agentic platform](docs/agentic-platform.md) — runs, agent loop, HITL, workflows, triggers, tools
 - [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Ecphoria adds for free
 - [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
+- [KB benchmarks](docs/benchmarks-kb.md) — retrieval on an engineering corpus, measured to 200k memories
 - [Web Explorer](examples/web-ui/) — single-file UI for SQL, memory search, and run traces
 
 ## Full Dev Stack

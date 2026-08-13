@@ -178,6 +178,95 @@ Response:
 }
 ```
 
+## Memory & knowledge base
+
+The cognition layer. Full request/response schemas are in [`openapi.yaml`](./openapi.yaml); this is
+the working subset.
+
+### Add a memory
+
+```bash
+POST /api/v1/memories
+{ "content": "The deploy target is the EKS cluster", "subject": "deploy.target", "user_id": "alice" }
+```
+
+`subject` is the contradiction key. Post a different `content` for the same `(scope, subject)` and
+the previous version is **superseded**, not overwritten — it stays queryable through history and
+as-of. Omit it and the memory is deduplicated by vector similarity instead (when embeddings are
+configured), or simply inserted.
+
+### Search
+
+```bash
+POST /api/v1/memories/search
+{ "query": "where do we deploy", "k": 5, "user_id": "alice" }
+```
+
+Hybrid: BM25 over an inverted index fused with vector k-NN by Reciprocal Rank Fusion, then blended
+with importance and recency. Works without an embedding provider (BM25 only).
+
+### History of a subject
+
+```bash
+GET /api/v1/memories/history?subject=deploy.target&user_id=alice
+```
+
+Every version, oldest first, with the period each was believed. `GET /memories/{id}/history` does
+the same from a memory id.
+
+### Bulk import
+
+```bash
+POST /api/v1/memories/batch
+{ "memories": [ { "content": "...", "subject": "..." }, ... ] }
+```
+
+Up to 10 000 per request, applied in order. Same cognition as `POST /memories` — a later memory in
+the batch can supersede an earlier one — but batched embeddings and writes make it roughly 4.8×
+faster. In cluster mode it falls back to per-memory Raft replication.
+
+### Documents
+
+```bash
+POST /api/v1/documents
+{ "path": "docs/runbook.md", "content": "# Runbook\n\n## Failover\n...",
+  "valid_from": "2026-07-18T22:43:46Z" }
+```
+
+Splits the Markdown on its heading hierarchy and stores one memory per section, addressed by its
+heading trail. Re-posting the same `path` supersedes the sections whose text changed, confirms the
+rest, and expires any that vanished. Returns
+`{ path, chunks, inserted, superseded, confirmed, removed }`.
+
+Pass `valid_from` — the source commit date — so the timeline reflects when the documentation
+changed rather than when the import ran. See [Knowledge base](./knowledge-base.md).
+
+### Provenance and feedback
+
+```bash
+GET  /api/v1/memories/{id}/provenance    # source events + supersession chain
+POST /api/v1/memories/{id}/feedback      # { "verdict": "helpful" | "wrong" | "obsolete" }
+GET  /api/v1/memories/watch              # WebSocket CDC stream
+```
+
+## Agent runtime
+
+```bash
+POST /api/v1/agents/run
+{ "agent_id": "assistant", "question": "...", "max_turns": 8, "background": true }
+```
+
+`background: true` returns `202 Accepted` with a run id plus `status_url` and `trace_url` to poll.
+Use it: the inline form runs the whole LLM↔tool loop inside the request, which exceeds the server's
+30-second request timeout on any real multi-turn run.
+
+```bash
+GET  /api/v1/runs/{id}          # status, input, result, cursor
+GET  /api/v1/runs/{id}/trace    # the journalled step-by-step trace
+POST /api/v1/runs/{id}/cancel
+POST /api/v1/runs/{id}/approve  # human-in-the-loop
+```
+
 ## Cluster Endpoints
 
 Available when `cluster.enabled = true`.
@@ -261,7 +350,12 @@ ORDER BY cnt DESC;
 
 ## MCP (Model Context Protocol)
 
-Ecphoria includes a built-in MCP server at `/mcp` using Streamable HTTP (SSE) transport.
+Ecphoria includes a built-in MCP server at `/mcp` using Streamable HTTP transport, advertising 25
+tools. Any MCP client connects — see [Connect an editor](./connect-claude.md) for Claude Code,
+OpenCode and Claude Desktop configuration.
+
+`resources/read` and `prompts/get` are not implemented: resources and prompts are enumerable but not
+fetchable.
 
 ### Configuration
 
@@ -344,9 +438,11 @@ Provider detection:
 ```bash
 ecphoria status                          # Server health check
 ecphoria query "SELECT ..."              # Execute SQL (incl. SELECT ... FROM memories)
-ecphoria ingest --source X --file Y      # Bulk ingest from file
+ecphoria ingest --source X --file Y      # Bulk ingest events from a JSON array / object / JSON Lines file
 ecphoria export --entity ID              # GDPR data export
 ecphoria export --to obsidian --path DIR # Export memories to an Obsidian vault
+ecphoria import --from git --path REPO [--watch]      # Markdown from a repo, chunked, commit dates as valid-time
+ecphoria import --from github --path owner/repo       # Backfill closed issues + PRs (GITHUB_TOKEN)
 ecphoria import --from obsidian --path DIR [--watch]  # Import a vault (live sync with --watch)
 ecphoria backup                          # Trigger a server-side backup (to the data dir)
 ecphoria restore --path <dir>            # Restore from a server-local backup dir (DESTRUCTIVE)

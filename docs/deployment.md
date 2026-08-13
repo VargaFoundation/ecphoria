@@ -191,7 +191,7 @@ helm install ecphoria deploy/helm/ecphoria/ -f values-production.yaml
 | `config.gateway.allowInsecure` | `false` | Opt out of the secure-by-default guard |
 | `config.gateway.oidc.enabled` | `false` | Enable OIDC (RS256/JWKS) auth |
 | `config.gateway.jwtSecretExistingSecret` | `""` | Name of a Secret (key `jwt-secret`) for JWT HS256 |
-| `config.embedding.provider` | `ollama` | Embedding provider |
+| `config.embedding.provider` | `ollama` | Embedding provider (the *server* default is `none` = BM25-only; the chart sets `ollama`) |
 | `config.embedding.ollamaUrl` | `http://ollama:11434` | Ollama server URL |
 | `persistence.enabled` | `true` | Enable persistent volumes |
 | `persistence.size` | `10Gi` | Volume size per node |
@@ -297,7 +297,7 @@ LLM fact extraction and graph auto-population are opt-in.
 | `memory.cognition.forget_threshold` | `ECPHORIA_MEMORY__COGNITION__FORGET_THRESHOLD` | `0.05` | Memories whose decayed importance falls below this are forgotten |
 | `memory.cognition.read_pool_size` | `ECPHORIA_MEMORY__COGNITION__READ_POOL_SIZE` | `4` | Read-connection count (query concurrency) |
 | `memory.cognition.max_memories_per_scope` | `ECPHORIA_MEMORY__COGNITION__MAX_MEMORIES_PER_SCOPE` | `0` | Per-scope active-memory cap (0 = unlimited) |
-| `memory.cognition.retrieval_scan_cap` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP` | `2000` | Candidate width scanned per query (BM25 + vector) |
+| `memory.cognition.retrieval_scan_cap` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP` | `2048` | Ranked candidates carried forward per query (BM25 + vector). **Not** a cap on how much of the corpus is searched — the lexical arm's FTS5 index covers the whole scope. Wider is better on the KB eval; see `docs/benchmarks-kb.md` |
 | `memory.cognition.retrieval_pool` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_POOL` | `200` | Fused pool kept after RRF for blend + rerank |
 | `memory.cognition.graph_expansion` | `ECPHORIA_MEMORY__COGNITION__GRAPH_EXPANSION` | `false` | Query-time knowledge-graph expansion in `memory_search` |
 | `memory.cognition.auto_graph` | `ECPHORIA_MEMORY__COGNITION__AUTO_GRAPH` | `false` | Auto-populate graph edges from each added memory |
@@ -307,6 +307,22 @@ LLM fact extraction and graph auto-population are opt-in.
 | `memory.cognition.retrieval_lexical_weight` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_LEXICAL_WEIGHT` | `1.0` | Weighted-RRF weight of the lexical (BM25) arm |
 | `memory.cognition.contradiction_review` | `ECPHORIA_MEMORY__COGNITION__CONTRADICTION_REVIEW` | `false` | HITL: contradictions queue for review instead of auto-superseding |
 | `memory.cognition.decay_interval_secs` | `ECPHORIA_MEMORY__COGNITION__DECAY_INTERVAL_SECS` | `0` | Leader forgets decayed memories on this interval (0 = off) |
+
+### Memory — promotion (webhook events → memories)
+
+Webhook deliveries land in the episodic store, which is SQL-queryable but invisible to
+`search_memory`. Promotion additionally writes the events that mark a **durable outcome** as
+memories, so closed tickets and resolved incidents are recallable alongside documentation. Off by
+default — it changes what a corpus contains.
+
+| Setting | Env Var | Default | Description |
+|---------|---------|---------|-------------|
+| `memory.promotion.enabled` | `ECPHORIA_MEMORY__PROMOTION__ENABLED` | `false` | Write matching webhook events as memories too |
+| `memory.promotion.rules` | `ECPHORIA_MEMORY__PROMOTION__RULES` | closes/merges/resolutions | `"<vendor>:<event_type>"`; either side may be `*`, and a trailing `*` on the type matches by prefix (`github:pull_request.*`) |
+
+Promoted memories use a deterministic subject (`acme/api#pr-42`), so provider redelivery resolves
+as `Confirmed` rather than a duplicate, and a ticket that reopens and closes again supersedes
+itself into a history. See `docs/knowledge-base.md`.
 
 ### Embedding
 
