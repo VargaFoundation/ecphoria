@@ -12,6 +12,7 @@ use crate::memory::cognition::{
     MemoryStore,
 };
 use crate::memory::episodic::{EpisodicStore, Event};
+use crate::memory::lexical::LexicalIndex;
 use crate::memory::semantic::{ScopedVectorIndex, SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
@@ -20,6 +21,43 @@ use crate::runtime::{
     Run, RunPatch, RunReplicator, RunStatus, RunStore, ToolExecutor, WorkflowNode,
 };
 use crate::Result;
+
+/// One document to ingest (see [`EcphoriaEngine::document_ingest`]).
+#[derive(Debug, Clone, Default)]
+pub struct DocumentIngest<'a> {
+    /// Stable identity — normally `<project>/<repo-relative path>`. Drives supersession *and* the
+    /// removal sweep, so two documents must never share one.
+    pub path: &'a str,
+    /// Raw Markdown.
+    pub content: &'a str,
+    /// Attached to every section.
+    pub metadata: serde_json::Value,
+    /// Valid-time for this version, e.g. the source commit date. Defaults to now.
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Project this document belongs to, so a search can narrow to it.
+    pub project: Option<&'a str>,
+}
+
+/// What one document re-import changed (see [`EcphoriaEngine::document_ingest`]).
+///
+/// The counts are the point of the API: on a steady-state re-import of an unchanged corpus every
+/// section should be `confirmed` and nothing else, which is how a `--watch` loop stays cheap and
+/// how a caller can tell whether a document actually moved.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DocumentIngestResult {
+    /// Repo-relative path the document is addressed by.
+    pub path: String,
+    /// Sections the document split into.
+    pub chunks: usize,
+    /// Sections that did not exist before.
+    pub inserted: usize,
+    /// Sections whose text changed — the previous version is kept in history.
+    pub superseded: usize,
+    /// Sections that were byte-identical to the stored version.
+    pub confirmed: usize,
+    /// Sections that vanished from the source and were expired.
+    pub removed: usize,
+}
 
 /// Provenance for a memory — the evidence chain behind a distilled fact (see
 /// [`EcphoriaEngine::memory_provenance`]).
@@ -99,6 +137,9 @@ pub struct EcphoriaEngine {
     memory_store: Arc<MemoryStore>,
     /// Vector index over memories only (kept separate from event embeddings).
     memory_index: Arc<ScopedVectorIndex>,
+    /// Inverted (FTS5) index over memories — the lexical arm of hybrid retrieval. Advisory: it
+    /// yields candidate ids that are re-read from `memory_store` under the active/scope filter.
+    lexical_index: Arc<LexicalIndex>,
     /// Per-modality vector indexes (mixed-dimension multi-modal embeddings).
     modal: crate::memory::semantic::MultiModalStore,
     ingest: IngestPipeline,
@@ -215,6 +256,20 @@ impl EcphoriaEngine {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "failed to rebuild memory index"),
+        }
+
+        // Inverted index for the lexical arm. Lives beside the cognition DuckDB file (or in
+        // memory when that is), and is rebuilt from it — DuckDB stays the single source of truth,
+        // so a deleted or corrupt index file costs a rebuild, never data.
+        let lexical_index = Arc::new(
+            LexicalIndex::open(&Self::lexical_index_path(&config.memory.cognition.db_path))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "falling back to in-memory lexical index");
+                    LexicalIndex::in_memory().expect("in-memory lexical index")
+                }),
+        );
+        if let Err(e) = Self::rebuild_lexical_index(&memory_store, &lexical_index).await {
+            tracing::warn!(error = %e, "failed to rebuild lexical index");
         }
 
         // Initialize embedding provider from config
@@ -465,6 +520,7 @@ impl EcphoriaEngine {
             state,
             memory_store,
             memory_index,
+            lexical_index,
             modal: crate::memory::semantic::MultiModalStore::new(),
             ingest,
             completion,
@@ -483,6 +539,54 @@ impl EcphoriaEngine {
     /// Get a reference to the configuration.
     pub fn config(&self) -> &CoreConfig {
         &self.config
+    }
+
+    /// Where the FTS5 index file lives, given the cognition DuckDB path.
+    ///
+    /// `:memory:` stays in memory; otherwise it is a sibling of the DuckDB file
+    /// (`…/memories.duckdb` → `…/memories.fts.sqlite`) so one data dir holds the whole layer.
+    fn lexical_index_path(cognition_db_path: &str) -> std::path::PathBuf {
+        if cognition_db_path == ":memory:" {
+            return std::path::PathBuf::from(":memory:");
+        }
+        Path::new(cognition_db_path).with_extension("fts.sqlite")
+    }
+
+    /// Rebuild the lexical index from DuckDB, the source of truth. Returns the number indexed.
+    ///
+    /// Paged so a large corpus never materializes at once. Called on startup and by
+    /// `/admin/reindex`; safe to run at any time (it clears first, so it converges rather than
+    /// accumulating duplicates).
+    async fn rebuild_lexical_index(store: &MemoryStore, index: &LexicalIndex) -> Result<usize> {
+        const PAGE: usize = 2_000;
+        index.clear()?;
+        let mut offset = 0usize;
+        let mut total = 0usize;
+        loop {
+            let page = store.lexical_page(offset, PAGE).await?;
+            if page.is_empty() {
+                break;
+            }
+            let n = page.len();
+            for (id, scope, project, subject, content) in page {
+                let key = crate::memory::cognition::scope_partition_key(&scope);
+                index.upsert(id, &key, project.as_deref(), subject.as_deref(), &content)?;
+            }
+            total += n;
+            offset += n;
+            if n < PAGE {
+                break;
+            }
+        }
+        if total > 0 {
+            tracing::info!(memories = total, "rebuilt lexical index from disk");
+        }
+        Ok(total)
+    }
+
+    /// Rebuild the lexical index on demand (admin reindex).
+    pub async fn lexical_reindex(&self) -> Result<usize> {
+        Self::rebuild_lexical_index(&self.memory_store, &self.lexical_index).await
     }
 
     /// Inject a tool executor (e.g. the gateway's MCP tool-gateway) so the agent loop can invoke
@@ -604,18 +708,71 @@ impl EcphoriaEngine {
 
     // ── Event triggers (event-driven agent runs) ─────────────────────
 
+    /// State-store agent id holding one tenant's triggers.
+    ///
+    /// The tenant is part of the key, not a field inside the value, because both the listing and
+    /// the firing loop enumerate keys — a tenant field would have to be filtered correctly at
+    /// every call site, and missing one leaks. Namespacing makes cross-tenant access impossible to
+    /// express rather than merely incorrect.
+    fn trigger_agent(tenant: &str) -> String {
+        let t = if tenant.is_empty() { "default" } else { tenant };
+        format!("__trigger:{t}")
+    }
+
+    /// State-store agent id holding the downstream MCP tool catalog.
+    ///
+    /// Deliberately **not** tenant-namespaced, unlike triggers: this is an operator-level catalog
+    /// of which external servers exist, not per-tenant data. Restrict who may write it with RBAC
+    /// (`/api/v1/tools` is a normal authenticated route).
+    const TOOL_CATALOG_AGENT: &'static str = "__tools";
+
+    /// Persist a downstream MCP server registration.
+    ///
+    /// The gateway keeps an in-memory map for the call path; this is the durable copy. Without it
+    /// the catalog was lost on restart and diverged between cluster nodes, so an agent's tool call
+    /// succeeded or 404'd depending on which node served it. Routing through the state store means
+    /// it replicates through Raft like any other state write.
+    pub async fn tool_server_register(&self, name: &str, url: &str) -> Result<()> {
+        self.state_set_via_driver(
+            Self::TOOL_CATALOG_AGENT,
+            name,
+            serde_json::json!({ "url": url }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Forget a downstream MCP server.
+    pub async fn tool_server_remove(&self, name: &str) -> Result<()> {
+        self.state_delete(Self::TOOL_CATALOG_AGENT, name).await
+    }
+
+    /// Every persisted `(name, url)` — used to repopulate the gateway's map at startup.
+    pub async fn tool_server_list(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for name in self.state_list_keys(Self::TOOL_CATALOG_AGENT).await? {
+            if let Some(entry) = self.state_get(Self::TOOL_CATALOG_AGENT, &name).await? {
+                if let Some(url) = entry.value.get("url").and_then(|v| v.as_str()) {
+                    out.push((name, url.to_string()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Register an event trigger: when an event matching `source` + `event_type` (each `*` = any)
-    /// is observed, [`Self::fire_triggers`] starts a run of `agent_id`. Persisted in the state store
-    /// (so it replicates via `StateSet`).
+    /// is observed for **this tenant**, [`Self::fire_triggers`] starts a run of `agent_id`.
+    /// Persisted in the state store (so it replicates via `StateSet`).
     pub async fn trigger_register(
         &self,
+        tenant: &str,
         name: &str,
         source: &str,
         event_type: &str,
         agent_id: &str,
     ) -> Result<()> {
         self.state_set_via_driver(
-            "__trigger",
+            &Self::trigger_agent(tenant),
             name,
             serde_json::json!({ "source": source, "event_type": event_type, "agent_id": agent_id }),
         )
@@ -623,11 +780,12 @@ impl EcphoriaEngine {
         .map(|_| ())
     }
 
-    /// List the registered event triggers.
-    pub async fn trigger_list(&self) -> Result<Vec<serde_json::Value>> {
+    /// List a tenant's registered event triggers.
+    pub async fn trigger_list(&self, tenant: &str) -> Result<Vec<serde_json::Value>> {
+        let agent = Self::trigger_agent(tenant);
         let mut out = Vec::new();
-        for name in self.state_list_keys("__trigger").await? {
-            if let Some(entry) = self.state_get("__trigger", &name).await? {
+        for name in self.state_list_keys(&agent).await? {
+            if let Some(entry) = self.state_get(&agent, &name).await? {
                 let mut v = entry.value;
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("name".into(), name.clone().into());
@@ -648,8 +806,9 @@ impl EcphoriaEngine {
         input: serde_json::Value,
     ) -> Result<Vec<uuid::Uuid>> {
         let mut fired = Vec::new();
-        for name in self.state_list_keys("__trigger").await.unwrap_or_default() {
-            let Ok(Some(entry)) = self.state_get("__trigger", &name).await else {
+        let agent = Self::trigger_agent(tenant);
+        for name in self.state_list_keys(&agent).await.unwrap_or_default() {
+            let Ok(Some(entry)) = self.state_get(&agent, &name).await else {
                 continue;
             };
             let v = entry.value;
@@ -842,6 +1001,40 @@ impl EcphoriaEngine {
             ));
         }
         let run = self
+            .run_agent_start(tenant, agent_id, question, parent_run_id)
+            .await?;
+        self.drive_agent_loop(
+            run.id,
+            tenant,
+            agent_id,
+            format!("Question: {question}\n"),
+            max_turns,
+        )
+        .await
+    }
+
+    /// Create a run and journal its opening step, **without** driving the loop.
+    ///
+    /// Split out of [`Self::run_agent_with_parent`] so a caller can answer immediately and drive
+    /// the run in the background — a multi-turn loop takes longer than an HTTP request should, and
+    /// running it inline under the gateway's request timeout meant a real run returned 504 while
+    /// continuing to execute invisibly.
+    ///
+    /// The returned run is `Running` with a journaled `run_start`, which is exactly the state
+    /// [`Self::run_agent_drive`] and the crash-recovery dispatcher expect.
+    pub async fn run_agent_start(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+        question: &str,
+        parent_run_id: Option<uuid::Uuid>,
+    ) -> Result<Run> {
+        if self.completion.is_none() {
+            return Err(crate::Error::Llm(
+                "run_agent requires a completion provider".into(),
+            ));
+        }
+        let mut run = self
             .run_create(
                 tenant,
                 Some(agent_id.to_string()),
@@ -849,12 +1042,13 @@ impl EcphoriaEngine {
                 serde_json::json!({ "question": question }),
             )
             .await?;
+        let started_at = chrono::Utc::now();
         let _ = self
             .run_update(
                 run.id,
                 RunPatch {
                     status: Some(RunStatus::Running),
-                    started_at: Some(chrono::Utc::now()),
+                    started_at: Some(started_at),
                     ..Default::default()
                 },
             )
@@ -866,15 +1060,28 @@ impl EcphoriaEngine {
             serde_json::json!({ "question": question }),
         )
         .await?;
+        // `run_create` returned the row as it was *before* the patch. Reflect what was actually
+        // written, or the caller (and the `202 Accepted` body) reports a run that never started.
+        run.status = RunStatus::Running;
+        run.started_at = Some(started_at);
+        Ok(run)
+    }
 
-        self.drive_agent_loop(
-            run.id,
-            tenant,
-            agent_id,
-            format!("Question: {question}\n"),
-            max_turns,
-        )
-        .await
+    /// Drive an already-started run to completion, rebuilding its transcript from the journal.
+    ///
+    /// Same path the dispatcher uses for crash recovery, with `max_turns` under the caller's
+    /// control. Safe to call on a run that has already made progress — the transcript replay is
+    /// what makes the loop re-entrant.
+    pub async fn run_agent_drive(&self, run_id: uuid::Uuid, max_turns: usize) -> Result<Run> {
+        let run = self
+            .run_get(run_id)
+            .await?
+            .ok_or_else(|| crate::Error::State("run not found".into()))?;
+        let agent_id = run.agent_id.clone().unwrap_or_default();
+        let tenant = run.tenant_id.clone();
+        let transcript = self.rebuild_agent_transcript(run_id).await?;
+        self.drive_agent_loop(run_id, &tenant, &agent_id, transcript, max_turns)
+            .await
     }
 
     /// Resume a run paused at human approval: if the approval is `approved`, rebuild the transcript
@@ -2025,7 +2232,7 @@ impl EcphoriaEngine {
         if cap > 0 {
             if let Ok(evicted) = self.memory_store.enforce_scope_cap(&scope, cap).await {
                 for id in evicted {
-                    let _ = self.memory_index.delete(id).await;
+                    self.forget_indexes(id).await;
                 }
             }
         }
@@ -2039,7 +2246,40 @@ impl EcphoriaEngine {
     /// them. This lets the cluster leader run cognition once, propose the rows through Raft, and
     /// have every node apply an identical result via [`Self::memory_apply_rows`] — avoiding the
     /// failover-divergence of re-running non-deterministic logic (new uuids/timestamps) per node.
-    pub async fn memory_plan(&self, mut input: MemoryInput) -> Result<(MemoryAdd, Vec<MemoryRow>)> {
+    pub async fn memory_plan(&self, input: MemoryInput) -> Result<(MemoryAdd, Vec<MemoryRow>)> {
+        let embedding = self.embed_memory_content(&input.content).await;
+        self.memory_plan_with_embedding(input, embedding).await
+    }
+
+    /// Embed one memory's content for storage, best-effort.
+    ///
+    /// The deterministic cognition paths work without it, but a failure silently drops the memory
+    /// out of vector search (BM25-only), so it is made observable (metric + warn) rather than
+    /// degrading quietly. Memory content is an indexed *document*, so this uses the document task
+    /// prefix, not the query one.
+    async fn embed_memory_content(&self, content: &str) -> Option<Vec<f32>> {
+        self.embedding.as_ref()?;
+        match self.embed_document_text(content).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                metrics::counter!("ecphoria_memory_embed_failures_total", "op" => "ingest")
+                    .increment(1);
+                tracing::warn!(error = %e, "memory embedding failed — stored without a vector (search degraded to BM25)");
+                None
+            }
+        }
+    }
+
+    /// [`Self::memory_plan`] with a caller-supplied embedding.
+    ///
+    /// Split out so bulk ingest can embed a whole batch in one provider round-trip and still run
+    /// cognition one memory at a time — which it must, because dedup and contradiction resolution
+    /// for memory *n* depend on the effects of memories *0..n*.
+    pub async fn memory_plan_with_embedding(
+        &self,
+        mut input: MemoryInput,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<(MemoryAdd, Vec<MemoryRow>)> {
         if input.scope.tenant_id.is_empty() {
             input.scope.tenant_id = "default".into();
         }
@@ -2052,28 +2292,12 @@ impl EcphoriaEngine {
             .filter(|s| !s.is_empty());
         let cog = &self.config.memory.cognition;
         let importance = input.importance.unwrap_or(cog.default_importance);
-        // Embedding is best-effort: the deterministic paths work without it. Memory content is an
-        // indexed *document*, so use the document task prefix (not the query one). A failure is not
-        // fatal, but it silently drops this memory out of vector search (BM25-only), so make it
-        // observable (metric + warn) rather than a silent degradation.
-        let embedding = match self.embedding.as_ref() {
-            Some(_) => match self.embed_document_text(&input.content).await {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    metrics::counter!("ecphoria_memory_embed_failures_total", "op" => "ingest")
-                        .increment(1);
-                    tracing::warn!(error = %e, "memory embedding failed — stored without a vector (search degraded to BM25)");
-                    None
-                }
-            },
-            None => None,
-        };
 
         // 1. Subject-based contradiction resolution (authoritative, no embedding required).
         if let Some(subject) = input.subject.clone() {
             let actives = self
                 .memory_store
-                .find_active_by_subject(&input.scope, &subject)
+                .find_active_by_subject(&input.scope, &subject, input.project.as_deref())
                 .await?;
             if let Some(existing) = actives.first() {
                 if existing.content.trim() == input.content.trim() {
@@ -2124,13 +2348,20 @@ impl EcphoriaEngine {
                 }
 
                 // Contradiction: supersede every active memory for this subject, insert new.
-                let now = chrono::Utc::now();
+                // `valid_at` is the valid-time boundary — when the new fact became true and the
+                // old one stopped being true. `recorded_at` is transaction time, always now.
+                let recorded_at = chrono::Utc::now();
+                let valid_at = Self::valid_boundary(
+                    input.valid_from,
+                    actives.iter().map(|a| a.valid_from).max(),
+                    recorded_at,
+                );
                 let mut rows: Vec<MemoryRow> = Vec::with_capacity(actives.len() + 1);
                 for a in &actives {
                     let mut old = a.clone();
                     old.state = MemoryState::Superseded;
-                    old.valid_to = Some(now);
-                    old.updated_at = now;
+                    old.valid_to = Some(valid_at);
+                    old.updated_at = recorded_at;
                     rows.push(MemoryRow {
                         memory: old,
                         embedding: None,
@@ -2138,9 +2369,10 @@ impl EcphoriaEngine {
                 }
                 let mut mem = Memory::new(input.scope.clone(), input.content.clone());
                 mem.subject = Some(subject);
+                mem.project = input.project.clone();
                 mem.importance = importance;
                 mem.supersedes = Some(actives[0].id);
-                mem.valid_from = now;
+                mem.valid_from = valid_at;
                 mem.source_event_ids = input.source_event_ids.clone();
                 mem.metadata = input.metadata.clone();
                 if let Some(t) = &input.mem_type {
@@ -2170,17 +2402,23 @@ impl EcphoriaEngine {
                     // "nothing is silently hard-deleted" guarantee on every write path, not just the
                     // subject-contradiction one. The outcome stays `Merged` so callers can still
                     // distinguish a near-duplicate consolidation from a true contradiction.
-                    let now = chrono::Utc::now();
+                    let recorded_at = chrono::Utc::now();
+                    let valid_at = Self::valid_boundary(
+                        input.valid_from,
+                        Some(top.memory.valid_from),
+                        recorded_at,
+                    );
                     let mut old = top.memory.clone();
                     old.state = MemoryState::Superseded;
-                    old.valid_to = Some(now);
-                    old.updated_at = now;
+                    old.valid_to = Some(valid_at);
+                    old.updated_at = recorded_at;
 
                     let mut mem = Memory::new(input.scope.clone(), input.content.clone());
                     mem.subject = top.memory.subject.clone();
+                    mem.project = input.project.clone().or(top.memory.project.clone());
                     mem.importance = importance.max(top.memory.importance);
                     mem.supersedes = Some(top.memory.id);
-                    mem.valid_from = now;
+                    mem.valid_from = valid_at;
                     // Provenance survives the merge: the old memory's source events still support
                     // the consolidated fact, so carry them forward (deduped) with the new ones.
                     let mut src = top.memory.source_event_ids.clone();
@@ -2217,7 +2455,11 @@ impl EcphoriaEngine {
         // 3. Insert a fresh memory.
         let mut mem = Memory::new(input.scope.clone(), input.content.clone());
         mem.subject = input.subject.clone();
+        mem.project = input.project.clone();
         mem.importance = importance;
+        if let Some(at) = input.valid_from {
+            mem.valid_from = at;
+        }
         mem.source_event_ids = input.source_event_ids.clone();
         mem.metadata = input.metadata.clone();
         if let Some(t) = &input.mem_type {
@@ -2235,6 +2477,364 @@ impl EcphoriaEngine {
         ))
     }
 
+    /// Add many memories in one call — the bulk-ingest path for loading a corpus.
+    ///
+    /// Semantically identical to calling [`Self::memory_add`] in a loop: cognition still runs one
+    /// memory at a time and in order, because dedup and contradiction resolution for memory *n*
+    /// depend on the effects of memories *0..n*. What changes is the I/O around it:
+    ///
+    /// - **embeddings** are computed for the whole batch in provider-sized chunks
+    ///   (`embedding.batch_size`) rather than one HTTP round-trip per memory;
+    /// - **DuckDB rows** are written in one transaction instead of one per memory — the dominant
+    ///   cost, ~4.3 ms/row vs ~59 µs batched (`docs/benchmarks.md`);
+    /// - **lexical index** entries likewise commit once.
+    ///
+    /// Rows are buffered and applied together, so cognition for memory *n* would not normally see
+    /// memories *0..n-1* — which would silently break contradiction resolution *within* a batch
+    /// (two versions of the same subject would both insert instead of one superseding the other).
+    /// The buffer is therefore **flushed whenever an incoming memory's subject collides with one
+    /// already pending**, so the deterministic guarantee holds exactly as it does one-at-a-time.
+    /// Distinct subjects — the normal case when importing a document corpus — never trigger it.
+    ///
+    /// Known limitation: *semantic* (vector) dedup still cannot see within a batch, because the
+    /// vector index is updated at apply time. Two subject-less near-duplicates in one batch are
+    /// both stored. Contradiction resolution by subject is the deterministic guarantee and is
+    /// preserved; vector dedup is a best-effort consolidation and is not.
+    pub async fn memory_add_batch(&self, inputs: Vec<MemoryInput>) -> Result<Vec<MemoryAdd>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 1. Embed everything up front, in provider-sized chunks.
+        let embeddings: Vec<Option<Vec<f32>>> = match self.embedding.as_ref() {
+            Some(provider) => {
+                let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(inputs.len());
+                let size = self.config.embedding.batch_size.max(1);
+                for chunk in inputs.chunks(size) {
+                    let texts: Vec<String> = chunk.iter().map(|i| i.content.clone()).collect();
+                    match provider.embed_documents(&texts).await {
+                        Ok(vs) if vs.len() == chunk.len() => out.extend(vs.into_iter().map(Some)),
+                        Ok(_) | Err(_) => {
+                            metrics::counter!("ecphoria_memory_embed_failures_total", "op" => "ingest")
+                                .increment(chunk.len() as u64);
+                            tracing::warn!(
+                                batch = chunk.len(),
+                                "batch embedding failed — memories stored without vectors (search degraded to BM25)"
+                            );
+                            out.extend(std::iter::repeat_n(None, chunk.len()));
+                        }
+                    }
+                }
+                out
+            }
+            None => vec![None; inputs.len()],
+        };
+
+        // 2. Plan each memory in order — cognition is sequential by necessity — buffering the
+        //    rows, and flushing early whenever a subject repeats so the contradiction check can
+        //    see the version it must supersede.
+        let mut adds = Vec::with_capacity(inputs.len());
+        let mut pending: Vec<MemoryRow> = Vec::new();
+        let mut pending_subjects: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for (input, embedding) in inputs.into_iter().zip(embeddings) {
+            // Key the overlay exactly as `memory_plan_with_embedding` will: default tenant filled
+            // in, subject normalized. A mismatch here would silently miss a collision.
+            let key = input.subject.as_deref().map(|s| {
+                let mut scope = input.scope.clone();
+                if scope.tenant_id.is_empty() {
+                    scope.tenant_id = "default".into();
+                }
+                (
+                    crate::memory::cognition::scope_partition_key(&scope),
+                    crate::memory::cognition::normalize_subject(s),
+                )
+            });
+            if let Some(k) = &key {
+                if pending_subjects.contains(k) {
+                    self.memory_apply_rows_batch(std::mem::take(&mut pending))
+                        .await?;
+                    pending_subjects.clear();
+                }
+            }
+            let (add, planned) = self.memory_plan_with_embedding(input, embedding).await?;
+            if let Some(k) = key {
+                pending_subjects.insert(k);
+            }
+            adds.push(add);
+            pending.extend(planned);
+        }
+
+        // 3. Apply what is left.
+        self.memory_apply_rows_batch(pending).await?;
+        Ok(adds)
+    }
+
+    /// Batched [`Self::memory_apply_rows`]: one DuckDB transaction, one lexical transaction, and
+    /// the vector index updated per row (USearch has no batch API and is already in-memory).
+    async fn memory_apply_rows_batch(&self, rows: Vec<MemoryRow>) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.memory_store.upsert_raw_batch(&rows).await?;
+
+        let mut lexical_upserts: Vec<crate::memory::lexical::LexicalEntry> = Vec::new();
+        for row in &rows {
+            let scope_key = crate::memory::cognition::scope_partition_key(&row.memory.scope);
+            match row.memory.state {
+                MemoryState::Active => {
+                    if let Some(emb) = &row.embedding {
+                        let _ = self
+                            .memory_index
+                            .upsert(&scope_key, &row.memory.to_semantic_entry(emb.clone()))
+                            .await;
+                    }
+                    lexical_upserts.push(crate::memory::lexical::LexicalEntry {
+                        id: row.memory.id,
+                        scope_key,
+                        project: row.memory.project.clone(),
+                        subject: row.memory.subject.clone(),
+                        content: row.memory.content.clone(),
+                    });
+                }
+                _ => self.forget_indexes(row.memory.id).await,
+            }
+            self.publish_memory_change(&row.memory);
+        }
+        if let Err(e) = self.lexical_index.upsert_batch(&lexical_upserts) {
+            tracing::warn!(error = %e, rows = lexical_upserts.len(), "lexical batch upsert failed");
+        }
+        metrics::counter!("ecphoria_memories_added_total").increment(rows.len() as u64);
+        Ok(rows.len() as u64)
+    }
+
+    /// Ingest (or re-ingest) a Markdown document as a set of independently-addressed chunks.
+    ///
+    /// This is what makes "documentation that evolves" work as a first-class case rather than a
+    /// pile of duplicates. The document is split on its heading hierarchy
+    /// ([`crate::ingest::chunk`]) and each section is stored as its own memory keyed by a stable
+    /// subject — `docs/deployment.md#Kubernetes > Production Values`. Re-importing the file then
+    /// routes each section through the *existing* deterministic contradiction path:
+    ///
+    /// | the section is… | outcome |
+    /// |---|---|
+    /// | unchanged | `Confirmed` — importance bumped, no new row |
+    /// | edited | `Superseded` — the previous text stays queryable via history / `as_of` |
+    /// | new | `Inserted` |
+    /// | deleted from the file | expired by the sweep below |
+    ///
+    /// So a runbook keeps its history *per section*, and "what did this say about failover in
+    /// March" is answerable. No new cognition was needed for that — only a stable subject key.
+    ///
+    /// The sweep is the one piece the subject path cannot do by itself: a section that disappears
+    /// produces no memory, so nothing supersedes its previous version and it would linger as a
+    /// stale active fact. Every previously-active subject under this document that the new version
+    /// no longer produces is therefore expired (not deleted — it stays in history).
+    ///
+    /// `valid_from` sets the **valid-time** boundary for every section written by this import —
+    /// pass the source commit's date and the timeline reflects when the *documentation* changed
+    /// rather than when the importer ran. Transaction time (`created_at`/`updated_at`) stays
+    /// wall-clock either way, so "what was true at T" and "what did we know at T" stay separable.
+    pub async fn document_ingest(
+        &self,
+        doc: DocumentIngest<'_>,
+        scope: &MemoryScope,
+        opts: &crate::ingest::chunk::ChunkOptions,
+    ) -> Result<DocumentIngestResult> {
+        use crate::ingest::chunk::chunk_markdown;
+        let DocumentIngest {
+            path: doc_path,
+            content,
+            metadata,
+            valid_from,
+            project,
+        } = doc;
+        let project = project.map(str::to_string);
+
+        let chunks = chunk_markdown(content, opts);
+        let inputs: Vec<MemoryInput> = chunks
+            .iter()
+            .map(|(chunk, part)| {
+                let mut meta = metadata.clone();
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("doc_path".into(), doc_path.into());
+                    obj.insert("heading_path".into(), chunk.heading_path.clone().into());
+                    obj.insert("ordinal".into(), chunk.ordinal.into());
+                }
+                MemoryInput {
+                    scope: scope.clone(),
+                    subject: Some(chunk.subject(doc_path, Some(*part))),
+                    content: chunk.text.clone(),
+                    importance: None,
+                    source_event_ids: vec![],
+                    metadata: meta,
+                    mem_type: Some("chunk".into()),
+                    valid_from,
+                    project: project.clone(),
+                }
+            })
+            .collect();
+
+        // Which subjects this version produces — normalized the same way the store will store
+        // them, so the sweep compares like with like.
+        let produced: std::collections::HashSet<String> = inputs
+            .iter()
+            .filter_map(|i| i.subject.as_deref())
+            .map(crate::memory::cognition::normalize_subject)
+            .collect();
+
+        let previous = self
+            .memory_store
+            .find_active_by_document(scope, doc_path)
+            .await?;
+
+        let added = self.memory_add_batch(inputs).await?;
+        let mut result = DocumentIngestResult {
+            path: doc_path.to_string(),
+            chunks: chunks.len(),
+            ..Default::default()
+        };
+        for a in &added {
+            match a.outcome {
+                MemoryOutcome::Inserted => result.inserted += 1,
+                MemoryOutcome::Confirmed => result.confirmed += 1,
+                MemoryOutcome::Superseded | MemoryOutcome::Merged => result.superseded += 1,
+                MemoryOutcome::Conflict => {}
+            }
+        }
+
+        // Sweep: expire sections that no longer exist in the source.
+        let now = chrono::Utc::now();
+        let stale: Vec<MemoryRow> = previous
+            .into_iter()
+            .filter(|m| m.subject.as_deref().is_some_and(|s| !produced.contains(s)))
+            .map(|mut m| {
+                m.state = MemoryState::Expired;
+                m.valid_to = Some(now);
+                m.updated_at = now;
+                MemoryRow {
+                    memory: m,
+                    embedding: None,
+                }
+            })
+            .collect();
+        result.removed = stale.len();
+        if !stale.is_empty() {
+            self.memory_apply_rows_batch(stale).await?;
+        }
+        Ok(result)
+    }
+
+    /// Pick the valid-time instant at which a new version takes over from `previous`.
+    ///
+    /// A supersession splits the timeline: the old version's `valid_to` and the new one's
+    /// `valid_from` are the same instant. If that instant were not **strictly after** the old
+    /// version's own `valid_from`, the old version would occupy a zero-width interval — present in
+    /// the history listing but unreachable by any `as_of(T)` query, which is a silent hole in
+    /// exactly the guarantee the bi-temporal layer exists to provide.
+    ///
+    /// That is not hypothetical: re-importing a document edited but not yet committed reports the
+    /// same commit date for both versions. When the supplied valid-time cannot separate them, the
+    /// honest answer is that the change became known *now*, so transaction time is used instead.
+    ///
+    /// Consequence worth knowing: backfill must run **oldest-first**. Replaying history in reverse
+    /// would push every version to now rather than splitting intervals around it — proper
+    /// out-of-order valid-time insertion needs interval splitting, which this does not do.
+    fn valid_boundary(
+        requested: Option<chrono::DateTime<chrono::Utc>>,
+        previous: Option<chrono::DateTime<chrono::Utc>>,
+        recorded_at: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let candidate = requested.unwrap_or(recorded_at);
+        match previous {
+            Some(prev) if candidate <= prev => {
+                recorded_at.max(prev + chrono::Duration::microseconds(1))
+            }
+            _ => candidate,
+        }
+    }
+
+    /// Write memories for the webhook events that represent a durable outcome.
+    ///
+    /// Called alongside episodic ingest, not instead of it: the full event stream stays queryable
+    /// in SQL, and only the closes/merges/resolutions additionally become recallable facts. Off
+    /// unless `memory.promotion.enabled`.
+    ///
+    /// Promoted memories are keyed by a deterministic subject (`acme/api#pr-42`), so a webhook
+    /// redelivery — which providers do freely — resolves as `Confirmed` rather than a duplicate,
+    /// and a ticket that reopens and closes again supersedes itself into a real history.
+    ///
+    /// Best-effort by design: a promotion failure must not fail the webhook, or a provider will
+    /// retry the whole delivery and duplicate the episodic events.
+    pub async fn promote_events(&self, tenant: &str, events: &[Event]) -> usize {
+        let cfg = &self.config.memory.promotion;
+        if !cfg.enabled {
+            return 0;
+        }
+        let scope = MemoryScope::tenant(tenant);
+        let inputs: Vec<MemoryInput> = events
+            .iter()
+            .filter(|e| crate::ingest::promote::matches(e, &cfg.rules))
+            .filter_map(|e| {
+                crate::ingest::promote::promote(e).map(|p| MemoryInput {
+                    scope: scope.clone(),
+                    subject: Some(p.subject),
+                    content: p.content,
+                    importance: None,
+                    // Provenance: the promoted fact points back at the event it came from, so
+                    // `/memories/{id}/provenance` shows the webhook delivery behind it.
+                    source_event_ids: vec![e.id],
+                    metadata: serde_json::json!({
+                        "source": e.source,
+                        "event_type": e.event_type,
+                        "promoted": true,
+                    }),
+                    mem_type: Some("episodic".into()),
+                    valid_from: Some(e.timestamp),
+                    project: None,
+                })
+            })
+            .collect();
+        if inputs.is_empty() {
+            return 0;
+        }
+        let n = inputs.len();
+        match self.memory_add_batch(inputs).await {
+            Ok(added) => added.len(),
+            Err(e) => {
+                tracing::warn!(error = %e, events = n, "promoting webhook events to memories failed");
+                0
+            }
+        }
+    }
+
+    /// CDC: publish a memory's lifecycle change. Best-effort — no receivers means dropped.
+    fn publish_memory_change(&self, memory: &Memory) {
+        let event = match memory.state {
+            MemoryState::Active => "upserted",
+            MemoryState::Superseded => "superseded",
+            MemoryState::Expired => "expired",
+        };
+        let _ = self.memory_change_tx.send(MemoryChange {
+            id: memory.id,
+            tenant_id: memory.scope.tenant_id.clone(),
+            user_id: memory.scope.user_id.clone(),
+            event,
+            subject: memory.subject.clone(),
+        });
+    }
+
+    /// Drop a memory from **both** derived indexes.
+    ///
+    /// Every deletion path must go through this rather than calling `memory_index.delete`
+    /// directly. The FTS5 index keeps its own copy of the memory's text, so an erasure that
+    /// skipped it would leave the content readable on disk after a GDPR delete — and would let a
+    /// stale candidate occupy a retrieval slot forever. Both removals are best-effort: the DuckDB
+    /// row is already gone, and `/admin/reindex` converges the indexes.
+    async fn forget_indexes(&self, id: uuid::Uuid) {
+        let _ = self.memory_index.delete(id).await;
+        let _ = self.lexical_index.remove(id);
+    }
+
     /// Apply a materialized memory change-set: persist each row and maintain the vector index
     /// (active rows are (re)indexed when they carry an embedding; superseded/expired rows are
     /// removed from the index). Deterministic — used by both [`Self::memory_add`] and Raft apply.
@@ -2244,34 +2844,31 @@ impl EcphoriaEngine {
             self.memory_store
                 .upsert_raw(&row.memory, row.embedding.as_deref())
                 .await?;
+            let scope_key = crate::memory::cognition::scope_partition_key(&row.memory.scope);
             match row.memory.state {
                 MemoryState::Active => {
                     if let Some(emb) = &row.embedding {
-                        let key = crate::memory::cognition::scope_partition_key(&row.memory.scope);
                         let _ = self
                             .memory_index
-                            .upsert(&key, &row.memory.to_semantic_entry(emb.clone()))
+                            .upsert(&scope_key, &row.memory.to_semantic_entry(emb.clone()))
                             .await;
                     }
+                    // Lexical index is best-effort (like the vector index): a failure degrades
+                    // recall until the next reindex, it must never fail the write.
+                    if let Err(e) = self.lexical_index.upsert(
+                        row.memory.id,
+                        &scope_key,
+                        row.memory.project.as_deref(),
+                        row.memory.subject.as_deref(),
+                        &row.memory.content,
+                    ) {
+                        tracing::warn!(error = %e, id = %row.memory.id, "lexical index upsert failed");
+                    }
                 }
-                _ => {
-                    let _ = self.memory_index.delete(row.memory.id).await;
-                }
+                _ => self.forget_indexes(row.memory.id).await,
             }
 
-            // CDC: publish the lifecycle change (best-effort; no receivers = dropped).
-            let event = match row.memory.state {
-                MemoryState::Active => "upserted",
-                MemoryState::Superseded => "superseded",
-                MemoryState::Expired => "expired",
-            };
-            let _ = self.memory_change_tx.send(MemoryChange {
-                id: row.memory.id,
-                tenant_id: row.memory.scope.tenant_id.clone(),
-                user_id: row.memory.scope.user_id.clone(),
-                event,
-                subject: row.memory.subject.clone(),
-            });
+            self.publish_memory_change(&row.memory);
 
             // Auto-populate graph edges from the memory's content: deterministic triple extraction
             // + uuidv5 edge ids derived from the memory id, so every replica produces the identical
@@ -2340,6 +2937,26 @@ impl EcphoriaEngine {
         scope: &MemoryScope,
         k: usize,
     ) -> Result<Vec<MemoryHit>> {
+        self.memory_search_in_project(query, scope, k, None).await
+    }
+
+    /// [`Self::memory_search`] restricted to one project, or across all of them when `None`.
+    ///
+    /// Projects share a scope on purpose. The scope tuple is an exact match, so putting a project
+    /// there would isolate projects *and* make cross-project search impossible — which is the
+    /// situation the `memory_grants` mechanism exists to work around, and it does so by running one
+    /// search per grantor and concatenating the lists. Concatenation is not fusion: results from
+    /// different scopes are never ranked against each other.
+    ///
+    /// Keeping one scope and filtering instead means a team gets both: `Some("payments")` narrows
+    /// to one project, `None` searches everything with a single RRF fusion over the whole corpus.
+    pub async fn memory_search_in_project(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        k: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<MemoryHit>> {
         use crate::memory::cognition::{lexical_rank, rrf_fuse_weighted};
 
         if query.trim().is_empty() || k == 0 {
@@ -2361,16 +2978,65 @@ impl EcphoriaEngine {
             cog.retrieval_pool.max(k)
         };
 
-        // Candidate universe for lexical ranking + id→memory map.
-        let candidates = self.memory_store.list_active(scope, scan_cap).await?;
+        // Lexical (BM25) ranking — always available, and the arm that has to scale: a knowledge
+        // base is searched by rare exact terms (error codes, service names, env vars, ticket keys)
+        // far more than by paraphrase.
+        //
+        // The FTS5 inverted index ranks the **whole** scope. The previous implementation scored
+        // BM25 in Rust over `list_active(scope, scan_cap)` — the top `scan_cap` memories by
+        // importance/recency — which made every memory below that cutoff unreachable by keyword,
+        // however well it matched. `scan_cap` now bounds only how many ranked candidates are
+        // carried forward, not how much of the corpus is considered.
+        // It runs in two stages, because the two halves have different jobs:
+        //
+        //   1. **Candidate generation** — FTS5 proposes up to `scan_cap` matching ids from the
+        //      *whole* scope. This is what removes the recall ceiling: previously the candidate
+        //      set was `list_active(scope, scan_cap)`, the top memories by importance/recency, so
+        //      anything below that cutoff could not be found by keyword however well it matched.
+        //   2. **Scoring** — the candidates are then ranked by [`lexical_rank`], the in-Rust BM25
+        //      that was already here. Measured on the KB eval set it ranks better than SQLite's
+        //      `bm25()` on this corpus (its tokenizer drops stop words before computing document
+        //      length, so prose is not penalised against terse reference docs), and it costs
+        //      almost nothing: these rows have already been read.
+        //
+        // So the index decides *what is considered*, and the existing ranker decides *in what
+        // order* — neither ceiling nor ranking regression.
+        let scope_key = crate::memory::cognition::scope_partition_key(scope);
         let mut by_id: std::collections::HashMap<uuid::Uuid, Memory> =
-            candidates.iter().cloned().map(|m| (m.id, m)).collect();
-
-        // Lexical (BM25) ranking — always available.
+            std::collections::HashMap::new();
+        let candidates: Vec<Memory> = match self
+            .lexical_index
+            .search(&scope_key, project, query, scan_cap)
+        {
+            Ok(ranked) if !ranked.is_empty() => {
+                let ids: Vec<uuid::Uuid> = ranked.into_iter().map(|(id, _)| id).collect();
+                // Re-read from DuckDB under the active + exact-scope filter: the index is
+                // advisory, so a stale entry costs a candidate slot and never a wrong result.
+                self.memory_store.get_active_by_ids(&ids, scope).await?
+            }
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                // Index unavailable → fall back to the capped scan so search still works, rather
+                // than losing the lexical arm entirely. The project filter is re-applied here so a
+                // degraded index cannot leak another project's memories into the results.
+                tracing::warn!(error = %e, "lexical index search failed — falling back to scan");
+                self.memory_store.list_active(scope, scan_cap).await?
+            }
+        };
+        // Applies to both branches: the fallback scan is unfiltered, and the FTS index is advisory
+        // so a stale entry could carry an out-of-date project.
+        let candidates: Vec<Memory> = match project {
+            Some(p) => candidates
+                .into_iter()
+                .filter(|m| m.project.as_deref() == Some(p))
+                .collect(),
+            None => candidates,
+        };
         let lex_ids: Vec<uuid::Uuid> = lexical_rank(query, &candidates)
             .into_iter()
             .map(|(i, _)| candidates[i].id)
             .collect();
+        by_id.extend(candidates.into_iter().map(|m| (m.id, m)));
 
         // Vector ranking — best-effort, only when embeddings are configured.
         let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
@@ -2391,6 +3057,11 @@ impl EcphoriaEngine {
                     .await
                 {
                     for h in hits {
+                        // USearch has no metadata filtering, so the project predicate is applied
+                        // after the k-NN fetch. Over-fetching is already the norm here.
+                        if project.is_some() && h.memory.project.as_deref() != project {
+                            continue;
+                        }
                         vec_ids.push(h.memory.id);
                         by_id.entry(h.memory.id).or_insert(h.memory);
                     }
@@ -2457,6 +3128,7 @@ impl EcphoriaEngine {
             let mems = self.memory_store.list_active(scope, k).await?;
             return Ok(mems
                 .into_iter()
+                .filter(|m| project.is_none() || m.project.as_deref() == project)
                 .map(|memory| MemoryHit { memory, score: 0.0 })
                 .collect());
         }
@@ -2647,7 +3319,7 @@ impl EcphoriaEngine {
         let events = self.episodic.delete_by_tenant(tenant).await?;
         let mem_ids = self.memory_store.delete_by_tenant(tenant).await?;
         for id in &mem_ids {
-            let _ = self.memory_index.delete(*id).await;
+            self.forget_indexes(*id).await;
         }
         let state = self
             .state
@@ -2672,7 +3344,7 @@ impl EcphoriaEngine {
     pub async fn delete_user(&self, tenant: &str, user_id: &str) -> Result<serde_json::Value> {
         let mem_ids = self.memory_store.delete_by_user(tenant, user_id).await?;
         for id in &mem_ids {
-            let _ = self.memory_index.delete(*id).await;
+            self.forget_indexes(*id).await;
         }
         Ok(serde_json::json!({
             "tenant": tenant,
@@ -2741,9 +3413,17 @@ impl EcphoriaEngine {
         keep_id: uuid::Uuid,
     ) -> Result<Vec<MemoryRow>> {
         let subject = crate::memory::cognition::normalize_subject(subject);
+        // A subject can now exist in several projects, so the group being resolved is the one the
+        // kept memory belongs to. Deriving it from `keep_id` keeps the signature stable and makes
+        // it impossible for the filter to disagree with the memory the caller chose.
+        let project = self
+            .memory_store
+            .get(keep_id)
+            .await?
+            .and_then(|m| m.project);
         let actives = self
             .memory_store
-            .find_active_by_subject(scope, &subject)
+            .find_active_by_subject(scope, &subject, project.as_deref())
             .await?;
         if !actives.iter().any(|m| m.id == keep_id) {
             return Err(crate::Error::State(format!(
@@ -2770,7 +3450,7 @@ impl EcphoriaEngine {
 
     /// Delete a memory (and its vector).
     pub async fn memory_delete(&self, id: uuid::Uuid) -> Result<()> {
-        let _ = self.memory_index.delete(id).await;
+        self.forget_indexes(id).await;
         self.memory_store.delete(id).await
     }
 
@@ -2781,7 +3461,7 @@ impl EcphoriaEngine {
             // Capture scope before expiring so the CDC event carries tenant/user/subject.
             let meta = self.memory_store.get(*id).await.ok().flatten();
             let _ = self.memory_store.expire(*id).await;
-            let _ = self.memory_index.delete(*id).await;
+            self.forget_indexes(*id).await;
             if let Some(m) = meta {
                 let _ = self.memory_change_tx.send(MemoryChange {
                     id: *id,
@@ -2903,7 +3583,7 @@ impl EcphoriaEngine {
     pub async fn memory_delete_scoped(&self, id: uuid::Uuid, tenant: &str) -> Result<bool> {
         let deleted = self.memory_store.delete_scoped(id, tenant).await?;
         if deleted {
-            let _ = self.memory_index.delete(id).await;
+            self.forget_indexes(id).await;
         }
         Ok(deleted)
     }
@@ -3039,7 +3719,7 @@ impl EcphoriaEngine {
         // that were never copied to the destination.
         let removed = self.memory_store.delete_by_tenant(tenant).await?;
         for id in removed {
-            let _ = self.memory_index.delete(id).await;
+            self.forget_indexes(id).await;
         }
         Ok(n)
     }
@@ -3131,7 +3811,7 @@ impl EcphoriaEngine {
             .decay(cog.decay_half_life_days, cog.forget_threshold)
             .await?;
         for id in &forgotten {
-            let _ = self.memory_index.delete(*id).await;
+            self.forget_indexes(*id).await;
         }
         if !forgotten.is_empty() {
             tracing::info!(

@@ -47,18 +47,18 @@ pub enum Command {
         #[arg(long)]
         user: Option<String>,
     },
-    /// Import an external knowledge store into memory (Obsidian vault, or a Mem0/Zep JSON export)
+    /// Import an external knowledge store into memory (git repo, Obsidian vault, Mem0/Zep export)
     Import {
-        /// Source format: obsidian | mem0 | zep
+        /// Source format: git | github | obsidian | mem0 | zep
         #[arg(long, default_value = "obsidian")]
         from: String,
-        /// Path to the source: an Obsidian vault directory, or a Mem0/Zep JSON export file
+        /// Source: a git repo path, a `owner/repo` slug for github, an Obsidian vault, or a JSON export
         #[arg(long)]
         path: String,
         /// Scope imported memories to this user id
         #[arg(long)]
         user: Option<String>,
-        /// Keep running and live-import notes as the vault changes (obsidian only)
+        /// Keep running and live-import files as they change (git and obsidian only)
         #[arg(long)]
         watch: bool,
     },
@@ -189,6 +189,9 @@ pub enum MemoryCmd {
         /// Scope to this user id
         #[arg(long)]
         user: Option<String>,
+        /// Restrict to one project; omit to search every project at once, ranked together
+        #[arg(long)]
+        project: Option<String>,
         /// Number of results
         #[arg(short, long, default_value = "10")]
         k: usize,

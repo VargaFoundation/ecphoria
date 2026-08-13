@@ -49,6 +49,8 @@ pub async fn memory_add(
         source_event_ids: vec![],
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
         mem_type: req.mem_type,
+        valid_from: None,
+        project: req.project,
     };
 
     // Cluster mode: run cognition on the leader to materialize the change-set, then replicate it
@@ -82,6 +84,194 @@ pub async fn memory_add(
     }
 }
 
+/// Maximum memories per bulk request — mirrors `MAX_INGEST_EVENTS` on the episodic path.
+const MAX_BATCH_MEMORIES: usize = 10_000;
+
+/// Ingest one Markdown document as independently-addressed sections.
+///
+/// POST /api/v1/documents { "path": "docs/runbook.md", "content": "# ...", "valid_from": "..." }
+///
+/// Chunking happens server-side deliberately: the removal sweep has to compare against what is
+/// already stored, so a client cannot do it correctly on its own. Re-posting the same `path`
+/// supersedes the sections whose text changed, confirms the rest, and expires any that vanished —
+/// so a `--watch` loop or a CI job can just re-post the file and get a correct timeline.
+///
+/// `valid_from` should be the commit date that produced this version. Without it the bi-temporal
+/// axis records when the importer ran rather than when the documentation changed.
+pub async fn document_ingest(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<DocumentIngestRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "document_ingest").increment(1);
+
+    if req.path.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "path is required".into(),
+        );
+    }
+    if req.content.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "content is required".into(),
+        );
+    }
+
+    let scope = scope_from(
+        &auth,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let mut opts = ecphoria_core::ingest::chunk::ChunkOptions::default();
+    if let Some(n) = req.target_chars.filter(|n| *n > 0) {
+        opts.target_chars = n;
+        opts.max_chars = opts.max_chars.max(n * 2);
+    }
+
+    match engine
+        .document_ingest(
+            ecphoria_core::engine::DocumentIngest {
+                path: &req.path,
+                content: &req.content,
+                metadata: req
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                valid_from: req.valid_from,
+                project: req.project.as_deref(),
+            },
+            &scope,
+            &opts,
+        )
+        .await
+    {
+        Ok(r) => api_ok(serde_json::to_value(r).unwrap_or_default()),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DOCUMENT_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Add many memories in one request — the bulk-import path for a document corpus.
+///
+/// POST /api/v1/memories/batch { "memories": [ {...}, {...} ] }
+///
+/// Same cognition as `POST /memories` applied in order, but batched I/O: embeddings are computed
+/// in provider-sized chunks and rows are written through the DuckDB Appender rather than one
+/// `INSERT` each (~4.8× faster end-to-end, measured in `docs/benchmarks-kb.md`).
+///
+/// **Cluster mode falls back to per-memory replication.** Each memory is planned and written to
+/// the Raft log individually, exactly as the single-memory endpoint does, so followers replay an
+/// identical change-set. Correct, but without the batching speedup — bulk corpus imports should
+/// target a single-node deployment or accept the slower path.
+pub async fn memory_add_batch(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
+    >,
+    Json(req): Json<MemoryBatchAddRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_add_batch")
+        .increment(1);
+
+    if req.memories.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "memories must not be empty".into(),
+        );
+    }
+    if req.memories.len() > MAX_BATCH_MEMORIES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BATCH_TOO_LARGE",
+            format!(
+                "{} memories exceeds the {MAX_BATCH_MEMORIES} limit",
+                req.memories.len()
+            ),
+        );
+    }
+    if let Some(i) = req
+        .memories
+        .iter()
+        .position(|m| m.content.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            format!("memories[{i}].content is required"),
+        );
+    }
+
+    let inputs: Vec<ecphoria_core::memory::cognition::MemoryInput> = req
+        .memories
+        .into_iter()
+        .map(|m| ecphoria_core::memory::cognition::MemoryInput {
+            scope: scope_from(
+                &auth,
+                m.tenant_id.as_deref(),
+                m.user_id.as_deref(),
+                m.agent_id.as_deref(),
+                m.session_id.as_deref(),
+            ),
+            subject: m.subject,
+            content: m.content,
+            importance: m.importance,
+            source_event_ids: vec![],
+            metadata: m.metadata.unwrap_or_else(|| serde_json::json!({})),
+            mem_type: m.mem_type,
+            valid_from: None,
+            project: m.project,
+        })
+        .collect();
+
+    if let Some(Extension(coord)) = cluster {
+        let coord = coord.read().await;
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let (result, rows) = match engine.memory_plan(input).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "MEMORY_ERROR",
+                        e.to_string(),
+                    )
+                }
+            };
+            let ar = ecphoria_cluster::raft::types::AppRequest::MemoryUpsert { rows };
+            if let Err(e) = coord.client_write(ar).await {
+                return cluster_write_error(e);
+            }
+            results.push(result);
+        }
+        return api_ok(serde_json::json!({
+            "added": results.len(),
+            "memories": results,
+        }));
+    }
+
+    match engine.memory_add_batch(inputs).await {
+        Ok(added) => api_ok(serde_json::json!({
+            "added": added.len(),
+            "memories": added,
+        })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 /// Search memories within a scope (semantic when embeddings exist, else recency).
 ///
 /// POST /api/v1/memories/search { "query": "...", "user_id": "...", "k": 5 }
@@ -102,7 +292,9 @@ pub async fn memory_search(
     let result = if req.shared {
         engine.memory_search_shared(&req.query, &scope, req.k).await
     } else {
-        engine.memory_search(&req.query, &scope, req.k).await
+        engine
+            .memory_search_in_project(&req.query, &scope, req.k, req.project.as_deref())
+            .await
     };
     match result {
         Ok(hits) => api_ok(serde_json::json!({ "results": hits, "count": hits.len() })),
@@ -397,6 +589,49 @@ pub async fn memory_update(
 /// Get the full temporal history of a memory (every superseded version).
 ///
 /// GET /api/v1/memories/{id}/history
+/// Full version history of a **subject** — every version, oldest first, with the period each was
+/// believed.
+///
+/// GET /api/v1/memories/history?subject=deploy.target[&user_id=…]
+///
+/// The by-id variant needs a memory id, which a caller only has if it already searched. A subject
+/// is the stable key a client actually holds ("what has `deploy.target` been over time"), and it
+/// is what makes the bi-temporal layer usable from an agent tool rather than only from SQL.
+pub async fn memory_history_by_subject(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    axum::extract::Query(q): axum::extract::Query<MemoryHistoryQuery>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_history_by_subject")
+        .increment(1);
+    if q.subject.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "subject is required".into(),
+        );
+    }
+    let scope = scope_from(
+        &auth,
+        q.tenant_id.as_deref(),
+        q.user_id.as_deref(),
+        q.agent_id.as_deref(),
+        q.session_id.as_deref(),
+    );
+    match engine.memory_history(&scope, &q.subject).await {
+        Ok(memories) => api_ok(serde_json::json!({
+            "subject": q.subject,
+            "count": memories.len(),
+            "memories": memories,
+        })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn memory_history(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,

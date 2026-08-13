@@ -960,3 +960,341 @@ async fn memory_update_and_filtered_list_via_rest() {
     assert_eq!(scopes["scopes"][0]["user_id"], "alice");
     assert_eq!(scopes["scopes"][0]["count"], 3);
 }
+
+/// Bulk memory import over REST: `POST /api/v1/memories/batch`.
+///
+/// Covers the three things that distinguish it from a loop over `POST /memories`: the whole batch
+/// lands, cognition still resolves contradictions *within* the batch, and the memories are
+/// immediately searchable (i.e. the batch write path maintains the derived indexes).
+#[tokio::test]
+async fn memory_batch_import_via_rest() {
+    let app = engine_router().await;
+
+    let body = serde_json::json!({
+        "memories": [
+            {"content": "the deploy target is bare metal", "subject": "deploy.target", "user_id": "alice"},
+            {"content": "we adopted quorum leases for shard handoff", "subject": "adr-007", "user_id": "alice"},
+            {"content": "the deploy target is kubernetes", "subject": "deploy.target", "user_id": "alice"}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/memories/batch")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let added = json_body(resp).await;
+    assert_eq!(added["added"], 3);
+    assert_eq!(
+        added["memories"][2]["outcome"], "superseded",
+        "a repeated subject inside one batch must still supersede: {added}"
+    );
+
+    // Only one active memory per subject survives.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/memories?user_id=alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list = json_body(resp).await;
+    assert_eq!(list["memories"].as_array().unwrap().len(), 2);
+
+    // And the bulk-written rows are searchable (derived indexes were maintained).
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/memories/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"query":"quorum leases shard handoff","user_id":"alice","k":5}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let hits = json_body(resp).await;
+    assert_eq!(
+        hits["results"][0]["memory"]["content"], "we adopted quorum leases for shard handoff",
+        "bulk-imported memory not searchable: {hits}"
+    );
+}
+
+/// Empty and oversized batches are rejected with a clear error rather than silently accepted.
+#[tokio::test]
+async fn memory_batch_rejects_empty_and_blank_content() {
+    let app = engine_router().await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/memories/batch")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"memories":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/memories/batch")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"memories":[{"content":"ok"},{"content":"   "}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Webhook events that mark a durable outcome must become searchable memories.
+///
+/// Without promotion, a closed ticket or a resolved incident lands only in the episodic store —
+/// queryable in SQL, invisible to `search_memory`. "Have we seen this error before?" is exactly
+/// the question a knowledge base exists to answer, and it goes through the memory API.
+#[tokio::test]
+async fn webhook_outcomes_are_promoted_to_searchable_memories() {
+    let mut config = CoreConfig::default();
+    config.memory.episodic.db_path = ":memory:".into();
+    config.memory.state.db_path = ":memory:".into();
+    config.memory.cognition.db_path = ":memory:".into();
+    config.runtime.db_path = ":memory:".into();
+    config.memory.promotion.enabled = true;
+    let engine = Arc::new(EcphoriaEngine::new(config).await.unwrap());
+    let app = ecphoria_gateway::rest::router_with_engine(engine);
+
+    let closed_issue = serde_json::json!({
+        "action": "closed",
+        "repository": {"full_name": "acme/api"},
+        "sender": {"login": "bob"},
+        "issue": {
+            "number": 7,
+            "title": "Quorum loss after failover",
+            "body": "Root cause: the standby held a stale term. Fixed by bumping it on promote."
+        }
+    });
+    let post_hook = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhook/github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let resp = post_hook(closed_issue.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["promoted"], 1, "outcome not promoted: {body}");
+
+    // The resolution is now reachable through the memory API.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/memories/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"query":"standby stale term quorum failover","k":5}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let hits = json_body(resp).await;
+    assert!(
+        hits["results"][0]["memory"]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("stale term")),
+        "resolved ticket not retrievable: {hits}"
+    );
+
+    // Providers redeliver freely — a repeat must confirm, not duplicate.
+    let resp = post_hook(closed_issue).await;
+    assert_eq!(json_body(resp).await["promoted"], 1);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/memories")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list = json_body(resp).await;
+    assert_eq!(
+        list["memories"].as_array().unwrap().len(),
+        1,
+        "webhook redelivery duplicated the memory: {list}"
+    );
+}
+
+/// `GET /memories/history?subject=…` must resolve, not be swallowed by `/memories/{id}`.
+///
+/// Both routes are registered; axum prefers the literal segment, but that is a routing detail
+/// worth pinning — a regression would surface as a confusing "not a valid memory id" error.
+/// The endpoint is what makes bi-temporal history reachable from an agent tool: a caller holds a
+/// subject ("deploy.target"), not a memory id.
+#[tokio::test]
+async fn memory_history_by_subject_lists_every_version() {
+    let app = engine_router().await;
+
+    for content in [
+        "the deploy target is bare metal",
+        "the deploy target is kubernetes",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/memories")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "content": content,
+                            "subject": "deploy.target",
+                            "user_id": "alice"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/memories/history?subject=deploy.target&user_id=alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "route did not resolve");
+    let body = json_body(resp).await;
+    assert_eq!(body["count"], 2, "{body}");
+    let versions = body["memories"].as_array().unwrap();
+    assert!(versions[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("bare metal"));
+    assert_eq!(versions[0]["state"], "superseded");
+    assert_eq!(versions[1]["state"], "active");
+
+    // A missing subject is a clear 400, not a 500 or an empty 200.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/memories/history?subject=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `mcp_enabled` and `llm_proxy_enabled` must actually gate their routes.
+///
+/// Both flags were declared, defaulted and asserted in config tests — but never read when the
+/// router was built, so the endpoints were mounted unconditionally. An operator disabling the LLM
+/// proxy to shrink the attack surface still had it listening, and nothing failed to tell them.
+/// That is the failure mode a config flag has when no test exercises its effect.
+#[tokio::test]
+async fn protocol_flags_gate_their_endpoints() {
+    async fn router_with(mcp: bool, proxy: bool) -> axum::Router {
+        let mut config = CoreConfig::default();
+        config.memory.episodic.db_path = ":memory:".into();
+        config.memory.state.db_path = ":memory:".into();
+        config.memory.cognition.db_path = ":memory:".into();
+        config.runtime.db_path = ":memory:".into();
+        let engine = Arc::new(EcphoriaEngine::new(config).await.unwrap());
+        let gw = ecphoria_gateway::server::GatewayConfig {
+            mcp_enabled: mcp,
+            llm_proxy_enabled: proxy,
+            ..Default::default()
+        };
+        ecphoria_gateway::rest::router_with_engine_and_auth(engine, None, None, None, &gw)
+    }
+    async fn status(app: &axum::Router, uri: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    let both_on = router_with(true, true).await;
+    assert_ne!(
+        status(&both_on, "/mcp").await,
+        StatusCode::NOT_FOUND,
+        "mcp_enabled = true should mount /mcp"
+    );
+    assert_ne!(
+        status(&both_on, "/v1/chat/completions").await,
+        StatusCode::NOT_FOUND,
+        "llm_proxy_enabled = true should mount the proxy"
+    );
+
+    let both_off = router_with(false, false).await;
+    assert_eq!(status(&both_off, "/mcp").await, StatusCode::NOT_FOUND);
+    assert_eq!(
+        status(&both_off, "/v1/chat/completions").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(&both_off, "/v1/messages").await,
+        StatusCode::NOT_FOUND
+    );
+    // Disabling a protocol must not disable the rest of the server.
+    let resp = both_off
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

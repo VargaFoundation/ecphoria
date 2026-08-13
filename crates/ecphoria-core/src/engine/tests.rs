@@ -2063,14 +2063,20 @@ async fn run_agent_loops_tool_then_answers_and_journals_steps() {
 async fn triggers_register_match_and_fire_runs() {
     let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
     engine
-        .trigger_register("on_pr", "github", "pull_request.opened", "pr-agent")
+        .trigger_register(
+            "default",
+            "on_pr",
+            "github",
+            "pull_request.opened",
+            "pr-agent",
+        )
         .await
         .unwrap();
     engine
-        .trigger_register("on_any", "*", "*", "catch-all")
+        .trigger_register("default", "on_any", "*", "*", "catch-all")
         .await
         .unwrap();
-    assert_eq!(engine.trigger_list().await.unwrap().len(), 2);
+    assert_eq!(engine.trigger_list("default").await.unwrap().len(), 2);
 
     // A GitHub PR event matches both the exact and the wildcard trigger → 2 runs.
     let fired = engine
@@ -2889,4 +2895,1097 @@ async fn ecphoria_state_sql_function_is_tenant_scoped() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+/// Retrieval must not degrade as the corpus grows.
+///
+/// This is the regression guard for the lexical arm's candidate window. Before the FTS5 index,
+/// the lexical arm scored BM25 over `list_active(scope, retrieval_scan_cap)` — the top memories
+/// by `importance DESC, valid_from DESC`. Once a scope held more than `retrieval_scan_cap`
+/// memories, everything below the cutoff became unreachable by keyword search regardless of how
+/// well it matched: on the KB eval set, recall@5 went from 83% at 2k memories to **0%** at 5k.
+///
+/// The needle is written *first* and then buried under newer memories, which is precisely the
+/// shape that used to fail (the filler wins the recency tie-break and evicts the needle from the
+/// window). A small cap is set explicitly so the test stays fast while still crossing it.
+#[tokio::test]
+async fn memory_search_recall_survives_corpus_growth() {
+    let mut config = inmem_config();
+    config.memory.cognition.retrieval_scan_cap = 64;
+    let engine = EcphoriaEngine::new(config).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+
+    let needle = engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "we adopted quorum leases for shard handoff")
+                .with_subject("adr-007"),
+        )
+        .await
+        .unwrap()
+        .memory
+        .id;
+
+    // Sanity: findable while the corpus is small.
+    let hits = engine
+        .memory_search("quorum leases shard handoff", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits[0].memory.id, needle,
+        "needle findable in a small corpus"
+    );
+
+    // Bury it under 10x the candidate window, all newer.
+    for i in 0..640 {
+        engine
+            .memory_add(
+                MemoryInput::new(
+                    scope.clone(),
+                    format!("routine background compaction completed for partition {i}"),
+                )
+                .with_subject(format!("note-{i}")),
+            )
+            .await
+            .unwrap();
+    }
+
+    let hits = engine
+        .memory_search("quorum leases shard handoff", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.first().map(|h| h.memory.id),
+        Some(needle),
+        "needle must stay rank 1 under {}x its scan cap — the whole point of the inverted index",
+        640 / 64
+    );
+}
+
+/// A superseded memory must not come back from the lexical index.
+///
+/// The index is advisory: entries are written best-effort and candidates are re-read from DuckDB
+/// under the `state = 'active'` + exact-scope filter. This pins that contract, because a stale
+/// index entry surfacing a retracted fact would be a correctness bug, not just a ranking one.
+#[tokio::test]
+async fn superseded_memories_never_resurface_from_the_index() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+
+    engine
+        .memory_add(
+            MemoryInput::new(
+                scope.clone(),
+                "the deploy target is the legacy bare-metal cluster",
+            )
+            .with_subject("deploy.target"),
+        )
+        .await
+        .unwrap();
+    engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "the deploy target is the kubernetes cluster")
+                .with_subject("deploy.target"),
+        )
+        .await
+        .unwrap();
+
+    let hits = engine
+        .memory_search("deploy target", &scope, 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "only the current fact is active: {hits:?}");
+    assert!(hits[0].memory.content.contains("kubernetes"));
+    assert!(
+        !hits.iter().any(|h| h.memory.content.contains("bare-metal")),
+        "superseded fact resurfaced from the lexical index"
+    );
+}
+
+/// Identifiers must survive tokenization end-to-end.
+///
+/// `cognition::tokenize` splits on every non-alphanumeric character, so `ECPHORIA_STORAGE__DATA_DIR`
+/// becomes four common words and a query for it matches any document mentioning "data" or
+/// "storage". The FTS5 tokenizer keeps `-`, `_` and `.` as token characters, so env vars, ticket
+/// keys, crate names and dotted paths stay whole — the terms an engineering corpus is searched by.
+#[tokio::test]
+async fn exact_identifier_lookup_beats_prose_that_merely_shares_words() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+
+    let target = engine
+        .memory_add(MemoryInput::new(
+            scope.clone(),
+            "ECPHORIA_STORAGE__DATA_DIR selects the directory used for on-disk data",
+        ))
+        .await
+        .unwrap()
+        .memory
+        .id;
+    for decoy in [
+        "the storage layer writes data into a directory chosen at startup",
+        "data directory permissions are validated during storage initialisation",
+        "each storage backend keeps its data under a separate directory",
+    ] {
+        engine
+            .memory_add(MemoryInput::new(scope.clone(), decoy))
+            .await
+            .unwrap();
+    }
+
+    let hits = engine
+        .memory_search("ECPHORIA_STORAGE__DATA_DIR", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.first().map(|h| h.memory.id),
+        Some(target),
+        "the exact identifier must outrank prose sharing its shredded words"
+    );
+}
+
+/// The lexical index must survive a restart — and be rebuildable from DuckDB alone.
+///
+/// The FTS5 index is a derived artifact written best-effort beside the cognition DuckDB file.
+/// Two properties matter and are both pinned here: a normal reopen keeps keyword search working,
+/// and **deleting the index file is recoverable**, because DuckDB is the source of truth and
+/// `EcphoriaEngine::new` rebuilds from it. That is what makes the index safe to treat as a cache.
+#[tokio::test]
+async fn lexical_index_survives_reopen_and_rebuilds_when_deleted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let p = |f: &str| tmp.path().join(f).to_string_lossy().to_string();
+    let cfg = || {
+        let mut c = CoreConfig::default();
+        c.memory.episodic.db_path = p("episodic.duckdb");
+        c.memory.state.db_path = p("state.db");
+        c.memory.cognition.db_path = p("mem.duckdb");
+        c.runtime.db_path = p("runtime.db");
+        c.memory.semantic.index_dir = p("vectors");
+        c
+    };
+    let scope = MemoryScope::tenant("default");
+    let query = "quorum leases shard handoff";
+
+    let needle = {
+        let engine = EcphoriaEngine::new(cfg()).await.unwrap();
+        let id = engine
+            .memory_add(MemoryInput::new(
+                scope.clone(),
+                "we adopted quorum leases for shard handoff",
+            ))
+            .await
+            .unwrap()
+            .memory
+            .id;
+        engine.persist().await.unwrap();
+        id
+    };
+
+    // Reopen: the on-disk index is picked up and keyword search still works.
+    {
+        let engine = EcphoriaEngine::new(cfg()).await.unwrap();
+        let hits = engine.memory_search(query, &scope, 5).await.unwrap();
+        assert_eq!(
+            hits.first().map(|h| h.memory.id),
+            Some(needle),
+            "lexical index not usable after reopen"
+        );
+    }
+
+    // Nuke the index file (corruption / manual recovery) — the rebuild on startup restores it.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", p("mem.fts.sqlite")));
+    }
+    {
+        let engine = EcphoriaEngine::new(cfg()).await.unwrap();
+        let hits = engine.memory_search(query, &scope, 5).await.unwrap();
+        assert_eq!(
+            hits.first().map(|h| h.memory.id),
+            Some(needle),
+            "index was not rebuilt from DuckDB after deletion"
+        );
+    }
+}
+
+/// GDPR erasure must purge the lexical index too, not just DuckDB.
+///
+/// The FTS5 index keeps its own copy of every memory's text. If a deletion path forgot it, erased
+/// content would stay readable on disk and keep matching queries — a compliance bug, not just a
+/// ranking one. This covers both erasure endpoints (`DELETE /admin/users/{id}` and
+/// `/admin/tenants/{id}`) through the engine methods behind them.
+#[tokio::test]
+async fn erasure_purges_the_lexical_index() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let victim = MemoryScope {
+        tenant_id: "acme".into(),
+        user_id: Some("alice".into()),
+        ..Default::default()
+    };
+    let bystander = MemoryScope {
+        tenant_id: "acme".into(),
+        user_id: Some("bob".into()),
+        ..Default::default()
+    };
+    for (scope, text) in [
+        (&victim, "alice takes the westbound train from waterloo"),
+        (&bystander, "bob takes the westbound train from waterloo"),
+    ] {
+        engine
+            .memory_add(MemoryInput::new(scope.clone(), text))
+            .await
+            .unwrap();
+    }
+
+    engine.delete_user("acme", "alice").await.unwrap();
+
+    assert!(
+        engine
+            .memory_search("westbound train waterloo", &victim, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "erased user's content still retrievable"
+    );
+    assert_eq!(
+        engine
+            .memory_search("westbound train waterloo", &bystander, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "erasure must not touch another user's memories"
+    );
+
+    engine.delete_tenant("acme").await.unwrap();
+    assert!(
+        engine
+            .memory_search("westbound train waterloo", &bystander, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "tenant erasure left content in the lexical index"
+    );
+}
+
+/// Bulk ingest must be semantically identical to adding one at a time.
+///
+/// `memory_add_batch` exists purely to change the I/O shape (batched embeddings, one DuckDB
+/// transaction, the Appender fast path). If it also changed cognition — which memory wins a
+/// contradiction, what gets superseded — it would be a different feature wearing the same name.
+/// This runs the same inputs both ways and compares the outcomes and the resulting corpus.
+#[tokio::test]
+async fn memory_add_batch_matches_sequential_semantics() {
+    let inputs = |scope: &MemoryScope| {
+        vec![
+            MemoryInput::new(scope.clone(), "the deploy target is bare metal")
+                .with_subject("deploy.target"),
+            MemoryInput::new(scope.clone(), "the oncall rotation is weekly")
+                .with_subject("oncall.rotation"),
+            // Same subject as the first → must supersede it, mid-batch.
+            MemoryInput::new(scope.clone(), "the deploy target is kubernetes")
+                .with_subject("deploy.target"),
+            // Byte-identical to the second → must be Confirmed, not a new row.
+            MemoryInput::new(scope.clone(), "the oncall rotation is weekly")
+                .with_subject("oncall.rotation"),
+        ]
+    };
+    let scope = MemoryScope::tenant("default");
+
+    let sequential = {
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        let mut outcomes = Vec::new();
+        for input in inputs(&scope) {
+            outcomes.push(engine.memory_add(input).await.unwrap().outcome);
+        }
+        let mut active: Vec<String> = engine
+            .memory_all(&scope, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        active.sort();
+        (outcomes, active)
+    };
+
+    let batched = {
+        let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+        let outcomes: Vec<_> = engine
+            .memory_add_batch(inputs(&scope))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.outcome)
+            .collect();
+        let mut active: Vec<String> = engine
+            .memory_all(&scope, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        active.sort();
+        (outcomes, active)
+    };
+
+    assert_eq!(
+        sequential.0, batched.0,
+        "batch produced different cognition outcomes"
+    );
+    assert_eq!(
+        sequential.1, batched.1,
+        "batch left a different active corpus"
+    );
+    // And specifically: the mid-batch contradiction really did resolve.
+    assert_eq!(batched.0[2], MemoryOutcome::Superseded);
+    assert_eq!(batched.0[3], MemoryOutcome::Confirmed);
+    assert_eq!(batched.1.len(), 2, "one active memory per subject");
+}
+
+/// Bulk-ingested memories must be searchable — i.e. the batch path maintains the lexical index.
+///
+/// The batch write path is separate code from `memory_apply_rows`, so it could plausibly persist
+/// rows to DuckDB while forgetting the derived indexes. That failure would be invisible until
+/// someone searched.
+#[tokio::test]
+async fn bulk_ingested_memories_are_immediately_searchable() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let inputs: Vec<MemoryInput> = (0..250)
+        .map(|i| {
+            MemoryInput::new(
+                scope.clone(),
+                format!("partition {i} completed a routine compaction"),
+            )
+            .with_subject(format!("note-{i}"))
+        })
+        .chain(std::iter::once(
+            MemoryInput::new(scope.clone(), "we adopted quorum leases for shard handoff")
+                .with_subject("adr-007"),
+        ))
+        .collect();
+
+    let added = engine.memory_add_batch(inputs).await.unwrap();
+    assert_eq!(added.len(), 251);
+
+    let hits = engine
+        .memory_search("quorum leases shard handoff", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.first().map(|h| h.memory.content.as_str()),
+        Some("we adopted quorum leases for shard handoff"),
+        "bulk-ingested memory not in the lexical index"
+    );
+}
+
+/// Re-importing an edited document supersedes only the sections that changed.
+///
+/// This is the whole point of chunking by heading: a runbook that evolves keeps its history *per
+/// section*, so "what did this say about failover in March" is answerable, and an edit to one
+/// paragraph does not churn the entire document. Anything less and the bi-temporal layer is just
+/// storing duplicates.
+#[tokio::test]
+async fn reimporting_an_edited_document_supersedes_only_the_changed_section() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+    let path = "docs/runbook.md";
+
+    const V1: &str = "# Runbook\n\n\
+        Overview of the recovery procedure for the primary cluster.\n\n\
+        ## Failover\n\n\
+        Promote the standby by hand, then update DNS.\n\n\
+        ## Rollback\n\n\
+        Restore the most recent snapshot and replay the log.\n";
+
+    let first = engine
+        .document_ingest(
+            DocumentIngest {
+                path,
+                content: V1,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.chunks, 3);
+    assert_eq!(first.inserted, 3);
+
+    // Re-import unchanged: everything confirmed, nothing written.
+    let same = engine
+        .document_ingest(
+            DocumentIngest {
+                path,
+                content: V1,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (same.confirmed, same.superseded, same.inserted, same.removed),
+        (3, 0, 0, 0),
+        "an unchanged re-import must be a no-op: {same:?}"
+    );
+
+    // Edit exactly one section.
+    let v2 = V1.replace(
+        "Promote the standby by hand, then update DNS.",
+        "Failover is automatic; the dispatcher promotes the standby.",
+    );
+    let edited = engine
+        .document_ingest(
+            DocumentIngest {
+                path,
+                content: &v2,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (edited.superseded, edited.confirmed, edited.removed),
+        (1, 2, 0),
+        "exactly one section should have moved: {edited:?}"
+    );
+
+    // The current answer is the new text…
+    let hits = engine
+        .memory_search("failover promote standby", &scope, 5)
+        .await
+        .unwrap();
+    assert!(
+        hits[0].memory.content.contains("automatic"),
+        "search returned stale text: {}",
+        hits[0].memory.content
+    );
+    // …and the old text is still recoverable through the supersession chain.
+    let history = engine
+        .memory_history(&scope, "docs/runbook.md#Runbook > Failover")
+        .await
+        .unwrap();
+    assert_eq!(
+        history.len(),
+        2,
+        "per-section history not kept: {history:#?}"
+    );
+    assert!(history[0].content.contains("by hand"));
+    assert_eq!(history[0].state, MemoryState::Superseded);
+}
+
+/// A section deleted from the source must stop being an active fact.
+///
+/// Supersession cannot cover this: a removed section produces no new memory, so nothing replaces
+/// it and it would linger as a confidently-retrievable statement that no longer exists anywhere.
+#[tokio::test]
+async fn removing_a_section_expires_it_without_losing_history() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+    let path = "docs/runbook.md";
+
+    const V1: &str = "# Runbook\n\n\
+        Overview of the recovery procedure.\n\n\
+        ## Manual failover\n\n\
+        Promote the standby by hand using the emergency console.\n\n\
+        ## Rollback\n\n\
+        Restore the most recent snapshot.\n";
+
+    engine
+        .document_ingest(
+            DocumentIngest {
+                path,
+                content: V1,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !engine
+            .memory_search("manual failover emergency console", &scope, 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "section should be findable before removal"
+    );
+
+    // The procedure was dropped from the document entirely.
+    let v2 = "# Runbook\n\n\
+        Overview of the recovery procedure.\n\n\
+        ## Rollback\n\n\
+        Restore the most recent snapshot.\n";
+    let after = engine
+        .document_ingest(
+            DocumentIngest {
+                path,
+                content: v2,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.removed, 1, "deleted section not swept: {after:?}");
+
+    let hits = engine
+        .memory_search("manual failover emergency console", &scope, 5)
+        .await
+        .unwrap();
+    assert!(
+        !hits
+            .iter()
+            .any(|h| h.memory.content.contains("emergency console")),
+        "a section deleted from the source is still being retrieved: {hits:#?}"
+    );
+    // Expired, not destroyed — it stays in the record.
+    let history = engine
+        .memory_history(&scope, "docs/runbook.md#Runbook > Manual failover")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, MemoryState::Expired);
+}
+
+/// Chunking must make a long document's sections independently retrievable.
+///
+/// Stored whole, a document is one vector and one BM25 document: a query aimed at one section
+/// competes against every unrelated word in the file, and a hit returns the entire thing.
+#[tokio::test]
+async fn chunked_sections_are_retrievable_individually() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+
+    let mut doc = String::from("# Operations Manual\n\nGeneral introduction to operations.\n\n");
+    for i in 0..40 {
+        doc.push_str(&format!(
+            "## Procedure {i}\n\nStep-by-step instructions for handling scenario {i}, including \
+             the specific escalation path and the owning team for that scenario.\n\n"
+        ));
+    }
+    doc.push_str(
+        "## Quorum loss\n\nIf the cluster loses quorum, stop writes and restore from the \
+         most recent snapshot before re-forming the Raft group.\n",
+    );
+
+    let r = engine
+        .document_ingest(
+            DocumentIngest {
+                path: "ops.md",
+                content: &doc,
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.chunks, 42, "expected one chunk per section");
+
+    let hits = engine
+        .memory_search("cluster lost quorum restore snapshot", &scope, 3)
+        .await
+        .unwrap();
+    assert!(
+        hits[0].memory.content.contains("quorum"),
+        "the right section did not win: {}",
+        hits[0].memory.content
+    );
+    assert!(
+        hits[0].memory.content.len() < doc.len() / 4,
+        "retrieval returned a document-sized blob rather than a section"
+    );
+}
+
+/// Backdated imports must build a real timeline, not stack every version at import time.
+///
+/// This is what separates a bi-temporal store from a versioned one. Importing a document's git
+/// history in one run records three versions *now* (transaction time), but each must be valid from
+/// its own commit date (valid time) — otherwise `as_of("2026-03-01")` returns whatever happened to
+/// be imported last rather than what the documentation actually said in March.
+#[tokio::test]
+async fn backdated_import_reconstructs_the_valid_time_timeline() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+    let path = "docs/runbook.md";
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+
+    // Replay three commits, oldest first, in a single import run.
+    for (date, text) in [
+        ("2026-01-15T00:00:00Z", "Promote the standby by hand."),
+        (
+            "2026-03-10T00:00:00Z",
+            "Promote the standby via the console.",
+        ),
+        ("2026-06-02T00:00:00Z", "Failover is automatic."),
+    ] {
+        let doc = format!("# Runbook\n\n## Failover\n\n{text}\n");
+        engine
+            .document_ingest(
+                DocumentIngest {
+                    path,
+                    content: &doc,
+                    valid_from: Some(at(date)),
+                    ..Default::default()
+                },
+                &scope,
+                &opts,
+            )
+            .await
+            .unwrap();
+    }
+
+    let subject = "docs/runbook.md#Runbook > Failover";
+    for (when, expected) in [
+        ("2026-02-01T00:00:00Z", Some("by hand")),
+        ("2026-04-01T00:00:00Z", Some("console")),
+        ("2026-07-01T00:00:00Z", Some("automatic")),
+        ("2026-01-01T00:00:00Z", None),
+    ] {
+        let got = engine
+            .memory_as_of(&scope, subject, at(when))
+            .await
+            .unwrap()
+            .map(|m| m.content);
+        match expected {
+            Some(text) => assert!(
+                got.as_deref().is_some_and(|c| c.contains(text)),
+                "as_of({when}) should contain {text:?}, got {got:?}"
+            ),
+            None => assert!(
+                got.is_none(),
+                "nothing was true before the first commit, got {got:?}"
+            ),
+        }
+    }
+
+    // Transaction time stays wall-clock: all three were recorded during this test run, even
+    // though they are valid from 2026.
+    let history = engine.memory_history(&scope, subject).await.unwrap();
+    assert_eq!(history.len(), 3);
+    let now = chrono::Utc::now();
+    for m in &history {
+        assert!(
+            (now - m.created_at).num_seconds().abs() < 60,
+            "created_at should be when we recorded it, not the commit date: {m:?}"
+        );
+        assert!(m.valid_from < at("2026-07-01T00:00:00Z"));
+    }
+}
+
+/// A superseded version must always occupy a non-empty validity interval.
+///
+/// If `valid_to` equals its own `valid_from`, the old version is listed in history but no
+/// `as_of(T)` can ever return it — a silent hole in the exact guarantee the bi-temporal layer
+/// exists to provide. This happens naturally when re-importing a document that was edited but not
+/// yet committed: git reports the same commit date for both versions.
+#[tokio::test]
+async fn superseding_at_the_same_valid_time_still_leaves_a_queryable_interval() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let commit = chrono::DateTime::parse_from_rfc3339("2026-07-18T22:43:46Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    for text in ["USearch was chosen.", "USearch was chosen, reconfirmed."] {
+        engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), text)
+                    .with_subject("adr-002.decision")
+                    .valid_from(commit),
+            )
+            .await
+            .unwrap();
+    }
+
+    let history = engine
+        .memory_history(&scope, "adr-002.decision")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    let old = history
+        .iter()
+        .find(|m| m.state == MemoryState::Superseded)
+        .unwrap();
+    let valid_to = old.valid_to.expect("superseded row must be closed");
+    assert!(
+        valid_to > old.valid_from,
+        "zero-width validity interval: {} .. {valid_to}",
+        old.valid_from
+    );
+
+    // And the old version is genuinely reachable at a point inside its interval.
+    let midpoint = old.valid_from + (valid_to - old.valid_from) / 2;
+    let at_mid = engine
+        .memory_as_of(&scope, "adr-002.decision", midpoint)
+        .await
+        .unwrap()
+        .expect("a version must be valid mid-interval");
+    assert_eq!(at_mid.content, "USearch was chosen.");
+}
+
+/// One tenant's triggers must never fire on — or be visible to — another tenant.
+///
+/// Triggers were stored under a single unscoped state key, so `fire_triggers` iterated every
+/// tenant's triggers on every webhook. On a shared deployment that is both a cross-tenant
+/// information leak (the trigger names and target agents are listable) and a cross-tenant *action*
+/// trigger: tenant B's webhook would start tenant A's agent, with tenant B's payload as input.
+#[tokio::test]
+async fn triggers_are_isolated_between_tenants() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    engine
+        .trigger_register(
+            "acme",
+            "on_pr",
+            "github",
+            "pull_request.opened",
+            "acme-agent",
+        )
+        .await
+        .unwrap();
+    engine
+        .trigger_register("globex", "on_any", "*", "*", "globex-agent")
+        .await
+        .unwrap();
+
+    // Listing is per-tenant.
+    assert_eq!(engine.trigger_list("acme").await.unwrap().len(), 1);
+    assert_eq!(engine.trigger_list("globex").await.unwrap().len(), 1);
+    assert!(engine
+        .trigger_list("someone-else")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Acme's event fires only Acme's trigger, even though globex has a catch-all `*`/`*`.
+    let fired = engine
+        .fire_triggers(
+            "acme",
+            "github",
+            "pull_request.opened",
+            serde_json::json!({"pr": 42}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fired.len(), 1, "globex's catch-all fired on acme's event");
+    let run = engine.run_get(fired[0]).await.unwrap().unwrap();
+    assert_eq!(run.tenant_id, "acme");
+    assert_eq!(run.agent_id.as_deref(), Some("acme-agent"));
+
+    // And a tenant with no triggers gets none, however busy its neighbours are.
+    assert!(engine
+        .fire_triggers(
+            "initech",
+            "github",
+            "pull_request.opened",
+            serde_json::json!({})
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Backdated content must not be forgotten for being old.
+///
+/// Decay measured age from `valid_from`, so an architecture decision valid since January would
+/// decay to `0.5 * 0.5^(240/30) = 0.002` — below the 0.05 forget threshold — and be expired after
+/// eight months, even though it is re-confirmed by every documentation import. For a knowledge
+/// base that silently deletes exactly the durable decisions it exists to hold. Age is now measured
+/// from `updated_at`, so anything still present in its source stays fresh.
+#[tokio::test]
+async fn long_valid_but_recently_confirmed_memories_are_not_forgotten() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let long_ago = chrono::Utc::now() - chrono::Duration::days(240);
+
+    engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "We use USearch rather than pgvector.")
+                .with_subject("adr-002.decision")
+                .valid_from(long_ago),
+        )
+        .await
+        .unwrap();
+
+    // On the old rule (age from `valid_from`) this would have been expired.
+    assert_eq!(
+        engine.memory_enforce_decay().await.unwrap(),
+        0,
+        "a decision valid since January was forgotten for being old"
+    );
+    assert!(
+        !engine
+            .memory_search("USearch pgvector", &scope, 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "decision no longer retrievable"
+    );
+}
+
+/// `run_agent_start` + `run_agent_drive` must equal `run_agent`.
+///
+/// The split exists so the gateway can answer `202 Accepted` and drive the loop in the background
+/// — a multi-turn run outlives an HTTP request, and running it inline under the 30 s request
+/// timeout returned 504 to the caller while the run kept executing invisibly. If the two halves
+/// diverged from the one-shot path, background runs would behave differently from synchronous
+/// ones for no visible reason.
+#[tokio::test]
+async fn split_agent_start_and_drive_match_the_one_shot_path() {
+    use crate::llm::CompletionProvider;
+
+    struct Fixed;
+    #[async_trait::async_trait]
+    impl CompletionProvider for Fixed {
+        async fn complete(&self, _system: &str, _user: &str) -> crate::Result<String> {
+            Ok("The deploy target is kubernetes.".to_string())
+        }
+        fn model_name(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    let mut engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    engine.completion = Some(std::sync::Arc::new(Fixed));
+
+    let started = engine
+        .run_agent_start("default", "assistant", "what is the deploy target?", None)
+        .await
+        .unwrap();
+    assert_eq!(started.status, RunStatus::Running);
+    // The opening step is journaled before any driving, so the transcript can be rebuilt — this
+    // is what lets the background task (or the crash dispatcher) pick the run up.
+    let trace = engine.run_trace(started.id).await.unwrap();
+    assert_eq!(trace.len(), 1);
+    assert_eq!(trace[0]["event_type"], "run_start");
+
+    let finished = engine.run_agent_drive(started.id, 4).await.unwrap();
+    assert_eq!(finished.id, started.id, "driving must not create a new run");
+    assert_eq!(finished.status, RunStatus::Succeeded);
+    assert!(
+        format!("{:?}", finished.result).contains("kubernetes"),
+        "{:?}",
+        finished.result
+    );
+}
+
+/// The document sweep must only ever touch the document it was given.
+///
+/// Re-importing a document expires the sections the new version no longer produces. That sweep
+/// matches on the document's path, so the path is the document's *identity* — and if two documents
+/// can share one, importing the second silently expires the first. This was not hypothetical:
+/// importing a second repository into a shared knowledge base destroyed 20 sections of the first
+/// one's `README.md`, because both were addressed by their repo-relative path.
+///
+/// The fix is a project namespace on the client side, but the invariant this rests on lives here:
+/// a sweep for `a/README.md` must not reach `b/README.md`, however similar their content.
+#[tokio::test]
+async fn document_sweep_never_reaches_a_different_document() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    let opts = crate::ingest::chunk::ChunkOptions::default();
+
+    const V1: &str = "# Overview\n\nShared intro text.\n\n## Setup\n\nRun the installer.\n";
+    for path in ["alpha/README.md", "beta/README.md"] {
+        engine
+            .document_ingest(
+                DocumentIngest {
+                    path,
+                    content: V1,
+                    ..Default::default()
+                },
+                &scope,
+                &opts,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        engine.memory_all(&scope, 100).await.unwrap().len(),
+        4,
+        "two documents, two sections each"
+    );
+
+    // Re-import alpha with its `Setup` section removed — beta must be untouched.
+    let r = engine
+        .document_ingest(
+            DocumentIngest {
+                path: "alpha/README.md",
+                content: "# Overview\n\nShared intro text.\n",
+                ..Default::default()
+            },
+            &scope,
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.removed, 1, "alpha's removed section should be swept");
+    assert_eq!(r.confirmed, 1, "alpha's surviving section is unchanged");
+
+    let subjects: Vec<String> = engine
+        .memory_all(&scope, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| m.subject)
+        .collect();
+    assert!(
+        subjects
+            .iter()
+            .any(|s| s.starts_with("beta/readme.md#overview")),
+        "beta's overview was swept by alpha's import: {subjects:?}"
+    );
+    assert!(
+        subjects
+            .iter()
+            .any(|s| s.starts_with("beta/readme.md#overview > setup")),
+        "beta's setup section was swept by alpha's import: {subjects:?}"
+    );
+    assert_eq!(
+        subjects.len(),
+        3,
+        "exactly one section removed: {subjects:?}"
+    );
+}
+
+/// Projects share a scope but can be searched separately — and searched together with real fusion.
+///
+/// This is the pair of properties the scope tuple cannot give you at once. Putting the project in
+/// the scope isolates projects *and* makes cross-project search impossible; the `memory_grants`
+/// workaround runs one search per scope and concatenates the lists, which never ranks results from
+/// different projects against each other. One scope plus a filter gives both.
+#[tokio::test]
+async fn projects_are_isolable_yet_jointly_searchable() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+
+    engine
+        .memory_add(
+            MemoryInput::new(
+                scope.clone(),
+                "Refunds are accepted for 90 days after capture.",
+            )
+            .with_project("payments"),
+        )
+        .await
+        .unwrap();
+    engine
+        .memory_add(
+            MemoryInput::new(
+                scope.clone(),
+                "Refunds of build artifacts are not a thing here.",
+            )
+            .with_project("platform"),
+        )
+        .await
+        .unwrap();
+
+    let names = |hits: &[MemoryHit]| -> Vec<String> {
+        hits.iter()
+            .map(|h| h.memory.project.clone().unwrap_or_default())
+            .collect()
+    };
+
+    // Narrowed to one project.
+    let only = engine
+        .memory_search_in_project("refund policy", &scope, 10, Some("payments"))
+        .await
+        .unwrap();
+    assert_eq!(names(&only), vec!["payments"], "leaked another project");
+
+    let other = engine
+        .memory_search_in_project("refund policy", &scope, 10, Some("platform"))
+        .await
+        .unwrap();
+    assert_eq!(names(&other), vec!["platform"]);
+
+    // A project nobody wrote to is empty, not an error.
+    assert!(engine
+        .memory_search_in_project("refund policy", &scope, 10, Some("nope"))
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Unfiltered: one corpus, one fusion — both projects ranked against each other.
+    let both = engine
+        .memory_search("refund policy", &scope, 10)
+        .await
+        .unwrap();
+    let mut got = names(&both);
+    got.sort();
+    assert_eq!(got, vec!["payments", "platform"]);
+}
+
+/// A subject means different things in different projects.
+///
+/// `deploy.target` in the payments repo is not a contradiction of `deploy.target` in the platform
+/// repo. If the project were not part of the contradiction key, importing the second project would
+/// supersede the first project's fact and the two teams would overwrite each other silently.
+#[tokio::test]
+async fn the_same_subject_in_two_projects_is_two_facts() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+
+    for (project, target) in [("payments", "ECS Fargate"), ("platform", "the EKS cluster")] {
+        engine
+            .memory_add(
+                MemoryInput::new(scope.clone(), format!("The deploy target is {target}."))
+                    .with_subject("deploy.target")
+                    .with_project(project),
+            )
+            .await
+            .unwrap();
+    }
+
+    let active = engine.memory_all(&scope, 10).await.unwrap();
+    assert_eq!(
+        active.len(),
+        2,
+        "one project superseded the other: {active:#?}"
+    );
+
+    // Within a project, contradiction resolution still works exactly as before.
+    engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "The deploy target is EKS Auto Mode.")
+                .with_subject("deploy.target")
+                .with_project("payments"),
+        )
+        .await
+        .unwrap();
+    let payments: Vec<String> = engine
+        .memory_search_in_project("deploy target", &scope, 10, Some("payments"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.memory.content)
+        .collect();
+    assert_eq!(
+        payments.len(),
+        1,
+        "supersession broke within a project: {payments:?}"
+    );
+    assert!(payments[0].contains("Auto Mode"));
+
+    // …and the other project is untouched.
+    let platform = engine
+        .memory_search_in_project("deploy target", &scope, 10, Some("platform"))
+        .await
+        .unwrap();
+    assert!(platform[0].memory.content.contains("EKS cluster"));
 }

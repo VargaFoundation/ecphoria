@@ -591,6 +591,9 @@ pub async fn webhook(
                 .iter()
                 .map(|e| (e.source.clone(), e.event_type.clone(), e.payload.clone()))
                 .collect();
+            // Keep the normalized events for memory promotion — `ingest` consumes them, and the
+            // promoted memory cites the event id, so the copy has to be taken before the move.
+            let to_promote = events.clone();
             let ingest_result = match &tenant {
                 Some(t) => {
                     let tc = ecphoria_core::config::TenantContext::new(t.clone());
@@ -600,8 +603,11 @@ pub async fn webhook(
             };
             match ingest_result {
                 Ok(ingested) => {
-                    // Event-driven agents: fire any matching triggers → start agent runs.
                     let tenant_str = tenant.as_deref().unwrap_or("default");
+                    // Durable outcomes (tickets closed, incidents resolved) additionally become
+                    // memories so they are reachable by `search_memory`, not only by SQL.
+                    let promoted = engine.promote_events(tenant_str, &to_promote).await;
+                    // Event-driven agents: fire any matching triggers → start agent runs.
                     let mut triggered_runs = Vec::new();
                     for (src, evt, payload) in trigger_inputs {
                         if let Ok(ids) = engine.fire_triggers(tenant_str, &src, &evt, payload).await
@@ -613,6 +619,7 @@ pub async fn webhook(
                         "source": source,
                         "normalized": count,
                         "ingested": ingested,
+                        "promoted": promoted,
                         "triggered_runs": triggered_runs,
                     }))
                 }
@@ -1034,7 +1041,13 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
-/// Re-embed events left unembedded (e.g. provider was down at ingest). Admin; closes cross-store gap.
+/// Rebuild the derived indexes. Admin; closes cross-store gaps.
+///
+/// Two independent repairs: re-embed events left unembedded (e.g. the provider was down at
+/// ingest), and rebuild the lexical (FTS5) index from DuckDB. Both indexes are written
+/// best-effort on the write path, so this is how a deployment converges them after an outage —
+/// or after deleting the index file, which is a supported way to recover from corruption since
+/// DuckDB remains the source of truth.
 pub async fn reindex(
     State(engine): State<Arc<EcphoriaEngine>>,
     shard: Option<Extension<crate::cluster::shard_route::ShardRoutingState>>,
@@ -1044,7 +1057,16 @@ pub async fn reindex(
     let local = match engine.reindex_unembedded(10_000).await {
         Ok(reindexed) => {
             let pending = engine.unembedded_count().await.unwrap_or(0);
-            serde_json::json!({ "reindexed": reindexed, "pending": pending })
+            // Best-effort: a lexical rebuild failure degrades keyword recall until the next
+            // restart, but must not mask a successful re-embed.
+            let lexical = match engine.lexical_reindex().await {
+                Ok(n) => serde_json::json!(n),
+                Err(e) => {
+                    tracing::warn!(error = %e, "lexical reindex failed");
+                    serde_json::Value::Null
+                }
+            };
+            serde_json::json!({ "reindexed": reindexed, "pending": pending, "lexical_indexed": lexical })
         }
         Err(e) => {
             return api_error(

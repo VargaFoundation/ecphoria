@@ -86,6 +86,57 @@ pub struct EmbedAndSearchRequest {
 
 // ── Memory cognition DTOs ───────────────────────────────────────────
 
+/// Query for `GET /api/v1/memories/history?subject=…`.
+#[derive(Debug, Deserialize)]
+pub struct MemoryHistoryQuery {
+    /// Stable key whose versions to list.
+    pub subject: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Ingest one document as independently-addressed chunks (see `EcphoriaEngine::document_ingest`).
+#[derive(Debug, Deserialize)]
+pub struct DocumentIngestRequest {
+    /// Stable identity of the document — normally its repo-relative path. Re-importing the same
+    /// path supersedes changed sections and expires removed ones.
+    pub path: String,
+    /// Raw Markdown.
+    pub content: String,
+    /// Valid-time for this version, e.g. the commit date that produced it. Defaults to now.
+    #[serde(default)]
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    /// Override the section size target (characters). Defaults to 1500.
+    #[serde(default)]
+    pub target_chars: Option<usize>,
+    /// Project this document belongs to.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Add many memories in one request — the bulk-import path for a document corpus.
+#[derive(Debug, Deserialize)]
+pub struct MemoryBatchAddRequest {
+    /// The memories to add, applied in order (a later one can supersede an earlier one).
+    pub memories: Vec<MemoryAddRequest>,
+}
+
 /// Add a memory through the cognition pipeline.
 #[derive(Debug, Deserialize)]
 pub struct MemoryAddRequest {
@@ -110,6 +161,10 @@ pub struct MemoryAddRequest {
     /// Memory type: "semantic" (default), "episodic", or "procedural".
     #[serde(default)]
     pub mem_type: Option<String>,
+    /// Project this memory belongs to, within its scope. Lets a later search narrow to one project
+    /// without splitting the store — see `docs/knowledge-base.md`.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Re-embed active memories with the currently-configured provider (after a model/dimension change).
@@ -257,6 +312,14 @@ pub struct RunAgentRequest {
     pub question: String,
     #[serde(default)]
     pub max_turns: Option<usize>,
+    /// Return as soon as the run is created and drive it in the background (`202 Accepted`),
+    /// instead of blocking until it finishes.
+    ///
+    /// A multi-turn agent run takes longer than the server's 30 s request timeout, so the
+    /// synchronous form reliably returns 504 while the run keeps going invisibly. Poll
+    /// `GET /api/v1/runs/{id}` for status and `/runs/{id}/trace` for the step journal.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Restore all stores from a backup directory (destructive; admin-only).
@@ -399,6 +462,9 @@ pub struct MemorySearchRequest {
     /// Also include memories shared with this user via a grant (cross-scope read). Default false.
     #[serde(default)]
     pub shared: bool,
+    /// Restrict to one project. Omit to search every project in the scope, fused together.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Grant a user read access to another user's memories (within the token's tenant).

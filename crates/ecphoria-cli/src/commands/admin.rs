@@ -86,10 +86,18 @@ pub async fn memory(url: &str, action: MemoryCmd) -> anyhow::Result<()> {
             }
             c.post_json("/api/v1/memories", body).await?
         }
-        MemoryCmd::Search { query, user, k } => {
+        MemoryCmd::Search {
+            query,
+            user,
+            project,
+            k,
+        } => {
             let mut body = serde_json::json!({ "query": query, "k": k });
             if let Some(u) = user {
                 body["user_id"] = serde_json::json!(u);
+            }
+            if let Some(p) = project {
+                body["project"] = serde_json::json!(p);
             }
             c.post_json("/api/v1/memories/search", body).await?
         }

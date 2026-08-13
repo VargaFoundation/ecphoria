@@ -490,6 +490,11 @@ async fn call_tool(
                     .get("mem_type")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
+                valid_from: None,
+                project: args
+                    .get("project")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             };
             if let Some(coord) = &cluster {
                 // Run cognition on the leader, replicate the materialized rows through the log.
@@ -510,8 +515,9 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .ok_or("missing 'query' parameter")?;
             let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            let project = args.get("project").and_then(|v| v.as_str());
             engine
-                .memory_search(query, &scoped_for(args, tenant), k)
+                .memory_search_in_project(query, &scoped_for(args, tenant), k, project)
                 .await
                 .map(|hits| serde_json::json!({"results": hits, "count": hits.len()}))
                 .map_err(|e| e.to_string())

@@ -50,6 +50,10 @@ LLM proxy) into calls on `ecphoria_core::EcphoriaEngine`. Also handles authentic
 | DELETE | `/api/v1/admin/tenants/{tenant_id}` | GDPR erasure (all stores) | Yes* (admin) | **Working** |
 | DELETE | `/api/v1/admin/users/{user_id}` | GDPR erasure by user (memories + vectors, tenant from token) | Yes* (admin) | **Working** |
 | GET | `/api/v1/memories/{id}/provenance` | memory → source events + supersession chain | Yes* | **Working** |
+| POST | `/api/v1/agents/run` | run an agent; `{"background": true}` → `202 Accepted` + run id to poll (the inline form exceeds the 30 s request timeout on any real run) | Yes* | **Working** |
+| POST | `/api/v1/documents` | ingest one Markdown document as heading-addressed sections (chunk + supersede + sweep, server-side); `valid_from` = source commit date | Yes* | **Working** |
+| GET | `/api/v1/memories/history` | version history by **subject** (`?subject=…`), not by id — what an agent tool actually holds | Yes* | **Working** |
+| POST | `/api/v1/memories/batch` | bulk memory import (≤10k/request; batched embeddings + DuckDB Appender, ~4.8× faster than a loop over `/memories`) | Yes* | **Working** |
 | POST | `/api/v1/memories/{id}/feedback` | feedback loop (helpful/wrong/obsolete) | Yes* | **Working** |
 | GET | `/api/v1/memories/watch` | WebSocket memory CDC stream (upserted/superseded/expired) | Yes* | **Working** |
 | GET | `/api/v1/memories/edges` | list all knowledge-graph edges (bulk view / Obsidian export) | Yes* | **Working** |

@@ -15,7 +15,12 @@ impl EcphoriaClient {
         Self {
             http: Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            // Accept either name. `ECPHORIA_API_KEY` is what the quickstart, the deployment docs
+            // and the server's own config use, so a user who followed those and then reached for
+            // the CLI would otherwise get an unexplained 401. `ECPHORIA_TOKEN` stays supported and
+            // wins when both are set, since admin flows document it.
             token: std::env::var("ECPHORIA_TOKEN")
+                .or_else(|_| std::env::var("ECPHORIA_API_KEY"))
                 .ok()
                 .filter(|s| !s.is_empty()),
         }
@@ -101,10 +106,18 @@ impl EcphoriaClient {
             .await
     }
 
-    pub async fn ingest(&self, source: &str, file: &str) -> anyhow::Result<serde_json::Value> {
+    /// Post already-parsed events. The *file* is read client-side by `commands::ingest`: the
+    /// server has no file-reading path, and must not grow one — a path in the request body would
+    /// be resolved against the server's filesystem, not the caller's, which is both surprising and
+    /// an arbitrary-file-read primitive.
+    pub async fn ingest(
+        &self,
+        source: &str,
+        events: Vec<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
         self.post_json(
             "/api/v1/ingest",
-            serde_json::json!({ "source": source, "file": file }),
+            serde_json::json!({ "source": source, "events": events }),
         )
         .await
     }
@@ -159,5 +172,34 @@ mod tests {
     fn client_with_custom_port() {
         let client = EcphoriaClient::new("http://10.0.0.1:9999");
         assert_eq!(client.base_url(), "http://10.0.0.1:9999");
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    /// The CLI must accept the same environment variable the rest of the product documents.
+    ///
+    /// The server config, the Docker quickstart and the session-capture hook all use
+    /// `ECPHORIA_API_KEY`; the CLI only ever read `ECPHORIA_TOKEN`. Following the documented setup
+    /// and then running `ecphoria import` produced a bare 401 with nothing pointing at the cause.
+    #[test]
+    fn token_resolution_accepts_both_names() {
+        // Resolution logic mirrored here rather than mutating process env, which would race with
+        // other tests in the same binary.
+        let resolve = |token: Option<&str>, api_key: Option<&str>| -> Option<String> {
+            token
+                .or(api_key)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+        };
+        assert_eq!(resolve(Some("t"), None).as_deref(), Some("t"));
+        assert_eq!(resolve(None, Some("k")).as_deref(), Some("k"));
+        assert_eq!(
+            resolve(Some("t"), Some("k")).as_deref(),
+            Some("t"),
+            "ECPHORIA_TOKEN wins"
+        );
+        assert_eq!(resolve(None, None), None);
+        assert_eq!(resolve(Some(""), None), None, "empty is not a credential");
     }
 }

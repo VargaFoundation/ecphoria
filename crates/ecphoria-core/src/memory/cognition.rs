@@ -140,6 +140,14 @@ pub struct Memory {
     /// Memory type: "semantic" (facts), "episodic" (events), or "procedural" (skills/steps).
     #[serde(default = "default_mem_type")]
     pub mem_type: String,
+    /// Which project this memory belongs to, within its scope.
+    ///
+    /// A filter, not a partition: every project shares one scope, so hybrid retrieval still fuses
+    /// the whole corpus and a query can span projects with proper ranking. Setting it lets a query
+    /// narrow to one project without splitting the store — which is what the scope tuple would do,
+    /// and what makes cross-project search impossible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 fn default_mem_type() -> String {
@@ -166,6 +174,7 @@ impl Memory {
             updated_at: now,
             metadata: serde_json::json!({}),
             mem_type: default_mem_type(),
+            project: None,
         }
     }
 
@@ -341,6 +350,20 @@ pub struct MemoryInput {
     pub metadata: serde_json::Value,
     /// Memory type (defaults to "semantic" when None).
     pub mem_type: Option<String>,
+    /// When the fact *became true*, if that differs from when it is being recorded.
+    ///
+    /// This is the **valid-time** axis, and it is what makes the bi-temporal model mean something
+    /// for imported content: a document section should be valid from the commit that changed it,
+    /// not from whenever the importer happened to run. It also sets the `valid_to` of whatever
+    /// this supersedes, so a backfill produces a coherent timeline rather than stacking every
+    /// version at import time.
+    ///
+    /// `created_at`/`updated_at` — the transaction-time axis, when *we* learned it — always stay
+    /// real wall-clock, so "what did we believe at T" and "what was true at T" remain separable.
+    /// `None` (the default) means both axes are now.
+    pub valid_from: Option<DateTime<Utc>>,
+    /// Project this memory belongs to (see [`Memory::project`]).
+    pub project: Option<String>,
 }
 
 impl MemoryInput {
@@ -354,7 +377,23 @@ impl MemoryInput {
             source_event_ids: Vec::new(),
             metadata: serde_json::json!({}),
             mem_type: None,
+            valid_from: None,
+            project: None,
         }
+    }
+
+    /// Attribute this memory to a project, so a query can narrow to it (see [`Memory::project`]).
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        let p = project.into();
+        self.project = (!p.trim().is_empty()).then_some(p);
+        self
+    }
+
+    /// Record this memory as having become true at `at` rather than now (see
+    /// [`MemoryInput::valid_from`]).
+    pub fn valid_from(mut self, at: DateTime<Utc>) -> Self {
+        self.valid_from = Some(at);
+        self
     }
 
     /// Set the stable subject key (enables deterministic contradiction resolution).
@@ -490,7 +529,7 @@ const STOP_WORDS: &[&str] = &[
     "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
 ];
 
-fn is_stop_word(w: &str) -> bool {
+pub(crate) fn is_stop_word(w: &str) -> bool {
     STOP_WORDS.contains(&w)
 }
 
@@ -717,7 +756,7 @@ impl MemoryStore {
     const SELECT_COLS: &'static str = "id, tenant_id, user_id, agent_id, session_id, subject, \
          content, importance, valid_from::VARCHAR, valid_to::VARCHAR, state, supersedes, \
          source_event_ids, version, created_at::VARCHAR, updated_at::VARCHAR, metadata::VARCHAR, \
-         mem_type";
+         mem_type, project";
 
     /// Create an in-memory store (testing).
     pub fn new() -> Self {
@@ -850,6 +889,22 @@ impl MemoryStore {
                           CREATE INDEX IF NOT EXISTS idx_attach_tenant ON memory_attachments(tenant_id);
                           CREATE INDEX IF NOT EXISTS idx_attach_memory ON memory_attachments(tenant_id, memory_id);",
                 },
+                super::migrations::Migration {
+                    version: 6,
+                    // Project partitioning *within* a scope.
+                    //
+                    // A team that shares one tenant wants both things at once: search everything,
+                    // or search one project. The scope tuple cannot express that — it is an exact
+                    // match, so putting the project in `agent_id` isolates projects from each other
+                    // and breaks cross-project search entirely. Grants exist for cross-scope reads
+                    // but they *concatenate* per-scope result lists rather than fusing them, so
+                    // ranking across projects is worse than ranking within one.
+                    //
+                    // A filter column keeps every memory in one scope — so RRF still fuses the
+                    // whole corpus — and makes isolation a predicate rather than a partition.
+                    sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS project VARCHAR;
+                          CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(tenant_id, project);",
+                },
             ],
         );
 
@@ -911,6 +966,7 @@ impl MemoryStore {
             mem_type: row
                 .get::<_, String>(17)
                 .unwrap_or_else(|_| "semantic".to_string()),
+            project: row.get::<_, Option<String>>(18).ok().flatten(),
         })
     }
 
@@ -953,9 +1009,9 @@ impl MemoryStore {
             "INSERT OR IGNORE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, mem_type, embedding)
+              created_at, updated_at, metadata, mem_type, embedding, project)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -976,6 +1032,7 @@ impl MemoryStore {
                 metadata_str,
                 memory.mem_type,
                 embedding_json,
+                memory.project,
             ],
         )
         .map_err(|e| crate::Error::Ingest(format!("insert memory: {e}")))?;
@@ -1010,9 +1067,9 @@ impl MemoryStore {
             "INSERT OR REPLACE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, mem_type, embedding)
+              created_at, updated_at, metadata, mem_type, embedding, project)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -1033,9 +1090,232 @@ impl MemoryStore {
                 metadata_str,
                 memory.mem_type,
                 embedding_json,
+                memory.project,
             ],
         )
         .map_err(|e| crate::Error::Ingest(format!("upsert memory: {e}")))?;
+        Ok(())
+    }
+
+    /// Insert-or-replace many memory rows in **one** transaction.
+    ///
+    /// DuckDB is columnar: a single-row `INSERT` costs milliseconds because each one is its own
+    /// implicit transaction and append. The repo's own benchmark measures ~4.3 ms per row-insert
+    /// against ~59 µs when batched (`docs/benchmarks.md`), which is why `memory_add` is documented
+    /// as row-insert bound. Bulk ingest routes through here instead.
+    ///
+    /// Same `INSERT OR REPLACE` semantics as [`Self::upsert_raw`], so it is equally safe for Raft
+    /// apply and replay. The whole batch commits or rolls back together.
+    pub async fn upsert_raw_batch(&self, rows: &[MemoryRow]) -> crate::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Split by whether the row already exists. Brand-new rows go through the DuckDB Appender,
+        // which is ~72× faster than a row `INSERT` (`docs/benchmarks.md`) but has no conflict
+        // handling — the same trade the episodic ingest path makes. Rows that replace an existing
+        // one (a supersede closing out the previous version) keep `INSERT OR REPLACE`.
+        //
+        // Bulk-loading a fresh corpus is almost entirely the first case, which is what makes the
+        // split worth its extra existence check: one `SELECT … IN (…)` per batch, not per row.
+        let existing = self.existing_ids(rows).await?;
+        let (updates, inserts): (Vec<&MemoryRow>, Vec<&MemoryRow>) =
+            rows.iter().partition(|r| existing.contains(&r.memory.id));
+        if !inserts.is_empty() {
+            self.append_new_batch(&inserts)?;
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let rows = updates;
+        let db = self.write_db.lock();
+        db.execute_batch("BEGIN TRANSACTION")
+            .map_err(|e| crate::Error::Ingest(format!("begin transaction: {e}")))?;
+        let result = (|| {
+            let mut stmt = db
+                .prepare(
+                    "INSERT OR REPLACE INTO memories
+                     (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
+                      valid_from, valid_to, state, supersedes, source_event_ids, version,
+                      created_at, updated_at, metadata, mem_type, embedding, project)
+                     VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
+                             ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
+                )
+                .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
+            for row in rows {
+                let memory = &row.memory;
+                let source_ids = if memory.source_event_ids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        memory
+                            .source_event_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                };
+                let embedding_json = row
+                    .embedding
+                    .as_ref()
+                    .map(|e| serde_json::to_string(e).unwrap_or_default());
+                let metadata_str =
+                    serde_json::to_string(&memory.metadata).unwrap_or_else(|_| "{}".into());
+                stmt.execute(duckdb::params![
+                    memory.id.to_string(),
+                    memory.scope.tenant_id,
+                    memory.scope.user_id,
+                    memory.scope.agent_id,
+                    memory.scope.session_id,
+                    memory.subject,
+                    memory.content,
+                    memory.importance as f64,
+                    memory.valid_from.to_rfc3339(),
+                    memory.valid_to.map(|t| t.to_rfc3339()),
+                    memory.state.as_str(),
+                    memory.supersedes.map(|s| s.to_string()),
+                    source_ids,
+                    memory.version as i64,
+                    memory.created_at.to_rfc3339(),
+                    memory.updated_at.to_rfc3339(),
+                    metadata_str,
+                    memory.mem_type,
+                    embedding_json,
+                    memory.project,
+                ])
+                .map_err(|e| crate::Error::Ingest(format!("insert memory: {e}")))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                db.execute_batch("COMMIT")
+                    .map_err(|e| crate::Error::Ingest(format!("commit: {e}")))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = db.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Which of these rows' ids are already stored. One query per 512 ids, not per row.
+    async fn existing_ids(
+        &self,
+        rows: &[MemoryRow],
+    ) -> crate::Result<std::collections::HashSet<Uuid>> {
+        const BATCH: usize = 512;
+        let ids: Vec<String> = rows.iter().map(|r| r.memory.id.to_string()).collect();
+        let mut found = std::collections::HashSet::new();
+        for chunk in ids.chunks(BATCH) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT id FROM memories WHERE id IN ({placeholders})");
+            let db = self.read_conn();
+            let mut stmt = db
+                .prepare(&sql)
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            let boxed: Vec<Box<dyn duckdb::ToSql>> = chunk
+                .iter()
+                .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
+                .collect();
+            let refs: Vec<&dyn duckdb::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+            let got = stmt
+                .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+                .map_err(|e| crate::Error::Query(e.to_string()))?;
+            found.extend(
+                got.filter_map(|r| r.ok())
+                    .filter_map(|s| Uuid::parse_str(&s).ok()),
+            );
+        }
+        Ok(found)
+    }
+
+    /// Append rows known not to exist yet, via the DuckDB Appender fast path.
+    ///
+    /// The Appender does not coerce strings, so `TIMESTAMPTZ` columns are written as typed
+    /// `Value::Timestamp`; `JSON` columns take their serialized string. Mirrors
+    /// [`super::episodic::EpisodicStore`]'s `append_fast`.
+    fn append_new_batch(&self, rows: &[&MemoryRow]) -> crate::Result<()> {
+        use duckdb::types::{TimeUnit, Value};
+        let ts = |dt: DateTime<Utc>| Value::Timestamp(TimeUnit::Microsecond, dt.timestamp_micros());
+        let ts_opt = |o: Option<DateTime<Utc>>| o.map_or(Value::Null, ts);
+
+        let db = self.write_db.lock();
+        {
+            let mut appender = db
+                .appender_with_columns(
+                    "memories",
+                    &[
+                        "id",
+                        "tenant_id",
+                        "user_id",
+                        "agent_id",
+                        "session_id",
+                        "subject",
+                        "content",
+                        "importance",
+                        "valid_from",
+                        "valid_to",
+                        "state",
+                        "supersedes",
+                        "source_event_ids",
+                        "version",
+                        "created_at",
+                        "updated_at",
+                        "metadata",
+                        "mem_type",
+                        "embedding",
+                        "project",
+                    ],
+                )
+                .map_err(|e| crate::Error::Ingest(format!("memories appender: {e}")))?;
+            for row in rows {
+                let m = &row.memory;
+                let source_ids = if m.source_event_ids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        m.source_event_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                };
+                appender
+                    .append_row(duckdb::params![
+                        m.id.to_string(),
+                        m.scope.tenant_id,
+                        m.scope.user_id,
+                        m.scope.agent_id,
+                        m.scope.session_id,
+                        m.subject,
+                        m.content,
+                        m.importance as f64,
+                        ts(m.valid_from),
+                        ts_opt(m.valid_to),
+                        m.state.as_str(),
+                        m.supersedes.map(|s| s.to_string()),
+                        source_ids,
+                        m.version as i64,
+                        ts(m.created_at),
+                        ts(m.updated_at),
+                        serde_json::to_string(&m.metadata).unwrap_or_else(|_| "{}".into()),
+                        m.mem_type,
+                        row.embedding
+                            .as_ref()
+                            .map(|e| serde_json::to_string(e).unwrap_or_default()),
+                        m.project.clone(),
+                    ])
+                    .map_err(|e| crate::Error::Ingest(format!("append memory: {e}")))?;
+            }
+            appender
+                .flush()
+                .map_err(|e| crate::Error::Ingest(format!("memories appender flush: {e}")))?;
+        }
         Ok(())
     }
 
@@ -1065,14 +1345,26 @@ impl MemoryStore {
         &self,
         scope: &MemoryScope,
         subject: &str,
+        project: Option<&str>,
     ) -> crate::Result<Vec<Memory>> {
         let (where_sql, mut params) = scope.where_clause();
         params.push(subject.to_string());
+        // The project participates in identity, so `deploy.target` in two projects are two facts,
+        // not a contradiction. Memories with no project keep the old behaviour exactly: they match
+        // only other project-less memories.
+        let project_sql = match project {
+            Some(p) => {
+                params.push(p.to_string());
+                "AND project = ?"
+            }
+            None => "AND project IS NULL",
+        };
         let sql = format!(
-            "SELECT {} FROM memories WHERE {} AND subject = ? AND state = 'active' \
+            "SELECT {} FROM memories WHERE {} AND subject = ? {} AND state = 'active' \
              ORDER BY valid_from DESC",
             Self::SELECT_COLS,
-            where_sql
+            where_sql,
+            project_sql
         );
         self.query_memories(&sql, &params)
     }
@@ -1092,6 +1384,116 @@ impl MemoryStore {
             limit.clamp(1, 10_000)
         );
         self.query_memories(&sql, &params)
+    }
+
+    /// Every active memory in `scope` belonging to document `doc_path` — the document's own
+    /// memory (`subject = path`) plus each of its chunks (`subject = path#Heading > Sub`).
+    ///
+    /// Used by the document re-import sweep to find sections that vanished from the source file:
+    /// they are the previously-active subjects the new version no longer produces.
+    pub async fn find_active_by_document(
+        &self,
+        scope: &MemoryScope,
+        doc_path: &str,
+    ) -> crate::Result<Vec<Memory>> {
+        let (where_sql, mut params) = scope.where_clause();
+        let path = normalize_subject(doc_path);
+        // `LIKE` metacharacters in a file path would silently widen the match, so escape them and
+        // bind the pattern rather than interpolating it.
+        let escaped = path
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let sql = format!(
+            "SELECT {} FROM memories WHERE {} AND state = 'active' \
+             AND (subject = ? OR subject LIKE ? ESCAPE '\\') ORDER BY subject",
+            Self::SELECT_COLS,
+            where_sql
+        );
+        params.push(path);
+        params.push(format!("{escaped}#%"));
+        self.query_memories(&sql, &params)
+    }
+
+    /// Hydrate an ordered list of candidate ids into active, in-scope memories.
+    ///
+    /// This is the safety half of the advisory-index contract used by the lexical (FTS5) arm: the
+    /// index proposes ids, and this filters them against the source of truth (`state = 'active'`
+    /// plus the exact scope tuple). An id that has since been superseded, expired, deleted or
+    /// moved out of scope simply drops out. **Caller order is preserved**, because for the lexical
+    /// arm that order *is* the BM25 ranking that feeds RRF.
+    ///
+    /// Ids are queried in batches so a wide candidate window doesn't build one enormous statement.
+    pub async fn get_active_by_ids(
+        &self,
+        ids: &[Uuid],
+        scope: &MemoryScope,
+    ) -> crate::Result<Vec<Memory>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        const BATCH: usize = 512;
+        let (where_sql, scope_params) = scope.where_clause();
+        let mut found: std::collections::HashMap<Uuid, Memory> = std::collections::HashMap::new();
+        for chunk in ids.chunks(BATCH) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {} FROM memories WHERE {} AND state = 'active' AND id IN ({})",
+                Self::SELECT_COLS,
+                where_sql,
+                placeholders
+            );
+            let mut params = scope_params.clone();
+            params.extend(chunk.iter().map(|id| id.to_string()));
+            for m in self.query_memories(&sql, &params)? {
+                found.insert(m.id, m);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    }
+
+    /// Page through the active corpus returning only what the lexical index needs
+    /// (`id`, scope, `subject`, `content`) — used to rebuild the index on boot / on reindex.
+    ///
+    /// Ordered by `id` (unique and stable) so paging can't skip or repeat a row, and deliberately
+    /// narrow so rebuilding a large corpus doesn't materialize whole `Memory` rows.
+    pub async fn lexical_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> crate::Result<Vec<(Uuid, MemoryScope, Option<String>, Option<String>, String)>> {
+        let db = self.read_conn();
+        let sql = "SELECT id, tenant_id, user_id, agent_id, session_id, subject, content, project \
+                   FROM memories WHERE state = 'active' ORDER BY id LIMIT ? OFFSET ?";
+        let mut stmt = db
+            .prepare(sql)
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map([limit as i64, offset as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MemoryScope {
+                        tenant_id: row.get::<_, String>(1)?,
+                        user_id: row.get::<_, Option<String>>(2)?,
+                        agent_id: row.get::<_, Option<String>>(3)?,
+                        session_id: row.get::<_, Option<String>>(4)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|e| crate::Error::Query(e.to_string()))?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, scope, project, subject, content)| {
+                Uuid::parse_str(&id)
+                    .ok()
+                    .map(|id| (id, scope, project, subject, content))
+            })
+            .collect())
     }
 
     /// Active memories for a scope with optional conjunctive filters + offset pagination. Stable
@@ -1701,6 +2103,19 @@ impl MemoryStore {
     /// `forget_threshold`. Decay is `importance * 0.5^(age_days / half_life_days)`.
     /// Expired memories are retained (state='expired') for history/audit, not hard-deleted.
     /// Returns the ids that were forgotten (so the caller can drop their vectors).
+    ///
+    /// **Age is measured from `updated_at`, not `valid_from`** — from when the memory was last
+    /// touched, not from when the fact became true. The distinction decides whether a knowledge
+    /// base survives: an architecture decision valid since January is not stale, and on
+    /// `valid_from` it would decay to `0.5 * 0.5^(240/30) = 0.002` and be forgotten after eight
+    /// months despite being re-confirmed by every import. Because a `Confirmed` re-assertion bumps
+    /// `updated_at`, anything still present in its source stays fresh, and only genuinely
+    /// unreferenced memories age out — which is the behaviour "decay-based forgetting" is meant to
+    /// describe. Documents removed from their source are expired by the document sweep instead.
+    ///
+    /// Age is continuous (seconds/86400), not whole days: `date_diff('day', …)` counts calendar
+    /// boundaries crossed, so a memory updated at 23:59 would read as a full day old two minutes
+    /// later and decay in visible steps rather than smoothly.
     /// Read-only: the ids that `decay` *would* expire, without writing. Lets the cluster leader
     /// compute the forget-set and replicate it via `MemoryExpire` (so every node expires the same
     /// rows) instead of applying decay only locally.
@@ -1714,7 +2129,8 @@ impl MemoryStore {
         let now = Utc::now().to_rfc3339();
         let db = self.write_db.lock();
         let sql = "SELECT id FROM memories WHERE state = 'active' AND importance * \
-             power(0.5, date_diff('day', valid_from, ?::TIMESTAMPTZ)::DOUBLE / ?) < ?";
+             power(0.5, date_diff('second', updated_at, ?::TIMESTAMPTZ)::DOUBLE / 86400.0 / ?) \
+             < ?";
         let mut stmt = db
             .prepare(sql)
             .map_err(|e| crate::Error::Query(e.to_string()))?;
@@ -1742,7 +2158,7 @@ impl MemoryStore {
         // Same predicate is reused for SELECT (to learn ids) and UPDATE (to expire) with the
         // same `now`, so the matched set is identical.
         let cond = "state = 'active' AND importance * power(0.5, \
-             date_diff('day', valid_from, ?::TIMESTAMPTZ)::DOUBLE / ?) < ?";
+             date_diff('second', updated_at, ?::TIMESTAMPTZ)::DOUBLE / 86400.0 / ?) < ?";
 
         let ids: Vec<Uuid> = {
             let sql = format!("SELECT id FROM memories WHERE {cond}");
@@ -1982,7 +2398,11 @@ impl MemoryStore {
         let rows = stmt
             .query_map([], |row| {
                 let memory = Self::parse_memory(row)?;
-                let emb_str: String = row.get(18)?; // SELECT_COLS(0..=17) + embedding at 18
+                // SELECT_COLS ends at `project` (index 18), so the appended embedding is 19.
+                // Getting this wrong is silent: `query_map` rows that fail to parse are dropped by
+                // the caller's `filter_map(Result::ok)`, so the vector index would simply rebuild
+                // empty on restart with no error anywhere.
+                let emb_str: String = row.get(19)?;
                 let embedding: Vec<f32> = serde_json::from_str(&emb_str).unwrap_or_default();
                 Ok((memory, embedding))
             })
@@ -2026,6 +2446,76 @@ impl MemoryStore {
             Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(crate::Error::Query(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod decay_tests {
+    use super::*;
+
+    fn aged(
+        scope: &MemoryScope,
+        content: &str,
+        valid_days_ago: i64,
+        touched_days_ago: i64,
+    ) -> Memory {
+        let mut m = Memory::new(scope.clone(), content);
+        m.valid_from = Utc::now() - chrono::Duration::days(valid_days_ago);
+        m.updated_at = Utc::now() - chrono::Duration::days(touched_days_ago);
+        m
+    }
+
+    /// Decay must key on when a memory was last *touched*, not on when its content became true.
+    ///
+    /// The two differ exactly for the content a knowledge base is built from: a decision valid
+    /// since January but re-confirmed by this morning's import is not stale. Keying on
+    /// `valid_from` expired it — `0.5 * 0.5^(240/30) = 0.002`, under the 0.05 threshold — which
+    /// silently deleted the most durable memories in the store.
+    #[tokio::test]
+    async fn decay_keys_on_last_touch_not_on_validity() {
+        let store = MemoryStore::new();
+        let scope = MemoryScope::tenant("default");
+
+        // Valid for 240 days, confirmed today → must survive.
+        let fresh = aged(&scope, "We use USearch rather than pgvector.", 240, 0);
+        // Valid for 10 days, untouched for 240 → genuinely stale, must go.
+        let stale = aged(&scope, "An incidental observation.", 10, 240);
+        store.insert(&fresh, None).await.unwrap();
+        store.insert(&stale, None).await.unwrap();
+
+        let forgotten = store.decay(30.0, 0.05).await.unwrap();
+        assert_eq!(
+            forgotten,
+            vec![stale.id],
+            "expected only the untouched memory to decay"
+        );
+
+        let survivors = store.list_active(&scope, 10).await.unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, fresh.id);
+    }
+
+    /// Age is continuous, not quantised to calendar days.
+    ///
+    /// `date_diff('day', …)` counts boundaries crossed, so a memory updated at 23:59 reads as a
+    /// full day old two minutes later — decay would arrive in visible steps and a sub-day
+    /// half-life would do nothing at all.
+    #[tokio::test]
+    async fn decay_age_is_continuous() {
+        let store = MemoryStore::new();
+        let scope = MemoryScope::tenant("default");
+        let mut m = Memory::new(scope.clone(), "half a day old");
+        m.updated_at = Utc::now() - chrono::Duration::hours(12);
+        store.insert(&m, None).await.unwrap();
+
+        // Half-life of 12h (0.5 days): importance halves to 0.25 — above a 0.2 threshold…
+        assert!(store.decay_candidates(0.5, 0.2).await.unwrap().is_empty());
+        // …and below a 0.3 one. Whole-day quantisation would report age 0 and neither would fire.
+        assert_eq!(
+            store.decay_candidates(0.5, 0.3).await.unwrap(),
+            vec![m.id],
+            "12h of decay was not observed — age is being rounded to whole days"
+        );
     }
 }
 
@@ -2183,7 +2673,7 @@ mod tests {
         store.insert(&b, None).await.unwrap();
 
         let alice = store
-            .find_active_by_subject(&MemoryScope::user("alice"), "color")
+            .find_active_by_subject(&MemoryScope::user("alice"), "color", None)
             .await
             .unwrap();
         assert_eq!(alice.len(), 1);
@@ -2211,7 +2701,7 @@ mod tests {
 
         // Only the new one is active.
         let active = store
-            .find_active_by_subject(&s, "favorite_color")
+            .find_active_by_subject(&s, "favorite_color", None)
             .await
             .unwrap();
         assert_eq!(active.len(), 1);
@@ -2262,7 +2752,10 @@ mod tests {
 
         let mut old = Memory::new(s.clone(), "trivial old fact");
         old.importance = 0.1;
+        // Old *and untouched* — decay keys on `updated_at`, so a memory that is merely valid
+        // since long ago (but re-confirmed recently) is deliberately not a decay candidate.
         old.valid_from = Utc::now() - chrono::Duration::days(365);
+        old.updated_at = Utc::now() - chrono::Duration::days(365);
         store.insert(&old, None).await.unwrap();
 
         let mut fresh = Memory::new(s.clone(), "important recent fact");

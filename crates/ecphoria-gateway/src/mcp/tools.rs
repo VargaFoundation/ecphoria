@@ -181,7 +181,8 @@ pub fn list_tools() -> Vec<McpTool> {
                     "user_id": {"type": "string", "description": "Scope the memory to a user"},
                     "agent_id": {"type": "string", "description": "Scope the memory to an agent"},
                     "session_id": {"type": "string", "description": "Scope the memory to a session"},
-                    "importance": {"type": "number", "description": "Optional importance 0.0–1.0"}
+                    "importance": {"type": "number", "description": "Optional importance 0.0–1.0"},
+                    "project": {"type": "string", "description": "Project this memory belongs to. Facts with the same subject in different projects are distinct, and a later search can narrow to one project."}
                 },
                 "required": ["content"]
             }),
@@ -196,7 +197,8 @@ pub fn list_tools() -> Vec<McpTool> {
                     "user_id": {"type": "string"},
                     "agent_id": {"type": "string"},
                     "session_id": {"type": "string"},
-                    "k": {"type": "integer", "description": "Number of results (default 5)"}
+                    "k": {"type": "integer", "description": "Number of results (default 5)"},
+                    "project": {"type": "string", "description": "Restrict to one project. Omit to search every project at once, ranked together."}
                 },
                 "required": ["query"]
             }),

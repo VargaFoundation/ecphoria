@@ -100,6 +100,32 @@ pub struct MemoryConfig {
     pub semantic: SemanticConfig,
     pub state: StateConfig,
     pub cognition: CognitionConfig,
+    pub promotion: PromotionConfig,
+}
+
+/// Which webhook events are additionally written as memories.
+///
+/// Webhooks land in the episodic store, which is SQL-queryable but invisible to `search_memory`.
+/// Promotion makes the durable outcomes — tickets handled, incidents resolved — recallable through
+/// the memory API. Off by default: it changes what a corpus contains, so it should be a decision.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PromotionConfig {
+    /// Write matching webhook events as memories in addition to episodic events.
+    pub enabled: bool,
+    /// `"<vendor>:<event_type>"` rules; either side may be `*`, and a trailing `*` on the event
+    /// type matches by prefix. Defaults to closes/merges/resolutions — see
+    /// [`crate::ingest::promote::default_rules`].
+    pub rules: Vec<String>,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules: crate::ingest::promote::default_rules(),
+        }
+    }
 }
 
 /// Configuration for the memory-cognition layer (dedup, contradiction resolution, importance).

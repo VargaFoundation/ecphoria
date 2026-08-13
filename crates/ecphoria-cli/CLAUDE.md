@@ -14,6 +14,8 @@ ecphoria query "SELECT ..."              # execute SQL
 ecphoria ingest --source X --file Y      # bulk ingest
 ecphoria export --entity ID              # GDPR data export (NDJSON)
 ecphoria export --to obsidian --path DIR # export memories → Obsidian markdown vault (round-trip)
+ecphoria import --from git --path REPO [--watch]      # repo Markdown → chunked docs; project = repo dir name (ECPHORIA_PROJECT)
+ecphoria import --from github --path owner/repo       # backfill closed issues + PRs (GITHUB_TOKEN)
 ecphoria import --from obsidian --path DIR [--watch]  # import vault; --watch = live human→agent sync
 ecphoria search "text" -k 5              # semantic search
 ecphoria shell                           # interactive SQL REPL
@@ -26,7 +28,7 @@ ecphoria retention enforce|list|set --source X --days N
 ecphoria audit [--since ISO] [--tenant T]
 ecphoria tenant delete|export|import --tenant T [--file F]
 ecphoria memory add "<fact>" [--subject S --user U --importance F]
-ecphoria memory search "<query>" [--user U -k N]
+ecphoria memory search "<query>" [--user U --project P -k N]   # --project narrows to one project
 ecphoria memory list [--user U --limit N --offset N --mem-type T --min-importance F --updated-after RFC3339 --updated-before RFC3339 --metadata-key K --metadata-value V]
 ecphoria memory get <id>|history <id>
 ecphoria memory update <id> [--content C --importance F --mem-type T --metadata '<json>']  # partial correction
@@ -38,7 +40,7 @@ ecphoria reindex                         # reindex unembedded events
 ecphoria rebalance --tenant T --target-shard N
 ```
 
-Global flags: `--url` (`ECPHORIA_URL`), `--token` (`ECPHORIA_TOKEN`, Bearer for admin routes).
+Global flags: `--url` (`ECPHORIA_URL`), `--token` (`ECPHORIA_TOKEN`, or `ECPHORIA_API_KEY`).
 
 ## Internal Architecture
 

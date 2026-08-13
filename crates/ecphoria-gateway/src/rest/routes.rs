@@ -172,6 +172,16 @@ pub fn router_with_engine_and_auth(
             axum::routing::post(handlers::memory_add).get(handlers::memory_list),
         )
         .route(
+            "/memories/batch",
+            axum::routing::post(handlers::memory_add_batch),
+        )
+        .route("/documents", axum::routing::post(handlers::document_ingest))
+        // Static segment must be registered alongside `/memories/{id}` — axum prefers the literal.
+        .route(
+            "/memories/history",
+            axum::routing::get(handlers::memory_history_by_subject),
+        )
+        .route(
             "/memories/search",
             axum::routing::post(handlers::memory_search),
         )
@@ -346,6 +356,28 @@ pub fn router_with_engine_and_auth(
     let tool_gateway = std::sync::Arc::new(crate::rest::tool_gateway::ToolGateway::new(
         config.tool_gateway_allow_private_networks,
     ));
+    // Repopulate the in-memory catalog from the durable copy, so a restart (or a follower that
+    // never served the original `POST /tools`) has the same tool surface as the node that
+    // registered them.
+    {
+        let gw = tool_gateway.clone();
+        let eng = engine.clone();
+        tokio::spawn(async move {
+            match eng.tool_server_list().await {
+                Ok(servers) if !servers.is_empty() => {
+                    let n = servers.len();
+                    for (name, url) in servers {
+                        if let Err(e) = gw.register(name.clone(), url) {
+                            tracing::warn!(error = %e, %name, "persisted tool server is invalid");
+                        }
+                    }
+                    tracing::info!(servers = n, "restored downstream MCP tool catalog");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "failed to restore tool catalog"),
+            }
+        });
+    }
     engine.set_tool_executor(tool_gateway.clone());
     api_routes = api_routes.layer(axum::Extension(tool_gateway));
 
@@ -394,25 +426,39 @@ pub fn router_with_engine_and_auth(
 
     app = app.nest("/api/v1", api_routes);
 
-    // MCP & LLM proxy (use engine state, resolved separately)
-    let mut protocol_routes = Router::new()
-        .route(
+    // MCP & LLM proxy (use engine state, resolved separately).
+    //
+    // Both are gated on their config flags. They were previously mounted unconditionally, so
+    // `mcp_enabled = false` / `llm_proxy_enabled = false` silently did nothing — an operator who
+    // turned the LLM proxy off to reduce attack surface still had it listening.
+    let mut protocol_routes = Router::new();
+    if config.mcp_enabled {
+        protocol_routes = protocol_routes.route(
             "/mcp",
             axum::routing::post(crate::mcp::transport::handle_mcp)
                 .get(crate::mcp::transport::handle_mcp_sse),
-        )
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(crate::llm_proxy::router::chat_completions),
-        )
-        .route(
-            "/v1/embeddings",
-            axum::routing::post(crate::llm_proxy::router::embeddings),
-        )
-        .route(
-            "/v1/messages",
-            axum::routing::post(crate::llm_proxy::router::messages),
-        )
+        );
+    } else {
+        tracing::info!("MCP server disabled (gateway.mcp_enabled = false)");
+    }
+    if config.llm_proxy_enabled {
+        protocol_routes = protocol_routes
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(crate::llm_proxy::router::chat_completions),
+            )
+            .route(
+                "/v1/embeddings",
+                axum::routing::post(crate::llm_proxy::router::embeddings),
+            )
+            .route(
+                "/v1/messages",
+                axum::routing::post(crate::llm_proxy::router::messages),
+            );
+    } else {
+        tracing::info!("LLM proxy disabled (gateway.llm_proxy_enabled = false)");
+    }
+    let mut protocol_routes = protocol_routes
         .with_state(engine)
         // Response-cache mode for the proxy (exact-match by default; similarity is opt-in).
         .layer(axum::Extension(

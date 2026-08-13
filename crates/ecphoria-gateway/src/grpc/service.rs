@@ -286,6 +286,8 @@ impl Ecphoria for EcphoriaGrpcService {
             source_event_ids: vec![],
             metadata: serde_json::json!({}),
             mem_type: None,
+            valid_from: None,
+            project: None,
         };
         let added = self
             .engine

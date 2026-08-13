@@ -255,13 +255,51 @@ pub async fn run_agent_endpoint(
         .as_ref()
         .and_then(|Extension(c)| c.tenant_id.clone())
         .unwrap_or_else(|| "default".into());
-    match engine
-        .run_agent(
-            &tenant,
-            &req.agent_id,
-            &req.question,
-            req.max_turns.unwrap_or(8),
+    let max_turns = req.max_turns.unwrap_or(8);
+
+    // Background mode: create the durable run record, hand the loop to a task, and answer at once.
+    //
+    // The synchronous form runs the whole LLM↔tool loop inside the request, under the app-wide 30 s
+    // timeout — so any real multi-turn run returns 504 to the caller while continuing to execute
+    // server-side, which looks like a failure and is not one. The run ledger already makes runs
+    // durable and resumable, so the honest shape is 202 + poll.
+    if req.background {
+        let run = match engine
+            .run_agent_start(&tenant, &req.agent_id, &req.question, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AGENT_ERROR",
+                    e.to_string(),
+                )
+            }
+        };
+        let id = run.id;
+        let engine_bg = engine.clone();
+        tokio::spawn(async move {
+            if let Err(e) = engine_bg.run_agent_drive(id, max_turns).await {
+                // The run is marked failed by the driver itself; log so an operator can see why
+                // without reading the trace.
+                tracing::warn!(error = %e, run_id = %id, "background agent run failed");
+            }
+        });
+        use axum::response::IntoResponse;
+        return (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "run": run,
+                "status_url": format!("/api/v1/runs/{id}"),
+                "trace_url": format!("/api/v1/runs/{id}/trace"),
+            })),
         )
+            .into_response();
+    }
+
+    match engine
+        .run_agent(&tenant, &req.agent_id, &req.question, max_turns)
         .await
     {
         Ok(run) => api_ok(serde_json::json!({ "run": run })),
@@ -274,14 +312,35 @@ pub async fn run_agent_endpoint(
 }
 
 /// Register a downstream MCP tool server (governed by the existing auth layer).
+///
+/// Written to the in-memory catalog *and* persisted, so the registration survives a restart and
+/// reaches every node in a cluster. Without the durable copy an agent's tool call succeeded or
+/// 404'd depending on which node happened to serve it.
 pub async fn register_tool(
+    State(engine): State<Arc<EcphoriaEngine>>,
     gateway: Option<Extension<std::sync::Arc<crate::rest::tool_gateway::ToolGateway>>>,
     Json(req): Json<RegisterToolServer>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "register_tool").increment(1);
     match gateway {
-        Some(Extension(gw)) => match gw.register(req.name.clone(), req.url) {
-            Ok(()) => api_ok(serde_json::json!({ "status": "registered", "name": req.name })),
+        Some(Extension(gw)) => match gw.register(req.name.clone(), req.url.clone()) {
+            Ok(()) => {
+                if let Err(e) = engine.tool_server_register(&req.name, &req.url).await {
+                    // The call path works from memory, so this is a durability failure, not a
+                    // request failure — surface it rather than pretending the write happened.
+                    tracing::warn!(error = %e, name = %req.name, "tool server registered in memory but not persisted");
+                    return api_ok(serde_json::json!({
+                        "status": "registered",
+                        "name": req.name,
+                        "persisted": false,
+                    }));
+                }
+                api_ok(serde_json::json!({
+                    "status": "registered",
+                    "name": req.name,
+                    "persisted": true,
+                }))
+            }
             Err(e) => api_error(StatusCode::BAD_REQUEST, "INVALID_TOOL_URL", e),
         },
         None => api_error(
@@ -427,14 +486,28 @@ pub async fn run_approve(
 }
 
 /// Register an event trigger (source/event_type `*` = any) → starts a run of `agent_id`.
+///
+/// Scoped to the caller's tenant: a trigger only ever fires on that tenant's events, and is only
+/// visible to it. The tenant comes from the authenticated token, never from the request body.
 pub async fn trigger_register(
     State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
     Json(req): Json<RegisterTriggerRequest>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "trigger_register")
         .increment(1);
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
     match engine
-        .trigger_register(&req.name, &req.source, &req.event_type, &req.agent_id)
+        .trigger_register(
+            &tenant,
+            &req.name,
+            &req.source,
+            &req.event_type,
+            &req.agent_id,
+        )
         .await
     {
         Ok(()) => api_ok(serde_json::json!({ "status": "registered", "name": req.name })),
@@ -446,10 +519,17 @@ pub async fn trigger_register(
     }
 }
 
-/// List the registered event triggers.
-pub async fn trigger_list(State(engine): State<Arc<EcphoriaEngine>>) -> Response {
+/// List the calling tenant's registered event triggers.
+pub async fn trigger_list(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "trigger_list").increment(1);
-    match engine.trigger_list().await {
+    let tenant = auth
+        .as_ref()
+        .and_then(|Extension(c)| c.tenant_id.clone())
+        .unwrap_or_else(|| "default".into());
+    match engine.trigger_list(&tenant).await {
         Ok(triggers) => api_ok(serde_json::json!({ "triggers": triggers })),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
