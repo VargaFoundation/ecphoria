@@ -4080,3 +4080,114 @@ async fn pruning_expires_documents_that_left_the_source() {
         .iter()
         .any(|m| m.subject.as_deref() == Some("docs/other.md#other > section")));
 }
+
+/// Search results must carry a signal a caller can judge them by.
+///
+/// The fused `score` is Reciprocal Rank Fusion: it encodes *position*, not match strength, so the
+/// top hit scores roughly the same whether it answered the question or merely shared a word.
+/// Driving a live session surfaced exactly that failure — five weakly-related documents came back
+/// at 0.028 against a real answer's 0.033, and nothing in the response distinguished "the corpus
+/// covers this" from "the corpus has nothing and these are the least-bad rows".
+#[tokio::test]
+async fn hits_report_the_per_arm_relevance_signals() {
+    // The index is built at the configured dimension, so a provider of a different width has its
+    // vectors rejected — the arm then silently never runs.
+    let mut config = inmem_config();
+    config.embedding.dimension = 8;
+    let mut engine = EcphoriaEngine::new(config).await.unwrap();
+    engine.embedding = Some(std::sync::Arc::new(ConstEmbedding { dim: 8 }));
+    let scope = MemoryScope::tenant("default");
+
+    engine
+        .memory_add(MemoryInput::new(
+            scope.clone(),
+            "The shard router rebuilds its ring after the lease expires.",
+        ))
+        .await
+        .unwrap();
+
+    let hits = engine
+        .memory_search("shard router ring lease", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let hit = &hits[0];
+
+    // Every embedding is the same unit vector here, so the vector arm matches at cosine 1.0.
+    let sim = hit
+        .similarity
+        .expect("vector arm matched — similarity must be reported");
+    assert!(
+        (0.0..=1.0).contains(&sim),
+        "similarity must be a cosine in [0,1], got {sim}"
+    );
+    assert!(
+        hit.lexical.is_some_and(|l| l > 0.0),
+        "the query's terms are in the memory — BM25 must be reported: {:?}",
+        hit.lexical
+    );
+    // And the ranking score stays what it was: rank-derived, not a relevance measure.
+    assert!(hit.score > 0.0);
+}
+
+/// Without an embedding provider there is no absolute relevance signal, and the API must say so
+/// rather than imply one.
+#[tokio::test]
+async fn similarity_is_absent_when_no_embeddings_are_configured() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    engine
+        .memory_add(MemoryInput::new(
+            scope.clone(),
+            "quorum leases for shard handoff",
+        ))
+        .await
+        .unwrap();
+
+    let hits = engine
+        .memory_search("quorum leases", &scope, 5)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].similarity.is_none(),
+        "there is no vector arm — reporting a similarity would invent one"
+    );
+    assert!(
+        hits[0].lexical.is_some(),
+        "the lexical arm still has a score"
+    );
+}
+
+/// The similarity floor filters on the vector arm without silently becoming vector-only search.
+#[tokio::test]
+async fn min_similarity_filters_without_dropping_lexical_only_hits() {
+    let mut config = inmem_config();
+    config.embedding.dimension = 8;
+    let mut engine = EcphoriaEngine::new(config).await.unwrap();
+    engine.embedding = Some(std::sync::Arc::new(ConstEmbedding { dim: 8 }));
+    let scope = MemoryScope::tenant("default");
+    engine
+        .memory_add(MemoryInput::new(
+            scope.clone(),
+            "quorum leases for shard handoff",
+        ))
+        .await
+        .unwrap();
+
+    // Every vector is identical here, so similarity is 1.0 — a floor below it keeps the hit…
+    assert_eq!(
+        engine
+            .memory_search_filtered("quorum leases", &scope, 5, None, Some(0.5))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // …and a floor above it drops the hit rather than silently ignoring the filter.
+    assert!(engine
+        .memory_search_filtered("quorum leases", &scope, 5, None, Some(1.5))
+        .await
+        .unwrap()
+        .is_empty());
+}

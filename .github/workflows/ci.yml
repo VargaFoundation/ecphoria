@@ -75,6 +75,25 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
 
+  retrieval:
+    name: Retrieval quality (KB eval)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      # The unit tests pin specific retrieval properties (recall survives corpus growth, a document
+      # sweep stays within its document). Nothing measured *overall* recall, so a ranking regression
+      # would have shipped silently. This runs the real eval against this repository's own
+      # documentation — offline, no embedding provider, no dataset download — and fails below a
+      # floor set under the measured BM25-only baseline of 90.3%: an alarm, not a target.
+      - run: cargo run --release -p ecphoria-core --example kb_eval
+        env:
+          KB_MIN_RECALL5: "85"
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+
   audit:
     name: Security audit (RUSTSEC advisories)
     runs-on: ubuntu-latest

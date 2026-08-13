@@ -198,7 +198,8 @@ pub fn list_tools() -> Vec<McpTool> {
                     "agent_id": {"type": "string"},
                     "session_id": {"type": "string"},
                     "k": {"type": "integer", "description": "Number of results (default 5)"},
-                    "project": {"type": "string", "description": "Restrict to one project. Omit to search every project at once, ranked together."}
+                    "project": {"type": "string", "description": "Restrict to one project. Omit to search every project at once, ranked together."},
+                    "min_similarity": {"type": "number", "description": "Optional floor on vector similarity. A weak separator: answered questions score around 0.70, unanswerable ones around 0.60, and the distributions overlap — prefer reading each result's `similarity` and content over relying on this."}
                 },
                 "required": ["query"]
             }),

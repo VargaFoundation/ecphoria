@@ -293,6 +293,53 @@ only how many ranked candidates are carried into scoring. Measured at 5 049 memo
 
 Wider is still better, so the default stands. (Debug build; latency inflated ~5×.)
 
+
+## Can a threshold tell "no answer" from "a weak answer"?
+
+An agent consuming search results needs to know when the corpus simply does not cover a question.
+The fused `score` cannot tell it: that score is Reciprocal Rank Fusion, so it encodes *position*,
+not match strength — the top hit scores about the same whether it answered the question or merely
+shared a word. Driving a live Claude Code session made the consequence concrete: five weakly-related
+documents came back at 0.028 against a real answer's 0.033.
+
+Every hit now carries the per-arm signals — `similarity` (vector cosine, comparable across queries)
+and `lexical` (BM25, comparable only within one query). The question is whether a floor on
+`similarity` separates the two cases. Measured on the reference corpus, comparing the 72 gold
+questions against 12 plausible engineering questions this repository genuinely does not discuss:
+
+| best top-5 similarity | p10 | p50 | p90 | n |
+|---|---|---|---|---|
+| question **is** answered | 0.630 | 0.703 | 0.785 | 70 |
+| question **not in corpus** | 0.563 | 0.601 | 0.661 | 12 |
+
+**They overlap.** A floor at 0.63 keeps ~90% of real answers but still admits about a quarter of the
+unanswerable ones; a floor at 0.66 cuts most of the noise and loses real answers with it. There is
+no clean cut.
+
+So `min_similarity` ships **opt-in with no default**. Shipping a default would state a confidence
+the measurement does not support — the kind of silent, plausible-looking failure this whole page
+exists to avoid. It is a coarse floor for callers who want one, and the tool description says as
+much so an agent does not over-trust it.
+
+What does work is the caller reading the results. In the live session, asked a question with no
+answer in the corpus, the agent said so plainly, explained *why* by citing what the corpus does
+contain, and correctly identified a `platform/docs/runbook.md` hit as an illustrative path from a
+code sample rather than a real runbook. Judgement over threshold.
+
+Similarity is available on 355 of 360 top-5 hits with an embedding provider configured, and on none
+without one — where there is no absolute relevance signal at all.
+
+## Regression gate
+
+`kb_eval` runs in CI (`.github/workflows/ci.yml`, job `retrieval`) against this repository's own
+documentation — offline, BM25-only, no dataset download — and fails the build when overall recall@5
+drops below `KB_MIN_RECALL5`. The floor is 85%, deliberately under the measured BM25-only baseline
+of 90.3%: an alarm for regressions, not a target to optimise against.
+
+The unit tests pin specific properties (recall survives corpus growth, a document sweep stays within
+its document, identifiers outrank prose). None of them measured *overall* recall, so a ranking
+regression would have shipped silently.
+
 ## Regression guards
 
 Three tests in `engine/tests.rs` pin the behaviour this page measures, so the ceiling cannot come

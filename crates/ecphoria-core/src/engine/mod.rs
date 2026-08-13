@@ -2583,10 +2583,23 @@ impl EcphoriaEngine {
             match row.memory.state {
                 MemoryState::Active => {
                     if let Some(emb) = &row.embedding {
-                        let _ = self
+                        // A rejected vector (usually `embedding.dimension` not matching the
+                        // provider's actual width) would otherwise leave the memory silently
+                        // absent from the vector arm — search degrades to BM25-only with nothing
+                        // anywhere saying why.
+                        if let Err(e) = self
                             .memory_index
                             .upsert(&scope_key, &row.memory.to_semantic_entry(emb.clone()))
-                            .await;
+                            .await
+                        {
+                            metrics::counter!("ecphoria_memory_vector_index_failures_total")
+                                .increment(1);
+                            tracing::warn!(
+                                error = %e, id = %row.memory.id, dim = emb.len(),
+                                "vector index upsert rejected — this memory is not searchable by \
+                                 vector; check embedding.dimension matches the provider"
+                            );
+                        }
                     }
                     lexical_upserts.push(crate::memory::lexical::LexicalEntry {
                         id: row.memory.id,
@@ -2908,10 +2921,23 @@ impl EcphoriaEngine {
             match row.memory.state {
                 MemoryState::Active => {
                     if let Some(emb) = &row.embedding {
-                        let _ = self
+                        // A rejected vector (usually `embedding.dimension` not matching the
+                        // provider's actual width) would otherwise leave the memory silently
+                        // absent from the vector arm — search degrades to BM25-only with nothing
+                        // anywhere saying why.
+                        if let Err(e) = self
                             .memory_index
                             .upsert(&scope_key, &row.memory.to_semantic_entry(emb.clone()))
-                            .await;
+                            .await
+                        {
+                            metrics::counter!("ecphoria_memory_vector_index_failures_total")
+                                .increment(1);
+                            tracing::warn!(
+                                error = %e, id = %row.memory.id, dim = emb.len(),
+                                "vector index upsert rejected — this memory is not searchable by \
+                                 vector; check embedding.dimension matches the provider"
+                            );
+                        }
                     }
                     // Lexical index is best-effort (like the vector index): a failure degrades
                     // recall until the next reindex, it must never fail the write.
@@ -2977,6 +3003,8 @@ impl EcphoriaEngine {
                     hits.push(MemoryHit {
                         memory: mem,
                         score: r.score,
+                        similarity: Some(r.score),
+                        lexical: None,
                     });
                 }
             }
@@ -3017,13 +3045,41 @@ impl EcphoriaEngine {
         k: usize,
         project: Option<&str>,
     ) -> Result<Vec<MemoryHit>> {
+        self.memory_search_filtered(query, scope, k, project, None)
+            .await
+    }
+
+    /// [`Self::memory_search_in_project`] with an optional floor on vector similarity.
+    ///
+    /// A caller often wants to know whether the corpus covers a question at all, and the fused
+    /// `score` cannot answer that — it is rank-derived. `min_similarity` is the closest available
+    /// proxy, and it is deliberately opt-in with no default because it is **a weak separator**:
+    /// measured on the reference corpus, questions the documentation answers score p10 0.63 /
+    /// p50 0.70, and questions it has nothing on score p10 0.56 / p50 0.60. Those overlap, so any
+    /// threshold trades real answers for filtered noise rather than cleanly separating the two.
+    ///
+    /// Shipping a default would state a confidence the data does not support. The reliable signal
+    /// remains the caller reading the returned `similarity` and content and judging.
+    pub async fn memory_search_filtered(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        k: usize,
+        project: Option<&str>,
+        min_similarity: Option<f32>,
+    ) -> Result<Vec<MemoryHit>> {
         use crate::memory::cognition::{lexical_rank, rrf_fuse_weighted};
 
         if query.trim().is_empty() || k == 0 {
             let mems = self.memory_store.list_active(scope, k.max(1)).await?;
             return Ok(mems
                 .into_iter()
-                .map(|memory| MemoryHit { memory, score: 0.0 })
+                .map(|memory| MemoryHit {
+                    memory,
+                    score: 0.0,
+                    similarity: None,
+                    lexical: None,
+                })
                 .collect());
         }
 
@@ -3092,14 +3148,23 @@ impl EcphoriaEngine {
                 .collect(),
             None => candidates,
         };
-        let lex_ids: Vec<uuid::Uuid> = lexical_rank(query, &candidates)
-            .into_iter()
-            .map(|(i, _)| candidates[i].id)
-            .collect();
+        // Keep the per-arm signals, not just the ordering: the fused score is rank-derived and
+        // says nothing about how well anything actually matched.
+        let ranked = lexical_rank(query, &candidates);
+        let mut lex_scores: std::collections::HashMap<uuid::Uuid, f32> =
+            std::collections::HashMap::with_capacity(ranked.len());
+        let mut lex_ids: Vec<uuid::Uuid> = Vec::with_capacity(ranked.len());
+        for (i, score) in ranked {
+            let id = candidates[i].id;
+            lex_scores.insert(id, score);
+            lex_ids.push(id);
+        }
         by_id.extend(candidates.into_iter().map(|m| (m.id, m)));
 
         // Vector ranking — best-effort, only when embeddings are configured.
         let mut vec_ids: Vec<uuid::Uuid> = Vec::new();
+        let mut vec_scores: std::collections::HashMap<uuid::Uuid, f32> =
+            std::collections::HashMap::new();
         if !self.memory_index.is_empty() {
             let embedded = self.embed_text(query).await;
             if let Err(e) = &embedded {
@@ -3123,6 +3188,9 @@ impl EcphoriaEngine {
                             continue;
                         }
                         vec_ids.push(h.memory.id);
+                        if let Some(sim) = h.similarity {
+                            vec_scores.insert(h.memory.id, sim);
+                        }
                         by_id.entry(h.memory.id).or_insert(h.memory);
                     }
                 }
@@ -3189,7 +3257,12 @@ impl EcphoriaEngine {
             return Ok(mems
                 .into_iter()
                 .filter(|m| project.is_none() || m.project.as_deref() == project)
-                .map(|memory| MemoryHit { memory, score: 0.0 })
+                .map(|memory| MemoryHit {
+                    memory,
+                    score: 0.0,
+                    similarity: None,
+                    lexical: None,
+                })
                 .collect());
         }
 
@@ -3214,7 +3287,19 @@ impl EcphoriaEngine {
             let age_days = (now - memory.updated_at).num_seconds().max(0) as f32 / 86_400.0;
             let recency = 0.5_f32.powf(age_days / 30.0);
             let score = rrf * (1.0 + w_imp * memory.importance + w_rec * recency);
-            scored.push(MemoryHit { memory, score });
+            let similarity = vec_scores.get(&memory.id).copied();
+            let lexical = lex_scores.get(&memory.id).copied();
+            scored.push(MemoryHit {
+                memory,
+                score,
+                similarity,
+                lexical,
+            });
+        }
+        if let Some(floor) = min_similarity {
+            // A hit with no similarity was matched lexically only (or there is no vector arm at
+            // all); dropping it would silently turn the filter into "vector-only search".
+            scored.retain(|h| h.similarity.is_none_or(|s| s >= floor));
         }
         scored.sort_by(|a, b| {
             b.score

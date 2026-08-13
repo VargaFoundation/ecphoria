@@ -516,8 +516,18 @@ async fn call_tool(
                 .ok_or("missing 'query' parameter")?;
             let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let project = args.get("project").and_then(|v| v.as_str());
+            let min_similarity = args
+                .get("min_similarity")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32);
             engine
-                .memory_search_in_project(query, &scoped_for(args, tenant), k, project)
+                .memory_search_filtered(
+                    query,
+                    &scoped_for(args, tenant),
+                    k,
+                    project,
+                    min_similarity,
+                )
                 .await
                 .map(|hits| serde_json::json!({"results": hits, "count": hits.len()}))
                 .map_err(|e| e.to_string())

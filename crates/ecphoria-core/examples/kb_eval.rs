@@ -28,6 +28,11 @@
 //! capped candidate window (`memory.cognition.retrieval_scan_cap`) falls off a cliff as soon as
 //! N exceeds the cap.
 //!
+//! **CI gate.** `KB_MIN_RECALL5=<pct>` makes the harness exit non-zero when overall recall@5 falls
+//! below it, so a retrieval regression fails the build instead of shipping silently. The floor is
+//! deliberately set below the measured BM25-only baseline, not at it: this is a regression alarm,
+//! not a target to optimise against.
+//!
 //! Env: `KB_ROOT` (corpus root, default = workspace root), `KB_PAD` (filler count, default 0),
 //! `KB_K` (retrieval depth, default 10), plus the `ECPHORIA_EMBEDDING__*` / `ECPHORIA_RERANK__*` /
 //! `ECPHORIA_COGNITION__*` overrides shared with `locomo_eval`.
@@ -448,6 +453,28 @@ const GOLD: &[Question] = &[
     },
 ];
 
+/// Questions this corpus genuinely cannot answer.
+///
+/// The gold set only contains questions the documentation *does* cover, so it can measure ranking
+/// but says nothing about the case that matters for an agent: the corpus has no answer and the
+/// caller has to be told. These are plausible engineering questions about subjects this repository
+/// simply does not discuss — the comparison that decides whether a relevance threshold can separate
+/// "answered" from "nothing here".
+const OUT_OF_CORPUS: &[&str] = &[
+    "what is our policy for rotating S3 bucket encryption keys",
+    "which team owns the payroll integration",
+    "how do we handle GDPR data subject access requests from EU customers",
+    "what is the SLA for the mobile push notification service",
+    "how is the Kafka consumer group rebalance timeout configured",
+    "who approves changes to the Terraform production workspace",
+    "what is the on-call escalation path for the billing team",
+    "how do we rotate the Datadog API keys",
+    "what is the retention policy for CCTV footage in the London office",
+    "which vendor provides our SOC 2 audit",
+    "how do we provision laptops for new starters",
+    "what is the maximum photo upload size in the mobile app",
+];
+
 /// Walk `root` for tracked-looking Markdown, skipping build output and vendored trees.
 fn collect_docs(root: &Path) -> Vec<(String, String)> {
     const SKIP: &[&str] = &["target", "node_modules", ".git", "data", ".cargo"];
@@ -852,6 +879,14 @@ async fn run() {
     // Characters a caller would have to paste into a prompt to use the top-5. Document-identity
     // recall says nothing about this, and it is the main thing chunking buys.
     let mut ctx_chars: Vec<f64> = Vec::new();
+    // Top-hit vector similarity, split by whether the gold document was actually found. If the two
+    // distributions overlap, no threshold can separate "answered" from "nothing here" and the
+    // caller has no way to tell them apart.
+    let mut sim_hit: Vec<f64> = Vec::new();
+    let mut sim_miss: Vec<f64> = Vec::new();
+    // (hits carrying a similarity, hits total) — if the vector arm rarely covers the top results,
+    // a similarity threshold cannot be the primary guard.
+    let mut sim_coverage: (usize, usize) = (0, 0);
     for question in GOLD {
         let start = std::time::Instant::now();
         let hits = engine
@@ -875,6 +910,28 @@ async fn run() {
                     .is_some_and(|s| s.to_lowercase().contains(&gold))
             })
             .map(|i| i + 1);
+
+        // How usable is the vector similarity as a "does the corpus cover this" signal? Two things
+        // decide that: how often a top result carries one at all, and whether the answered and
+        // not-found distributions are separable. If they overlap, no threshold can tell them apart.
+        sim_coverage.0 += hits
+            .iter()
+            .take(5)
+            .filter(|h| h.similarity.is_some())
+            .count();
+        sim_coverage.1 += hits.iter().take(5).count();
+        if let Some(best) = hits
+            .iter()
+            .take(5)
+            .filter_map(|h| h.similarity)
+            .fold(None, |a: Option<f32>, s| Some(a.map_or(s, |m| m.max(s))))
+        {
+            if matches!(rank, Some(r) if r <= 5) {
+                sim_hit.push(best as f64);
+            } else {
+                sim_miss.push(best as f64);
+            }
+        }
         if rank.is_none() {
             misses.push(Miss {
                 question: question.q,
@@ -951,6 +1008,41 @@ async fn run() {
         "context top-5:    {:.0} chars median (what you would paste into a prompt)",
         pct_of(&mut ctx_chars, 0.50)
     );
+    println!(
+        "similarity coverage: {}/{} of top-5 hits carry one",
+        sim_coverage.0, sim_coverage.1
+    );
+    // The comparison that decides whether a threshold is usable at all.
+    let mut sim_absent: Vec<f64> = Vec::new();
+    for q in OUT_OF_CORPUS {
+        if let Ok(hits) = engine.memory_search(q, &scope, k).await {
+            if let Some(best) = hits
+                .iter()
+                .take(5)
+                .filter_map(|h| h.similarity)
+                .fold(None, |a: Option<f32>, s| Some(a.map_or(s, |m| m.max(s))))
+            {
+                sim_absent.push(best as f64);
+            }
+        }
+    }
+    if !sim_hit.is_empty() || !sim_miss.is_empty() {
+        let stat = |v: &mut Vec<f64>| {
+            if v.is_empty() {
+                return "n/a".to_string();
+            }
+            format!(
+                "p10={:.3} p50={:.3} p90={:.3} (n={})",
+                pct_of(v, 0.10),
+                pct_of(v, 0.50),
+                pct_of(v, 0.90),
+                v.len()
+            )
+        };
+        println!("best similarity, answered:     {}", stat(&mut sim_hit));
+        println!("best similarity, not found:    {}", stat(&mut sim_miss));
+        println!("best similarity, NOT IN CORPUS:{}", stat(&mut sim_absent));
+    }
     let provider = engine.config().embedding.provider.as_str();
     println!(
         "mode:             {}",
@@ -969,6 +1061,26 @@ async fn run() {
             docs.len() + pad - scan_cap
         );
     }
+    // Machine-checkable gate for CI.
+    let recall5 = 100.0
+        * records
+            .iter()
+            .filter(|r| matches!(r.rank, Some(x) if x <= 5))
+            .count() as f64
+        / records.len().max(1) as f64;
+    if let Some(floor) = std::env::var("KB_MIN_RECALL5")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        if recall5 + 1e-9 < floor {
+            eprintln!(
+                "\nFAIL: recall@5 {recall5:.1}% is below the floor of {floor:.1}% — retrieval regressed"
+            );
+            std::process::exit(1);
+        }
+        println!("\ngate: recall@5 {recall5:.1}% >= floor {floor:.1}% — OK");
+    }
+
     if !misses.is_empty() {
         println!("\nmisses ({}) — what came back instead:", misses.len());
         for m in &misses {

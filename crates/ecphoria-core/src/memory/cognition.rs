@@ -466,7 +466,23 @@ pub struct MemoryScopeCount {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryHit {
     pub memory: Memory,
+    /// Ranking score. **Not a relevance measure** — it is derived from Reciprocal Rank Fusion, so
+    /// it encodes *position*, not match strength: the top hit scores roughly the same whether it
+    /// answered the question or merely shared a word. Use it to order results, never to judge them.
     pub score: f32,
+    /// Cosine similarity from the vector arm, in `[0, 1]`, when this memory was among the k-NN
+    /// results. Comparable across queries, so this is the signal that distinguishes "the corpus
+    /// covers this" from "the corpus has nothing and these are the least-bad rows".
+    ///
+    /// `None` means the memory was found lexically only, or that no embedding provider is
+    /// configured — in which case there is no absolute relevance signal at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
+    /// BM25 score from the lexical arm. Meaningful *within* one query (a hit at half the top
+    /// score matched half as well) but not across queries, since it depends on the corpus's term
+    /// statistics and the document lengths involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<f32>,
 }
 
 /// A cross-scope read grant: within a tenant, `grantee_user_id` may also read

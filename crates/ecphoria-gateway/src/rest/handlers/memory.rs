@@ -342,7 +342,13 @@ pub async fn memory_search(
         engine.memory_search_shared(&req.query, &scope, req.k).await
     } else {
         engine
-            .memory_search_in_project(&req.query, &scope, req.k, req.project.as_deref())
+            .memory_search_filtered(
+                &req.query,
+                &scope,
+                req.k,
+                req.project.as_deref(),
+                req.min_similarity,
+            )
             .await
     };
     match result {

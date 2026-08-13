@@ -481,6 +481,12 @@ pub struct MemorySearchRequest {
     /// Restrict to one project. Omit to search every project in the scope, fused together.
     #[serde(default)]
     pub project: Option<String>,
+    /// Drop hits whose vector similarity is below this. **Opt-in and a weak separator** — measured
+    /// on the reference corpus, answered questions score p10=0.63/p50=0.70 and questions the corpus
+    /// cannot answer score p10=0.56/p50=0.60, so the distributions overlap. Useful as a coarse
+    /// floor; not a reliable "the corpus has no answer" test. Ignored without an embedding provider.
+    #[serde(default)]
+    pub min_similarity: Option<f32>,
 }
 
 /// Grant a user read access to another user's memories (within the token's tenant).
