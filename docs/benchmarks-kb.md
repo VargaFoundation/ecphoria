@@ -329,6 +329,58 @@ code sample rather than a real runbook. Judgement over threshold.
 Similarity is available on 355 of 360 top-5 hits with an embedding provider configured, and on none
 without one — where there is no absolute relevance signal at all.
 
+
+## Measuring against real questions
+
+The eval set on this page is hand-written by the people who wrote the corpus. It is a good
+regression alarm and weak evidence that a *team's* questions get answered. Turn on the query log and
+after a few weeks you can replace it with the real thing:
+
+```toml
+[memory.query_log]
+enabled       = true
+include_query = true   # false keeps the shape without storing what was typed
+```
+
+Each search becomes an episodic event under source `ecphoria/query-log`, written from a bounded
+queue by a background task — a search pays a `try_send`, not a database insert, and records are
+dropped and counted rather than ever applying backpressure.
+
+```sql
+-- The questions worth acting on: asked, and the corpus had nothing.
+SELECT payload->>'query' AS question, count(*) AS asked
+FROM episodic
+WHERE event_type = 'memory.search' AND NOT (payload->>'matched')::BOOLEAN
+GROUP BY 1 ORDER BY 2 DESC LIMIT 50;
+
+-- Coverage over time: what fraction of searches actually matched something.
+SELECT date_trunc('day', ts) AS day,
+       count(*) AS searches,
+       round(100.0 * count(*) FILTER (WHERE (payload->>'matched')::BOOLEAN) / count(*), 1) AS matched_pct
+FROM episodic WHERE event_type = 'memory.search'
+GROUP BY 1 ORDER BY 1;
+
+-- Which projects answer well, and which are thin.
+SELECT payload->>'project' AS project,
+       count(*) AS searches,
+       round(avg((payload->>'top_similarity')::DOUBLE), 3) AS avg_top_similarity
+FROM episodic WHERE event_type = 'memory.search' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+Set a retention policy so the log does not outgrow the corpus it measures:
+`ecphoria retention set --source ecphoria/query-log --days 90`.
+
+### `matched` is not `results > 0`
+
+**A search never returns empty.** When neither the lexical nor the vector arm produces anything, it
+falls back to the most important and most recent memories in scope — so an unanswerable question
+comes back with a full page of plausible-looking documents. Those hits are distinguishable
+(`score` 0, no `similarity`, no `lexical`), but only if you look.
+
+That is why the log keys "the corpus had no answer" on `matched` rather than on the row count, and
+why the honest advice to an agent is to read the returned content rather than trust that rows came
+back. It is also worth knowing when you write your own client.
+
 ## Regression gate
 
 `kb_eval` runs in CI (`.github/workflows/ci.yml`, job `retrieval`) against this repository's own

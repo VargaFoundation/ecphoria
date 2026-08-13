@@ -13,6 +13,7 @@ use crate::memory::cognition::{
 };
 use crate::memory::episodic::{EpisodicStore, Event};
 use crate::memory::lexical::LexicalIndex;
+use crate::memory::query_log::{QueryLogger, QueryRecord};
 use crate::memory::semantic::{ScopedVectorIndex, SearchResult, SemanticEntry, SemanticStore};
 use crate::memory::state::StateStore;
 use crate::query::{QueryExecutor, QueryPlanner};
@@ -140,6 +141,9 @@ pub struct EcphoriaEngine {
     /// Inverted (FTS5) index over memories — the lexical arm of hybrid retrieval. Advisory: it
     /// yields candidate ids that are re-read from `memory_store` under the active/scope filter.
     lexical_index: Arc<LexicalIndex>,
+    /// Records searches so retrieval quality can be measured against real questions rather than
+    /// hand-written ones. `None` unless `memory.query_log.enabled`.
+    query_log: Option<QueryLogger>,
     /// Per-modality vector indexes (mixed-dimension multi-modal embeddings).
     modal: crate::memory::semantic::MultiModalStore,
     ingest: IngestPipeline,
@@ -271,6 +275,16 @@ impl EcphoriaEngine {
         if let Err(e) = Self::rebuild_lexical_index(&memory_store, &lexical_index).await {
             tracing::warn!(error = %e, "failed to rebuild lexical index");
         }
+
+        // Search telemetry. Off unless configured: a query is text a human typed.
+        let query_log = config.memory.query_log.enabled.then(|| {
+            tracing::info!(
+                include_query = config.memory.query_log.include_query,
+                "query log enabled — searches are recorded under source '{}'",
+                crate::memory::query_log::QUERY_LOG_SOURCE
+            );
+            QueryLogger::spawn(episodic.clone(), config.memory.query_log.include_query)
+        });
 
         // Initialize embedding provider from config
         let embedding: Option<Arc<dyn EmbeddingProvider>> = match config.embedding.provider.as_str()
@@ -521,6 +535,7 @@ impl EcphoriaEngine {
             memory_store,
             memory_index,
             lexical_index,
+            query_log,
             modal: crate::memory::semantic::MultiModalStore::new(),
             ingest,
             completion,
@@ -3068,19 +3083,62 @@ impl EcphoriaEngine {
         project: Option<&str>,
         min_similarity: Option<f32>,
     ) -> Result<Vec<MemoryHit>> {
+        let started = std::time::Instant::now();
+        let outcome = self
+            .memory_search_inner(query, scope, k, project, min_similarity)
+            .await;
+        if let (Some(log), Ok((hits, matched))) = (&self.query_log, &outcome) {
+            let top = hits.first();
+            log.record(QueryRecord {
+                tenant_id: if scope.tenant_id.is_empty() {
+                    "default".into()
+                } else {
+                    scope.tenant_id.clone()
+                },
+                user_id: scope.user_id.clone(),
+                agent_id: scope.agent_id.clone(),
+                project: project.map(str::to_string),
+                query: Some(query.to_string()),
+                k,
+                results: hits.len(),
+                // "Nothing matched" is the fact worth recording, and it is not the same as "zero
+                // rows": with no lexical or vector hit the search still returns the most
+                // important/recent memories, so an unanswerable question comes back full.
+                matched: *matched,
+                top_subject: top.and_then(|h| h.memory.subject.clone()),
+                top_similarity: top.and_then(|h| h.similarity),
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        outcome.map(|(hits, _)| hits)
+    }
+
+    /// Returns `(hits, matched)`. `matched` is false when neither the lexical nor the vector arm
+    /// produced anything and the results are the importance/recency fallback — which is the
+    /// difference between "here is your answer" and "here is something".
+    async fn memory_search_inner(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        k: usize,
+        project: Option<&str>,
+        min_similarity: Option<f32>,
+    ) -> Result<(Vec<MemoryHit>, bool)> {
         use crate::memory::cognition::{lexical_rank, rrf_fuse_weighted};
 
         if query.trim().is_empty() || k == 0 {
             let mems = self.memory_store.list_active(scope, k.max(1)).await?;
-            return Ok(mems
-                .into_iter()
-                .map(|memory| MemoryHit {
-                    memory,
-                    score: 0.0,
-                    similarity: None,
-                    lexical: None,
-                })
-                .collect());
+            return Ok((
+                mems.into_iter()
+                    .map(|memory| MemoryHit {
+                        memory,
+                        score: 0.0,
+                        similarity: None,
+                        lexical: None,
+                    })
+                    .collect::<Vec<_>>(),
+                false,
+            ));
         }
 
         // Retrieval widths (configurable; read-path only). `scan_cap` is the candidate universe for
@@ -3254,16 +3312,18 @@ impl EcphoriaEngine {
         // Nothing matched lexically or by vector → fall back to importance/recency.
         if rankings.is_empty() {
             let mems = self.memory_store.list_active(scope, k).await?;
-            return Ok(mems
-                .into_iter()
-                .filter(|m| project.is_none() || m.project.as_deref() == project)
-                .map(|memory| MemoryHit {
-                    memory,
-                    score: 0.0,
-                    similarity: None,
-                    lexical: None,
-                })
-                .collect());
+            return Ok((
+                mems.into_iter()
+                    .filter(|m| project.is_none() || m.project.as_deref() == project)
+                    .map(|memory| MemoryHit {
+                        memory,
+                        score: 0.0,
+                        similarity: None,
+                        lexical: None,
+                    })
+                    .collect::<Vec<_>>(),
+                false,
+            ));
         }
 
         // Over-fetch, then re-rank by relevance blended with importance + recency, so a recent or
@@ -3340,7 +3400,7 @@ impl EcphoriaEngine {
         }
 
         scored.truncate(k);
-        Ok(scored)
+        Ok((scored, true))
     }
 
     // ── Cross-scope sharing (grants) ─────────────────────────────────

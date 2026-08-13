@@ -4191,3 +4191,97 @@ async fn min_similarity_filters_without_dropping_lexical_only_hits() {
         .unwrap()
         .is_empty());
 }
+
+/// Searches are recorded when the log is enabled — including the ones that found nothing.
+///
+/// The reference eval is hand-written by the people who wrote the corpus: useful as a regression
+/// alarm, weak as evidence that a *team's* questions get answered. Without this, a month of use
+/// produces anecdotes rather than a dataset, and the questions that came up empty — the ones worth
+/// acting on — leave no trace at all.
+#[tokio::test]
+async fn searches_are_recorded_when_enabled() {
+    let mut config = inmem_config();
+    config.memory.query_log.enabled = true;
+    let engine = EcphoriaEngine::new(config).await.unwrap();
+    let scope = MemoryScope::tenant("acme");
+
+    engine
+        .memory_add(
+            MemoryInput::new(scope.clone(), "quorum leases for shard handoff")
+                .with_project("platform"),
+        )
+        .await
+        .unwrap();
+    engine
+        .memory_search_in_project("quorum leases", &scope, 5, Some("platform"))
+        .await
+        .unwrap();
+    engine
+        .memory_search("our S3 key rotation policy", &scope, 5)
+        .await
+        .unwrap();
+
+    // The writer batches on a window; poll rather than sleep a fixed amount.
+    let mut events = Vec::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        events = engine
+            .query_by_source(crate::memory::query_log::QUERY_LOG_SOURCE, 100)
+            .await
+            .unwrap_or_default();
+        if events.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(events.len(), 2, "both searches should be recorded");
+
+    let by_query = |q: &str| {
+        events
+            .iter()
+            .find(|e| e.payload.get("query").and_then(|v| v.as_str()) == Some(q))
+            .unwrap_or_else(|| panic!("no record for {q:?}"))
+            .payload
+            .clone()
+    };
+
+    let answered = by_query("quorum leases");
+    assert_eq!(answered["empty"], false);
+    assert_eq!(answered["results"], 1);
+    assert_eq!(answered["project"], "platform");
+    assert_eq!(answered["_tenant_id"], "acme");
+
+    // The record that matters: a question the corpus could not answer. Note that it still came
+    // back with a row — with no lexical or vector match the search falls back to the most
+    // important/recent memories, so `results` alone would have read as a successful answer. That
+    // is precisely why the log keys on `matched`.
+    let unanswered = by_query("our S3 key rotation policy");
+    assert_eq!(unanswered["matched"], false, "no arm matched this question");
+    assert_eq!(unanswered["empty"], true);
+    assert_eq!(
+        unanswered["results"], 1,
+        "the fallback returns rows even when nothing matched — the trap this field exposes"
+    );
+    assert_eq!(answered["matched"], true);
+}
+
+/// Nothing is recorded unless the operator turned it on.
+#[tokio::test]
+async fn searches_are_not_recorded_by_default() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let scope = MemoryScope::tenant("default");
+    engine
+        .memory_add(MemoryInput::new(scope.clone(), "a fact"))
+        .await
+        .unwrap();
+    engine.memory_search("a fact", &scope, 5).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        engine
+            .query_by_source(crate::memory::query_log::QUERY_LOG_SOURCE, 10)
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "queries were recorded without being enabled"
+    );
+}

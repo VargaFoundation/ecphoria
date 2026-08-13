@@ -101,6 +101,31 @@ pub struct MemoryConfig {
     pub state: StateConfig,
     pub cognition: CognitionConfig,
     pub promotion: PromotionConfig,
+    pub query_log: QueryLogConfig,
+}
+
+/// Recording of searches, so retrieval quality can be measured against real questions.
+///
+/// Off by default: a query is text a human typed, and on a shared server recording it is a decision
+/// a team should make deliberately rather than discover. See [`crate::memory::query_log`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QueryLogConfig {
+    /// Record each `memory_search` as an episodic event under `ecphoria/query-log`.
+    pub enabled: bool,
+    /// Include the query text. With this off the shape is still recorded — result counts,
+    /// similarity, latency, whether anything matched — which answers "how often do we come up
+    /// empty" without storing what was asked.
+    pub include_query: bool,
+}
+
+impl Default for QueryLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_query: true,
+        }
+    }
 }
 
 /// Which webhook events are additionally written as memories.

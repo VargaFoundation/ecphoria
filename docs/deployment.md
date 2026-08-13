@@ -324,6 +324,21 @@ Promoted memories use a deterministic subject (`acme/api#pr-42`), so provider re
 as `Confirmed` rather than a duplicate, and a ticket that reopens and closes again supersedes
 itself into a history. See `docs/knowledge-base.md`.
 
+### Memory — query log
+
+Records each search as an episodic event so retrieval quality can be measured against real
+questions instead of hand-written ones. Off by default: a query is text a human typed, and on a
+shared server recording it should be a deliberate decision.
+
+| Setting | Env Var | Default | Description |
+|---------|---------|---------|-------------|
+| `memory.query_log.enabled` | `ECPHORIA_MEMORY__QUERY_LOG__ENABLED` | `false` | Record searches under source `ecphoria/query-log` |
+| `memory.query_log.include_query` | `ECPHORIA_MEMORY__QUERY_LOG__INCLUDE_QUERY` | `true` | Include the query text. With this off the shape is still recorded (result counts, similarity, latency, whether anything matched) |
+
+Records go through a bounded queue drained in batches, so a search pays a `try_send` rather than a
+row insert; on overload records are dropped and counted (`ecphoria_query_log_dropped_total`) rather
+than slowing the search. See `docs/benchmarks-kb.md` for the queries worth running against it.
+
 ### Embedding
 
 | Setting | Env Var | Default | Description |
