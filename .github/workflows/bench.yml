@@ -45,14 +45,21 @@ jobs:
           fi
 
       - name: Run benchmarks
-        # `pipefail` is the point: without it the exit status is `tee`'s, so a `cargo bench` that
-        # never compiled leaves an empty `bench-output.txt` and a green step — the failure then
-        # surfaces two steps later as "No benchmark result was found", pointing at the wrong
-        # thing entirely.
+        # Two things this line got wrong, one hiding the other.
+        #
+        # `--bench engine` rather than the whole package: `--output-format bencher` goes to every
+        # bench target of the crate, and the `--lib` target runs under libtest, which rejects the
+        # flag outright (`error: Unrecognized option: 'output-format'`). Only `benches/engine.rs`
+        # is `harness = false`. This job has therefore never produced a measurement.
+        #
+        # `pipefail` is why that is visible at all: without it the exit status is `tee`'s, so a
+        # `cargo bench` that never ran leaves an empty `bench-output.txt` and a green step, and
+        # the failure surfaces two steps later as "No benchmark result was found" — which reads
+        # like a problem with the comparison rather than with the command above it.
         shell: bash
         run: |
           set -o pipefail
-          cargo bench -p ecphoria-core -- --output-format bencher | tee bench-output.txt
+          cargo bench -p ecphoria-core --bench engine -- --output-format bencher | tee bench-output.txt
 
       - name: Download previous benchmark results
         uses: actions/cache@v4
