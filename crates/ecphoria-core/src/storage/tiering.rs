@@ -107,10 +107,16 @@ impl TieringManager {
             if should_backup {
                 tracing::info!("starting automatic S3 backup");
                 match engine.backup_to_s3().await {
-                    Ok(()) => {
+                    Ok(summary) => {
                         self.last_backup = Some(std::time::Instant::now());
                         metrics::counter!("ecphoria_backup_s3_total").increment(1);
-                        tracing::info!("automatic S3 backup completed");
+                        metrics::gauge!("ecphoria_backup_s3_bytes").set(summary.bytes as f64);
+                        tracing::info!(
+                            prefix = %summary.prefix,
+                            files = summary.files,
+                            bytes = summary.bytes,
+                            "automatic S3 backup completed"
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "automatic S3 backup failed");

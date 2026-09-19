@@ -26,6 +26,17 @@ config:
   storage:
     dataDir: /data
     engine: local
+    # -- Object storage: the backup target, and the blob store when `engine: s3`. Leave `bucket`
+    # empty to disable both. Credentials come from a Secret you create, or — better where it exists
+    # — from the pod's ambient identity (IRSA / Workload Identity / instance profile), in which case
+    # leave `existingSecret` empty and there is no key to rotate or leak.
+    s3:
+      bucket: ""
+      region: us-east-1
+      endpoint: ""            # e.g. http://minio.storage:9000 for MinIO; empty = AWS
+      existingSecret: ""      # Secret holding the credentials
+      accessKeyKey: access-key
+      secretKeyKey: secret-key
   memory:
     episodic:
       dbPath: /data/episodic.duckdb
@@ -75,6 +86,15 @@ config:
     # PG-wire TLS (encrypts the password = API key in transit) needs cert+key FILES mounted into the
     # pod. Create a Secret (keys tls.crt/tls.key) and mount it, then set in ecphoria.toml or via
     # a values override with an extra volume — not wired here to avoid shipping a half-configured mount.
+  backup:
+    # Where backups land inside the bucket.
+    s3Prefix: "backups/"
+    # Local backups kept under <dataDir>/backups (0 = keep all). The prune runs after each backup.
+    maxBackups: 7
+    # In-process timer. Off by default — prefer `backup.cronjob` below, which has a result an
+    # operator can alert on.
+    autoEnabled: false
+    intervalHours: 24
   cluster:
     enabled: true
     # nodeId is auto-assigned from StatefulSet ordinal
@@ -88,6 +108,39 @@ config:
     # Used by `openai` and `openai_compatible`. Pointing this at a gateway keeps one place where
     # model access is priced and rate-limited.
     openaiBaseUrl: "https://api.openai.com/v1"
+
+# -- Backups. `config.storage.s3.bucket` must be set for anything to leave the cluster.
+#
+# Two ways to schedule one, and the CronJob is the better one: a Kubernetes job has a result, a
+# history, and an alert when it fails, where an in-process timer has a log line. `autoEnabled` is
+# kept for deployments without a CronJob controller.
+backup:
+  cronjob:
+    enabled: false
+    schedule: "0 2 * * *"
+    # `s3` captures a backup and ships it to the bucket, verifying the manifest landed. `local`
+    # writes under <dataDir>/backups/ on whichever node answers — useful only with a PVC you snapshot.
+    target: s3
+    # The admin API key the job authenticates with, from a Secret you create. Required when
+    # `config.gateway.authEnabled` (the default).
+    apiKeySecret: ""
+    apiKeySecretKey: api-key
+    # Kubernetes keeps the last N job records; keep enough to see a pattern of failures.
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    # Never run two backups at once: they would stage the same stores concurrently.
+    concurrencyPolicy: Forbid
+    # A job that has not started within this window is skipped rather than piling up after an outage.
+    startingDeadlineSeconds: 600
+    backoffLimit: 2
+    activeDeadlineSeconds: 3600
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
 
 # -- Service configuration
 service:
@@ -138,6 +191,11 @@ persistence:
   accessModes:
     - ReadWriteOnce
 
+# -- Writable /tmp (emptyDir) — required with `securityContext.readOnlyRootFilesystem`, which is on
+# by default. A backup stages here before it is uploaded, so size it above one backup's footprint.
+tmpVolume:
+  sizeLimit: 1Gi
+
 # -- Resource requests and limits
 resources:
   requests:
@@ -165,7 +223,9 @@ securityContext:
   capabilities:
     drop:
       - ALL
-  readOnlyRootFilesystem: false
+  # On by default: every write the server makes goes to the PVC (/data) or to the /tmp emptyDir
+  # (backup staging). Turn it off only if you mount something that writes elsewhere.
+  readOnlyRootFilesystem: true
 
 # -- Liveness and readiness probes
 probes:
@@ -211,6 +271,20 @@ networkPolicy:
   # httpFrom:
   #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
   httpFrom: []
+  # -- Egress. Opt-in, and **default-deny once on**: DNS and peer traffic are always allowed, and
+  # anything else must be named here. Get this wrong and the symptom is an embedding provider that
+  # times out or a backup that never lands, so turn it on deliberately and list what you use.
+  #
+  # egress:
+  #   enabled: true
+  #   to:
+  #     - to: [{ podSelector: { matchLabels: { app: ollama } } }]
+  #       ports: [{ protocol: TCP, port: 11434 }]
+  #     - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: [169.254.169.254/32] } }]  # S3 over HTTPS
+  #       ports: [{ protocol: TCP, port: 443 }]
+  egress:
+    enabled: false
+    to: []
 
 # -- Node affinity / tolerations
 nodeSelector: {}

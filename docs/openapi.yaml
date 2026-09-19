@@ -506,7 +506,22 @@ paths:
   /api/v1/admin/backup:
     post:
       summary: Trigger a full backup (admin)
-      responses: { '200': { description: Backup path } }
+      description: >
+        `target=local` (the default) writes under `<data_dir>/backups/<timestamp>/` and prunes to
+        `backup.max_backups`. `target=s3` additionally uploads it under `backup.s3_prefix`, writing
+        `manifest.json` LAST — it is the commit record, so a half-written backup has none — then
+        re-reads it and checks every object landed. See docs/backup-restore.md.
+      parameters:
+        - name: target
+          in: query
+          schema: { type: string, enum: [local, s3], default: local }
+      responses:
+        '200':
+          description: >
+            local → { status, path, timestamp, pruned }; s3 → { prefix, timestamp, files, bytes,
+            manifest_key, artifacts }
+        '400': { description: unknown target }
+        '500': { description: backup failed, or an object did not land }
   /api/v1/admin/tenants:
     post:
       summary: Create — or confirm — a tenant (admin)

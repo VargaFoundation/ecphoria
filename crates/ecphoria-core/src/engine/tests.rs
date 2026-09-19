@@ -3752,3 +3752,150 @@ async fn a_batch_write_fills_the_kind_column_too() {
         .unwrap();
     assert_eq!(rows[0]["n"], "2");
 }
+
+// ── Backup integrity: the manifest is the commit record (E-11) ────────────────
+
+/// A storage backend that records what was written, in order, and can be told to lose a key —
+/// which is the failure a backup has to survive noticing.
+#[derive(Default)]
+struct RecordingStorage {
+    objects: parking_lot::Mutex<std::collections::BTreeMap<String, bytes::Bytes>>,
+    order: parking_lot::Mutex<Vec<String>>,
+    /// Keys whose `put` silently does nothing — a partial upload that still returned Ok.
+    swallow: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for RecordingStorage {
+    async fn put(&self, key: &str, data: bytes::Bytes) -> crate::Result<()> {
+        self.order.lock().push(key.to_string());
+        if self.swallow.iter().any(|s| key.ends_with(s.as_str())) {
+            return Ok(());
+        }
+        self.objects.lock().insert(key.to_string(), data);
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> crate::Result<Option<bytes::Bytes>> {
+        Ok(self.objects.lock().get(key).cloned())
+    }
+    async fn delete(&self, key: &str) -> crate::Result<()> {
+        self.objects.lock().remove(key);
+        Ok(())
+    }
+    async fn list(&self, prefix: &str) -> crate::Result<Vec<String>> {
+        Ok(self
+            .objects
+            .lock()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+}
+
+async fn engine_with_some_data() -> EcphoriaEngine {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    engine
+        .memory_add(MemoryInput::new(
+            MemoryScope::tenant("default"),
+            "the deploy target is the EKS cluster",
+        ))
+        .await
+        .unwrap();
+    engine
+}
+
+#[tokio::test]
+async fn the_manifest_is_uploaded_last_so_a_half_written_backup_has_none() {
+    let engine = engine_with_some_data().await;
+    let storage = RecordingStorage::default();
+    let summary = engine
+        .backup_to_storage(&storage, "backups/")
+        .await
+        .unwrap();
+
+    let order = storage.order.lock().clone();
+    assert!(order.len() > 1, "{order:?}");
+    assert!(
+        order.last().unwrap().ends_with("/manifest.json"),
+        "the manifest must be written after every artifact: {order:?}"
+    );
+    assert_eq!(
+        order
+            .iter()
+            .filter(|k| k.ends_with("/manifest.json"))
+            .count(),
+        1
+    );
+    assert!(summary.manifest_key.ends_with("/manifest.json"));
+    assert!(summary.artifacts > 0);
+    assert!(summary.bytes > 0);
+}
+
+#[tokio::test]
+async fn an_artifact_that_did_not_land_fails_the_backup() {
+    // The failure that actually happens: `put` returns Ok and the object is not there. A backup
+    // that reports success here is the one nobody discovers until a restore.
+    let engine = engine_with_some_data().await;
+    let storage = RecordingStorage {
+        // One file inside the vector index directory — the case a per-artifact check would miss.
+        swallow: vec!["state.db".into()],
+        ..Default::default()
+    };
+    let err = engine
+        .backup_to_storage(&storage, "backups/")
+        .await
+        .expect_err("an artifact is missing from the bucket");
+    assert!(err.to_string().contains("backup incomplete"), "{err}");
+    assert!(err.to_string().contains("state.db"), "{err}");
+}
+
+#[tokio::test]
+async fn a_backup_with_no_manifest_is_refused_rather_than_reported_complete() {
+    let engine = engine_with_some_data().await;
+    let storage = RecordingStorage {
+        swallow: vec!["manifest.json".into()],
+        ..Default::default()
+    };
+    let err = engine
+        .backup_to_storage(&storage, "backups/")
+        .await
+        .expect_err("no commit record, no backup");
+    assert!(err.to_string().contains("manifest missing"), "{err}");
+}
+
+#[tokio::test]
+async fn the_prefix_keeps_one_directory_per_backup() {
+    let engine = engine_with_some_data().await;
+    let storage = RecordingStorage::default();
+    let summary = engine
+        .backup_to_storage(&storage, "backups/shard-0/")
+        .await
+        .unwrap();
+    assert!(
+        summary.prefix.starts_with("backups/shard-0/"),
+        "{}",
+        summary.prefix
+    );
+    for key in storage.objects.lock().keys() {
+        assert!(key.starts_with(&summary.prefix), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn one_missing_file_inside_a_directory_artifact_still_fails() {
+    // The case a per-artifact check would wave through: `memories_export/` is present, so
+    // "is the artifact there?" answers yes — while the export is missing the file that makes it
+    // loadable. Verification is per object for exactly this reason.
+    let engine = engine_with_some_data().await;
+    let storage = RecordingStorage {
+        swallow: vec!["load.sql".into()],
+        ..Default::default()
+    };
+    let err = engine
+        .backup_to_storage(&storage, "backups/")
+        .await
+        .expect_err("a directory artifact with a hole in it is not a backup");
+    assert!(err.to_string().contains("backup incomplete"), "{err}");
+    assert!(err.to_string().contains("load.sql"), "{err}");
+}

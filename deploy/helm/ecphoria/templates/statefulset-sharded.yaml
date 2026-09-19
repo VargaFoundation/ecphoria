@@ -94,6 +94,34 @@ spec:
               value: {{ $root.Values.config.embedding.model | quote }}
             - name: ECPHORIA_EMBEDDING__OLLAMA_URL
               value: {{ $root.Values.config.embedding.ollamaUrl | quote }}
+            {{- if $root.Values.config.storage.s3.bucket }}
+            - name: ECPHORIA_STORAGE__S3__BUCKET
+              value: {{ $root.Values.config.storage.s3.bucket | quote }}
+            - name: ECPHORIA_STORAGE__S3__REGION
+              value: {{ $root.Values.config.storage.s3.region | quote }}
+            {{- with $root.Values.config.storage.s3.endpoint }}
+            - name: ECPHORIA_STORAGE__S3__ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $root.Values.config.storage.s3.existingSecret }}
+            - name: ECPHORIA_STORAGE__S3__ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.config.storage.s3.existingSecret | quote }}
+                  key: {{ $root.Values.config.storage.s3.accessKeyKey | default "access-key" | quote }}
+            - name: ECPHORIA_STORAGE__S3__SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.config.storage.s3.existingSecret | quote }}
+                  key: {{ $root.Values.config.storage.s3.secretKeyKey | default "secret-key" | quote }}
+            {{- end }}
+            {{- end }}
+            # Each shard backs up under its own prefix — one bucket, one directory per Raft group,
+            # so a restore cannot silently mix two shards' stores.
+            - name: ECPHORIA_BACKUP__S3_PREFIX
+              value: "{{ $root.Values.config.backup.s3Prefix }}shard-{{ $shard }}/"
+            - name: ECPHORIA_BACKUP__MAX_BACKUPS
+              value: {{ $root.Values.config.backup.maxBackups | quote }}
           command:
             - /bin/sh
             - -c
@@ -123,6 +151,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # Writable /tmp for backup staging — required by readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ $root.Values.tmpVolume.sizeLimit | default "1Gi" }}
   {{- if $root.Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

@@ -180,6 +180,42 @@ spec:
             - name: ECPHORIA_EMBEDDING__OPENAI_BASE_URL
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.config.storage.s3.bucket }}
+            # Object storage — the backup target, and the blob store when storage.engine = s3.
+            - name: ECPHORIA_STORAGE__S3__BUCKET
+              value: {{ .Values.config.storage.s3.bucket | quote }}
+            - name: ECPHORIA_STORAGE__S3__REGION
+              value: {{ .Values.config.storage.s3.region | quote }}
+            {{- with .Values.config.storage.s3.endpoint }}
+            - name: ECPHORIA_STORAGE__S3__ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.config.storage.s3.existingSecret }}
+            # Credentials from a Secret. Leave it unset to use the node's/pod's ambient identity
+            # (IRSA, Workload Identity, an instance profile) — the better option where it exists,
+            # since there is then no key to rotate or leak.
+            - name: ECPHORIA_STORAGE__S3__ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.storage.s3.existingSecret | quote }}
+                  key: {{ .Values.config.storage.s3.accessKeyKey | default "access-key" | quote }}
+            - name: ECPHORIA_STORAGE__S3__SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.storage.s3.existingSecret | quote }}
+                  key: {{ .Values.config.storage.s3.secretKeyKey | default "secret-key" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.backup.autoEnabled }}
+            - name: ECPHORIA_BACKUP__AUTO_ENABLED
+              value: "true"
+            - name: ECPHORIA_BACKUP__INTERVAL_HOURS
+              value: {{ .Values.config.backup.intervalHours | quote }}
+            {{- end }}
+            - name: ECPHORIA_BACKUP__S3_PREFIX
+              value: {{ .Values.config.backup.s3Prefix | quote }}
+            - name: ECPHORIA_BACKUP__MAX_BACKUPS
+              value: {{ .Values.config.backup.maxBackups | quote }}
           # Init script to derive node_id and peers from StatefulSet
           command:
             - /bin/sh
@@ -221,6 +257,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # A backup stages under the system temp dir before it is uploaded, so /tmp has to be
+            # writable even with a read-only root filesystem. Sized, so a runaway backup fills a
+            # bounded volume instead of the node's disk.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit | default "1Gi" }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

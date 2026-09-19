@@ -1168,8 +1168,30 @@ pub async fn backup(
     State(engine): State<Arc<EcphoriaEngine>>,
     shard: Option<Extension<crate::cluster::shard_route::ShardRoutingState>>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<super::models::BackupParams>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "backup").increment(1);
+
+    // `?target=s3` captures a backup and ships it to object storage in one call, so a scheduled
+    // backup is a request an operator (or a CronJob) makes, rather than a timer inside the server
+    // that nobody can trigger, observe the result of, or fail a job on.
+    if params.target.as_deref() == Some("s3") {
+        return match engine.backup_to_s3().await {
+            Ok(summary) => api_ok(serde_json::to_value(summary).unwrap_or_default()),
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BACKUP_ERROR",
+                e.to_string(),
+            ),
+        };
+    }
+    if let Some(other) = params.target.as_deref().filter(|t| *t != "local") {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TARGET",
+            format!("unknown backup target `{other}` — use `local` (default) or `s3`"),
+        );
+    }
 
     let backup_dir = std::path::PathBuf::from(&engine.config().storage.data_dir).join("backups");
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();

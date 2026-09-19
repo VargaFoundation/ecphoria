@@ -328,6 +328,7 @@ Ecphoria automatically:
 - [Editions](docs/editions.md) — `ecphoria:memory` vs `ecphoria:full`, and why the split is a build choice
 - [Choregos integration](docs/integrations/choregos.md) — context packs, fact writes, governed proposals
 - [Releasing](docs/releasing.md) — what a release produces, how to cut one, how to verify a signed image
+- [Backup & restore](docs/backup-restore.md) — what a backup contains, how to restore it, and the drill
 - [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Ecphoria adds for free
 - [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
 - [KB benchmarks](docs/benchmarks-kb.md) — retrieval on an engineering corpus, measured to 200k memories

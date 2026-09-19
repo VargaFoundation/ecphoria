@@ -374,6 +374,14 @@ than slowing the search. See `docs/benchmarks-kb.md` for the queries worth runni
 
 ### Backup
 
+See [backup-restore.md](./backup-restore.md) for the runbook — what a backup contains, why the
+manifest is written last, how to restore, and the drill that tells you your real RTO.
+
+`POST /api/v1/admin/backup` writes under `<data_dir>/backups/`; `?target=s3` additionally ships it
+to the configured bucket and verifies every object landed. On Kubernetes prefer the chart's
+`backup.cronjob` over the in-process timer below: a Kubernetes job has a result and a history to
+alert on, a timer has a log line.
+
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
 | `backup.auto_enabled` | `ECPHORIA_BACKUP__AUTO_ENABLED` | `false` | Background S3 backups in the tiering task |

@@ -273,6 +273,20 @@ jobs:
           --set ingress.enabled=true --set autoscaling.enabled=true
           --set serviceMonitor.enabled=true --set prometheusRule.enabled=true
           --set sharding.enabled=true >/dev/null
+      # The hardened path: backups to object storage, a locked-down NetworkPolicy, a read-only root.
+      - run: >-
+          helm template ecphoria deploy/helm/ecphoria
+          --set backup.cronjob.enabled=true --set backup.cronjob.apiKeySecret=ecphoria-admin
+          --set config.storage.s3.bucket=ecphoria --set config.storage.s3.existingSecret=ecphoria-s3
+          --set networkPolicy.enabled=true --set networkPolicy.egress.enabled=true >/dev/null
+      # …and the guards that refuse a backup with nowhere to go, or no key to authenticate with.
+      # A green backup job that uploads nothing is worse than no backup at all.
+      - name: The CronJob refuses to render when it could not work
+        run: |
+          ! helm template ecphoria deploy/helm/ecphoria \
+              --set backup.cronjob.enabled=true --set backup.cronjob.apiKeySecret=k 2>/dev/null
+          ! helm template ecphoria deploy/helm/ecphoria \
+              --set backup.cronjob.enabled=true --set config.storage.s3.bucket=b 2>/dev/null
 
   build:
     name: Build

@@ -777,3 +777,12 @@ mod tests {
         assert_eq!(req.k, 10);
     }
 }
+
+/// `POST /api/v1/admin/backup?target=…`
+#[derive(Debug, Default, Deserialize)]
+pub struct BackupParams {
+    /// `local` (default) writes under `<data_dir>/backups/`; `s3` additionally ships it to the
+    /// configured bucket and verifies the manifest landed.
+    #[serde(default)]
+    pub target: Option<String>,
+}

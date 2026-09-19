@@ -1,0 +1,86 @@
+{{- if .Values.backup.cronjob.enabled }}
+{{- if and (eq .Values.backup.cronjob.target "s3") (not .Values.config.storage.s3.bucket) }}
+{{- fail "backup.cronjob.target=s3 needs config.storage.s3.bucket — a backup with nowhere to go is worse than no backup, because the job goes green" }}
+{{- end }}
+{{- if and .Values.config.gateway.authEnabled (not .Values.backup.cronjob.apiKeySecret) }}
+{{- fail "backup.cronjob needs backup.cronjob.apiKeySecret when config.gateway.authEnabled — create a Secret holding an admin API key" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "ecphoria.fullname" . }}-backup
+  labels:
+    {{- include "ecphoria.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.cronjob.schedule | quote }}
+  # Two backups at once would stage the same stores concurrently.
+  concurrencyPolicy: {{ .Values.backup.cronjob.concurrencyPolicy | quote }}
+  # After a control-plane outage, run the one that was missed — not the twelve that were.
+  startingDeadlineSeconds: {{ .Values.backup.cronjob.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backup.cronjob.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.backup.cronjob.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "ecphoria.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: backup
+              # The server image, for `curl` and for nothing else: the job is an HTTP call, and a
+              # second image would be a second thing to patch for no gain.
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.backup.cronjob.resources | nindent 16 }}
+              env:
+                - name: ECPHORIA_URL
+                  value: "http://{{ include "ecphoria.fullname" . }}:{{ .Values.service.httpPort }}"
+                - name: TARGET
+                  value: {{ .Values.backup.cronjob.target | quote }}
+                {{- if .Values.backup.cronjob.apiKeySecret }}
+                - name: API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.cronjob.apiKeySecret | quote }}
+                      key: {{ .Values.backup.cronjob.apiKeySecretKey | quote }}
+                {{- end }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # `-f` so an HTTP error is a job failure. The whole point of a CronJob over an
+                  # in-process timer is that a failed backup is a failed *object* someone can alert
+                  # on, so nothing here may exit 0 on a bad answer.
+                  RESPONSE=$(curl -fsS -X POST \
+                    ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} \
+                    "${ECPHORIA_URL}/api/v1/admin/backup?target=${TARGET}")
+                  echo "${RESPONSE}"
+
+                  # The manifest is the commit record: the server uploads it last, after every
+                  # artifact, and re-reads it to check each one is in the bucket. A response without
+                  # it means the backup did not complete, whatever the status code said.
+                  if [ "${TARGET}" = "s3" ]; then
+                    echo "${RESPONSE}" | grep -q '"manifest_key"' || {
+                      echo "backup reported no manifest — treating as failed" >&2
+                      exit 1
+                    }
+                  else
+                    echo "${RESPONSE}" | grep -q '"status":"ok"' || {
+                      echo "backup did not report ok — treating as failed" >&2
+                      exit 1
+                    }
+                  fi
+                  echo "backup ok"
+{{- end }}

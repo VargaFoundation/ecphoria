@@ -4376,53 +4376,137 @@ impl EcphoriaEngine {
     ///
     /// Creates a local backup first, then uploads each file to S3 under the
     /// configured prefix with a timestamp directory.
-    pub async fn backup_to_s3(&self) -> Result<()> {
-        use crate::storage::StorageBackend;
-
+    pub async fn backup_to_s3(&self) -> Result<S3BackupSummary> {
         let s3_config = &self.config.storage.s3;
         if s3_config.bucket.is_empty() {
             return Err(crate::Error::Config(
                 "S3 bucket not configured for backup".into(),
             ));
         }
-
         let s3 = crate::storage::s3::S3Storage::from_config(s3_config).await?;
+        let prefix = self.config.backup.s3_prefix.clone();
+        self.backup_to_storage(&s3, &prefix).await
+    }
 
+    /// Capture a backup and upload it to any storage backend under `prefix`.
+    ///
+    /// Split from [`Self::backup_to_s3`] so the integrity properties — manifest last, then verify
+    /// every artifact it names is really there — are testable against an in-memory backend instead
+    /// of only against a bucket nobody has in CI.
+    pub async fn backup_to_storage(
+        &self,
+        storage: &dyn crate::storage::StorageBackend,
+        prefix: &str,
+    ) -> Result<S3BackupSummary> {
         // Create a temporary local backup
         let tmp = std::env::temp_dir().join(format!(
-            "ecphoria-backup-{}",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+            "ecphoria-backup-{}-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+            uuid::Uuid::new_v4().simple()
         ));
         self.backup(&tmp).await?;
 
-        let prefix = &self.config.backup.s3_prefix;
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let base = format!("{prefix}{timestamp}");
 
-        // Walk the temp directory and upload each file
+        // Walk the temp directory and upload each file.
+        //
+        // `manifest.json` goes LAST, deliberately. It carries the per-artifact SHA-256s, so it is
+        // the *commit record* of the backup: a run that dies halfway leaves objects behind but no
+        // manifest, and a restore that requires one therefore cannot pick a half-written backup.
+        // Uploading it in whatever order the directory happened to list would make a truncated
+        // backup indistinguishable from a complete one.
         let mut entries = Vec::new();
         Self::walk_dir(&tmp, &mut entries)?;
+        entries.sort();
+        let manifest_name = std::ffi::OsStr::new("manifest.json");
+        let (manifest_entries, artifact_entries): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .partition(|p| p.file_name() == Some(manifest_name) && p.parent() == Some(&*tmp));
 
+        let mut bytes_uploaded = 0u64;
+        let mut uploaded = 0usize;
+        for file_path in artifact_entries.iter().chain(manifest_entries.iter()) {
+            let relative = file_path
+                .strip_prefix(&tmp)
+                .map_err(|e| crate::Error::Storage(format!("path strip: {e}")))?;
+            let key = format!("{base}/{}", relative.to_string_lossy());
+            let data = tokio::fs::read(file_path)
+                .await
+                .map_err(|e| crate::Error::Storage(format!("read backup file: {e}")))?;
+            bytes_uploaded += data.len() as u64;
+            storage.put(&key, bytes::Bytes::from(data)).await?;
+            uploaded += 1;
+        }
+
+        let manifest_key = format!("{base}/manifest.json");
+
+        // Verify what landed, while the local copy still exists.
+        //
+        // Two separate claims: `put` returned Ok, and the object is in the bucket. The second is
+        // the one a restore depends on, and the moment to find out it is false is now — not in six
+        // months, from a directory that is missing one file of a vector index.
+        //
+        // Checked per *file*, not per artifact: the vector index is a directory, and a check that
+        // only asked "is `vectors/` there?" would pass with half of it missing.
+        let manifest_bytes = storage
+            .get(&manifest_key)
+            .await?
+            .ok_or_else(|| crate::Error::Storage("backup manifest missing after upload".into()))?;
+        let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| crate::Error::Storage(format!("backup manifest unreadable: {e}")))?;
+        let present: std::collections::HashSet<String> = storage
+            .list(&format!("{base}/"))
+            .await?
+            .into_iter()
+            .collect();
+        let mut missing: Vec<String> = Vec::new();
         for file_path in &entries {
             let relative = file_path
                 .strip_prefix(&tmp)
                 .map_err(|e| crate::Error::Storage(format!("path strip: {e}")))?;
-            let s3_key = format!("{prefix}{timestamp}/{}", relative.to_string_lossy());
-            let data = tokio::fs::read(file_path)
-                .await
-                .map_err(|e| crate::Error::Storage(format!("read backup file: {e}")))?;
-            s3.put(&s3_key, bytes::Bytes::from(data)).await?;
+            let key = format!("{base}/{}", relative.to_string_lossy());
+            if !present.contains(&key) {
+                missing.push(key);
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            let shown = missing
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = missing.len().saturating_sub(5);
+            return Err(crate::Error::Storage(format!(
+                "backup incomplete: {} object(s) did not land — {shown}{}",
+                missing.len(),
+                if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                }
+            )));
         }
 
         // Clean up temp directory
         let _ = tokio::fs::remove_dir_all(&tmp).await;
 
         tracing::info!(
-            prefix = %prefix,
-            timestamp = %timestamp,
-            files = entries.len(),
-            "S3 backup complete"
+            prefix = %base,
+            files = uploaded,
+            bytes = bytes_uploaded,
+            "object-storage backup complete"
         );
-        Ok(())
+        Ok(S3BackupSummary {
+            prefix: base,
+            timestamp,
+            files: uploaded,
+            bytes: bytes_uploaded,
+            manifest_key,
+            artifacts: manifest.artifacts.len(),
+        })
     }
 
     /// Recursively walk a directory, collecting file paths.
@@ -4514,6 +4598,23 @@ impl EcphoriaEngine {
 const BACKUP_FORMAT_VERSION: u32 = 1;
 
 /// Integrity + provenance manifest written alongside a backup (`manifest.json`).
+/// What one S3 backup wrote, returned so an operator (or a CronJob) sees it rather than having to
+/// go and look in the bucket.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct S3BackupSummary {
+    /// Full key prefix of this backup, e.g. `backups/20260919T101500Z`.
+    pub prefix: String,
+    pub timestamp: String,
+    /// Objects uploaded.
+    pub files: usize,
+    pub bytes: u64,
+    /// The commit record — present only if the backup completed.
+    pub manifest_key: String,
+    /// Artifacts named by the manifest, each verified present in the bucket.
+    pub artifacts: usize,
+}
+
+/// The commit record of a backup: what was captured, how much of it, and a checksum per artifact.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupManifest {
     /// On-disk backup format version.
