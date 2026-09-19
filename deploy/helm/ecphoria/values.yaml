@@ -45,6 +45,30 @@ config:
       defaultDimension: 768
     state:
       dbPath: /data/state.db
+    # -- Retrieval knobs. 0 = the server's default; set them only with a measurement in hand.
+    #
+    # `retrievalScanCap` is the one that moves read latency: it is the candidate width per
+    # retrieval arm (default 2048). The service benchmark measured 540 ms p95 at 2048 and 24 ms at
+    # 512 on a 20k-memory corpus, with no measurable recall cost *at that size* — and the default
+    # is 2048 because a much larger corpus does lose recall when the window narrows. Measure with
+    # `kb_eval` on your own corpus before changing it. See docs/benchmarks-choregos.md.
+    cognition:
+      retrievalScanCap: 0
+      readPoolSize: 0
+      retrievalPool: 0
+      decayIntervalSecs: 0      # >0 → the leader forgets decayed memories on this interval
+      contradictionReview: false
+    # -- What a tenant may write: attribution, and the shape of typed facts. Off by default.
+    # See docs/facts.md — start a tenant at `warn`, watch the counter, then switch to `strict`.
+    #
+    # governance:
+    #   factValidation: warn
+    #   tenants:
+    #     choregos: { requireProvenance: true, factValidation: strict }
+    governance:
+      requireProvenance: false
+      factValidation: ""
+      tenants: {}
   gateway:
     listen: "0.0.0.0:8432"
     pgListen: "0.0.0.0:5432"

@@ -306,10 +306,10 @@ LLM fact extraction and graph auto-population are opt-in.
 | `memory.cognition.default_importance` | `ECPHORIA_MEMORY__COGNITION__DEFAULT_IMPORTANCE` | `0.5` | Importance assigned to a new memory (0.0–1.0) |
 | `memory.cognition.decay_half_life_days` | `ECPHORIA_MEMORY__COGNITION__DECAY_HALF_LIFE_DAYS` | `30` | Half-life (days) for time-decay of importance |
 | `memory.cognition.forget_threshold` | `ECPHORIA_MEMORY__COGNITION__FORGET_THRESHOLD` | `0.05` | Memories whose decayed importance falls below this are forgotten |
-| `memory.cognition.read_pool_size` | `ECPHORIA_MEMORY__COGNITION__READ_POOL_SIZE` | `4` | Read-connection count (query concurrency) |
+| `memory.cognition.read_pool_size` | `ECPHORIA_MEMORY__COGNITION__READ_POOL_SIZE` | `8` | Read-connection count (query concurrency) |
 | `memory.cognition.max_memories_per_scope` | `ECPHORIA_MEMORY__COGNITION__MAX_MEMORIES_PER_SCOPE` | `0` | Per-scope active-memory cap (0 = unlimited) |
-| `memory.cognition.retrieval_scan_cap` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP` | `2048` | Ranked candidates carried forward per query (BM25 + vector). **Not** a cap on how much of the corpus is searched — the lexical arm's FTS5 index covers the whole scope. Wider is better on the KB eval; see `docs/benchmarks-kb.md` |
-| `memory.cognition.retrieval_pool` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_POOL` | `200` | Fused pool kept after RRF for blend + rerank |
+| `memory.cognition.retrieval_scan_cap` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP` | `2048` | Ranked candidates carried forward per query (BM25 + vector). **Not** a cap on how much of the corpus is searched — the lexical arm's FTS5 index covers the whole scope. Wider is better on the KB eval (`docs/benchmarks-kb.md`), and it is also **the** read-latency lever: 540 ms p95 at 2048 vs 24 ms at 512 on a 20k-memory corpus under 50 reads/s, with no measurable recall cost *at that size* (`docs/benchmarks-choregos.md`). Measure your own corpus before narrowing it |
+| `memory.cognition.retrieval_pool` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_POOL` | `50` | Fused pool kept after RRF for blend + rerank |
 | `memory.cognition.graph_expansion` | `ECPHORIA_MEMORY__COGNITION__GRAPH_EXPANSION` | `false` | Query-time knowledge-graph expansion in `memory_search` |
 | `memory.cognition.auto_graph` | `ECPHORIA_MEMORY__COGNITION__AUTO_GRAPH` | `false` | Auto-populate graph edges from each added memory |
 | `memory.cognition.retrieval_importance_weight` | `ECPHORIA_MEMORY__COGNITION__RETRIEVAL_IMPORTANCE_WEIGHT` | `0.3` | Importance weight in the retrieval blend (0 = pure relevance) |
@@ -382,6 +382,20 @@ than slowing the search. See `docs/benchmarks-kb.md` for the queries worth runni
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
 | `runtime.db_path` | `ECPHORIA_RUNTIME__DB_PATH` | `./data/runs.db` | SQLite path for the durable agent-run ledger |
+
+### Governance (what a tenant may write)
+
+Per tenant, off by default — see [facts.md](./facts.md).
+
+| Setting | Env Var | Default |
+|---------|---------|---------|
+| `memory.governance.require_provenance` | `ECPHORIA_MEMORY__GOVERNANCE__REQUIRE_PROVENANCE` | `false` |
+| `memory.governance.fact_validation` | `…__FACT_VALIDATION` | `off` (`warn` / `strict`) |
+| `memory.governance.tenants.<id>.*` | `…__TENANTS__<ID>__REQUIRE_PROVENANCE` / `…__FACT_VALIDATION` | inherits the global value |
+
+**A tenant id only survives the env round-trip if it is lowercase alphanumeric.** `acme-prod`
+arrives as `acme_prod` and would govern a tenant that does not exist — the chart refuses to render
+rather than mis-scope the rules; mount an `ecphoria.toml` for such a tenant.
 
 ### Backup
 

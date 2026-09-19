@@ -88,6 +88,35 @@ spec:
               value: "{{ $shard }}"
             - name: ECPHORIA_CLUSTER__SHARD_BASE_URLS
               value: "{{- range $i := until (int $root.Values.sharding.shards) }}{{ if $i }},{{ end }}http://{{ include "ecphoria.fullname" $root }}-shard-{{ $i }}-headless.{{ $root.Release.Namespace }}.svc.cluster.local:8432{{- end }}"
+            {{- if gt (int $root.Values.config.memory.cognition.retrievalScanCap) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP
+              value: {{ $root.Values.config.memory.cognition.retrievalScanCap | quote }}
+            {{- end }}
+            {{- if gt (int $root.Values.config.memory.cognition.readPoolSize) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__READ_POOL_SIZE
+              value: {{ $root.Values.config.memory.cognition.readPoolSize | quote }}
+            {{- end }}
+            {{- if $root.Values.config.memory.governance.requireProvenance }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__REQUIRE_PROVENANCE
+              value: "true"
+            {{- end }}
+            {{- with $root.Values.config.memory.governance.factValidation }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__FACT_VALIDATION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- range $tenant, $rules := $root.Values.config.memory.governance.tenants }}
+            {{- if not (regexMatch "^[a-z0-9]+$" $tenant) }}
+            {{- fail (printf "config.memory.governance.tenants: `%s` cannot be configured through the chart (env-var round-trip changes it) — mount an ecphoria.toml instead" $tenant) }}
+            {{- end }}
+            {{- if hasKey $rules "requireProvenance" }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__TENANTS__{{ $tenant | upper }}__REQUIRE_PROVENANCE
+              value: {{ $rules.requireProvenance | quote }}
+            {{- end }}
+            {{- if hasKey $rules "factValidation" }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__TENANTS__{{ $tenant | upper }}__FACT_VALIDATION
+              value: {{ $rules.factValidation | quote }}
+            {{- end }}
+            {{- end }}
             - name: ECPHORIA_EMBEDDING__PROVIDER
               value: {{ $root.Values.config.embedding.provider | quote }}
             - name: ECPHORIA_EMBEDDING__MODEL

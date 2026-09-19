@@ -71,6 +71,50 @@ spec:
             # State
             - name: ECPHORIA_MEMORY__STATE__DB_PATH
               value: {{ .Values.config.memory.state.dbPath | quote }}
+            # Cognition — the retrieval knobs. `0`/empty means "server default", so an
+            # unconfigured chart behaves exactly as before.
+            {{- if gt (int .Values.config.memory.cognition.retrievalScanCap) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__RETRIEVAL_SCAN_CAP
+              value: {{ .Values.config.memory.cognition.retrievalScanCap | quote }}
+            {{- end }}
+            {{- if gt (int .Values.config.memory.cognition.readPoolSize) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__READ_POOL_SIZE
+              value: {{ .Values.config.memory.cognition.readPoolSize | quote }}
+            {{- end }}
+            {{- if gt (int .Values.config.memory.cognition.retrievalPool) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__RETRIEVAL_POOL
+              value: {{ .Values.config.memory.cognition.retrievalPool | quote }}
+            {{- end }}
+            {{- if gt (int .Values.config.memory.cognition.decayIntervalSecs) 0 }}
+            - name: ECPHORIA_MEMORY__COGNITION__DECAY_INTERVAL_SECS
+              value: {{ .Values.config.memory.cognition.decayIntervalSecs | quote }}
+            {{- end }}
+            {{- if .Values.config.memory.cognition.contradictionReview }}
+            - name: ECPHORIA_MEMORY__COGNITION__CONTRADICTION_REVIEW
+              value: "true"
+            {{- end }}
+            # Governance — what a tenant may write (docs/facts.md). Off unless set.
+            {{- if .Values.config.memory.governance.requireProvenance }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__REQUIRE_PROVENANCE
+              value: "true"
+            {{- end }}
+            {{- with .Values.config.memory.governance.factValidation }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__FACT_VALIDATION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- range $tenant, $rules := .Values.config.memory.governance.tenants }}
+            {{- if not (regexMatch "^[a-z0-9]+$" $tenant) }}
+            {{- fail (printf "config.memory.governance.tenants: `%s` cannot be configured through the chart — a tenant id reaches the server as an env var name, and anything but lowercase alphanumerics comes back changed (a hyphen would arrive as an underscore and silently govern a tenant that does not exist). Mount an ecphoria.toml for this one." $tenant) }}
+            {{- end }}
+            {{- if hasKey $rules "requireProvenance" }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__TENANTS__{{ $tenant | upper }}__REQUIRE_PROVENANCE
+              value: {{ $rules.requireProvenance | quote }}
+            {{- end }}
+            {{- if hasKey $rules "factValidation" }}
+            - name: ECPHORIA_MEMORY__GOVERNANCE__TENANTS__{{ $tenant | upper }}__FACT_VALIDATION
+              value: {{ $rules.factValidation | quote }}
+            {{- end }}
+            {{- end }}
             # Gateway
             - name: ECPHORIA_GATEWAY__LISTEN
               value: {{ .Values.config.gateway.listen | quote }}
