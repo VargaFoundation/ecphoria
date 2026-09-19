@@ -7,7 +7,7 @@
 //! binds the address peers actually dial — the port the old HTTP transport got wrong).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ecphoria_cluster::raft::types::AppRequest;
 use ecphoria_cluster::{ClusterConfig, ClusterCoordinator};
@@ -20,6 +20,14 @@ async fn inmem_engine() -> Arc<EcphoriaEngine> {
     c.memory.cognition.db_path = ":memory:".into();
     Arc::new(EcphoriaEngine::new(c).await.unwrap())
 }
+
+/// How long a three-node cluster gets to elect a leader, and a committed write to reach every
+/// node. Both are deadlines rather than iteration counts: `for _ in 0..100` with a 100 ms sleep
+/// reads like ten seconds but buys less, because each turn also pays for the check itself — on a
+/// two-core hosted runner, enough less to fail for no reason. These budgets are deliberately
+/// generous; they only cost time when something is genuinely broken.
+const ELECTION_BUDGET: Duration = Duration::from_secs(30);
+const CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Grab an ephemeral localhost port, then release it for the coordinator to bind.
 fn free_port() -> u16 {
@@ -67,14 +75,18 @@ async fn three_node_grpc_cluster_replicates_over_sockets() {
 
     // Wait for a leader to emerge over real gRPC (production timings: election ≤3s + bootstrap retry).
     let mut elected = false;
-    for _ in 0..200 {
+    let deadline = Instant::now() + ELECTION_BUDGET;
+    while Instant::now() < deadline {
         if coords.iter().any(|c| c.is_leader()) {
             elected = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(elected, "cluster did not elect a leader over gRPC");
+    assert!(
+        elected,
+        "cluster did not elect a leader over gRPC in {ELECTION_BUDGET:?}"
+    );
 
     // Propose a write on the leader.
     let leader = coords
@@ -93,14 +105,21 @@ async fn three_node_grpc_cluster_replicates_over_sockets() {
     // The committed write must converge on every node's engine — over real sockets.
     for (i, engine) in engines.iter().enumerate() {
         let mut converged = false;
-        for _ in 0..100 {
+        let deadline = Instant::now() + CONVERGENCE_BUDGET;
+        while Instant::now() < deadline {
             if engine.event_count().await.unwrap() == 1 {
                 converged = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(converged, "node {} did not converge over gRPC", i + 1);
+        assert!(
+            converged,
+            "node {} did not converge over gRPC in {:?} — it holds {} event(s), expected 1",
+            i + 1,
+            CONVERGENCE_BUDGET,
+            engine.event_count().await.unwrap()
+        );
     }
 
     for mut c in coords {
@@ -164,14 +183,18 @@ async fn three_node_grpc_cluster_replicates_over_mtls() {
 
     // Leader election requires successful mTLS handshakes between every pair of nodes.
     let mut elected = false;
-    for _ in 0..200 {
+    let deadline = Instant::now() + ELECTION_BUDGET;
+    while Instant::now() < deadline {
         if coords.iter().any(|c| c.is_leader()) {
             elected = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(elected, "cluster did not elect a leader over mTLS");
+    assert!(
+        elected,
+        "cluster did not elect a leader over mTLS in {ELECTION_BUDGET:?}"
+    );
 
     let leader = coords
         .iter()
@@ -189,14 +212,21 @@ async fn three_node_grpc_cluster_replicates_over_mtls() {
     // The committed write converges on every node — over real TLS sockets.
     for (i, engine) in engines.iter().enumerate() {
         let mut converged = false;
-        for _ in 0..100 {
+        let deadline = Instant::now() + CONVERGENCE_BUDGET;
+        while Instant::now() < deadline {
             if engine.event_count().await.unwrap() == 1 {
                 converged = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(converged, "node {} did not converge over mTLS", i + 1);
+        assert!(
+            converged,
+            "node {} did not converge over mTLS in {:?} — it holds {} event(s), expected 1",
+            i + 1,
+            CONVERGENCE_BUDGET,
+            engine.event_count().await.unwrap()
+        );
     }
 
     for mut c in coords {
