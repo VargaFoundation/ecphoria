@@ -196,7 +196,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
 /// signatures; the verify path uses [`verify_hex_hmac`] (constant-time) directly.
 #[cfg(test)]
 fn hmac_sha256(secret: &str, msg: &[u8]) -> Option<Vec<u8>> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(msg);
@@ -205,7 +205,7 @@ fn hmac_sha256(secret: &str, msg: &[u8]) -> Option<Vec<u8>> {
 
 /// Constant-time comparison of an expected HMAC against a hex-encoded signature.
 fn verify_hex_hmac(secret: &str, msg: &[u8], sig_hex: &str) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let Ok(expected) = hex_decode(sig_hex.trim()) else {
         return false;
@@ -2698,7 +2698,7 @@ mod tests {
 
     #[test]
     fn webhook_signature_verifies_and_rejects() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let secret = "supersecret-webhook-key";
         let body = br#"{"hello":"world"}"#;
