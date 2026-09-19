@@ -3,6 +3,13 @@ name: Benchmarks
 on:
   pull_request:
     branches: [main]
+  # Also on `main`, and this is what makes the comparison mean anything. A cache written by a
+  # pull request lives in that pull request's own scope and no other run can read it; only a
+  # cache written on the default branch is visible to every branch. Without this trigger, every
+  # pull request compared its measurements against an empty baseline — the 130% alert could
+  # never fire, whatever a change did to the numbers.
+  push:
+    branches: [main]
   # The profile bench is slow (it builds a corpus before it measures anything), so it runs on a
   # schedule and on demand rather than on every PR.
   schedule:
@@ -16,7 +23,7 @@ permissions:
 jobs:
   bench:
     name: Criterion benchmarks
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,13 +68,17 @@ jobs:
           set -o pipefail
           cargo bench -p ecphoria-core --bench engine -- --output-format bencher | tee bench-output.txt
 
-      - name: Download previous benchmark results
-        uses: actions/cache@v4
+      # Read and write are split on purpose. `actions/cache` skips saving on an exact key hit,
+      # so a single fixed key would freeze the baseline at whatever the first run measured and
+      # never move again. Pull requests only read; `main` writes a new entry per commit, and the
+      # prefix restore picks up the most recent one.
+      - name: Baseline measured on `main`
+        uses: actions/cache/restore@v4
         with:
           path: ./bench-cache
-          key: bench-${{ runner.os }}-${{ github.base_ref }}
+          key: bench-${{ runner.os }}-main-
           restore-keys: |
-            bench-${{ runner.os }}-main
+            bench-${{ runner.os }}-main-
 
       - name: Compare and comment on PR
         uses: benchmark-action/github-action-benchmark@v1
@@ -78,12 +89,19 @@ jobs:
           # Dependabot's GITHUB_TOKEN is read-only whatever this workflow declares, so a comment
           # is a guaranteed 403 — and the action treats that as a failure. The measurement still
           # runs and still lands in the job summary; only the comment is skipped.
-          comment-on-alert: ${{ github.actor != 'dependabot[bot]' }}
+          comment-on-alert: ${{ github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' }}
           alert-threshold: "130%"
           fail-on-alert: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          comment-always: ${{ github.actor != 'dependabot[bot]' }}
+          comment-always: ${{ github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' }}
           summary-always: true
+
+      - name: Publish the new baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ./bench-cache
+          key: bench-${{ runner.os }}-main-${{ github.sha }}
 
   profile:
     name: Choregos profile (service under load)
