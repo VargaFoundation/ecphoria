@@ -20,7 +20,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -30,12 +30,12 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      - uses: Mozilla-Actions/sccache-action@v0.0.11
       - name: Enable sccache only if the cache service answers
         # When the GitHub Actions cache is down, `sccache` fails to start its server and every
         # `cargo` invocation that uses it as RUSTC_WRAPPER dies with exit 101. A compiler cache
@@ -55,7 +55,7 @@ jobs:
     name: Local ONNX backends (compile guard)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # embed-local/rerank-local pull fastembed → ort, which downloads a native onnxruntime binary at
@@ -69,14 +69,14 @@ jobs:
     name: Version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/check-versions.sh
 
   memory-only:
     name: Memory-only build (no agent runtime, no LLM proxy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `ecphoria:memory` is a published image, so its build has to keep working. The failure mode
@@ -93,10 +93,10 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      - uses: Mozilla-Actions/sccache-action@v0.0.11
       - name: Enable sccache only if the cache service answers
         # When the GitHub Actions cache is down, `sccache` fails to start its server and every
         # `cargo` invocation that uses it as RUSTC_WRAPPER dies with exit 101. A compiler cache
@@ -120,10 +120,10 @@ jobs:
     name: Retrieval quality (KB eval)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      - uses: Mozilla-Actions/sccache-action@v0.0.11
       - name: Enable sccache only if the cache service answers
         # When the GitHub Actions cache is down, `sccache` fails to start its server and every
         # `cargo` invocation that uses it as RUSTC_WRAPPER dies with exit 101. A compiler cache
@@ -153,7 +153,7 @@ jobs:
       contents: read
       checks: write # audit-check posts a check-run with the advisory results
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Scans the dependency tree for known vulnerabilities (RUSTSEC database).
       - uses: rustsec/audit-check@v2
         with:
@@ -163,8 +163,8 @@ jobs:
     name: Go SDK (build + vet)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.21"
       # Compile-verify the Go client (no local Go toolchain in the dev env, so CI is the gate).
@@ -177,7 +177,7 @@ jobs:
     name: Python SDK (build + pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
@@ -193,7 +193,7 @@ jobs:
     name: Python binding (pyo3 build + smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v7
         with:
@@ -212,8 +212,8 @@ jobs:
     name: Admin console (JS logic)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       # The console is a single HTML file baked via include_str! (no browser in CI). Syntax-check its
@@ -228,8 +228,8 @@ jobs:
     name: TypeScript SDK (build + test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Install + build
@@ -243,7 +243,7 @@ jobs:
     name: Operator (fmt + clippy + build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -263,7 +263,7 @@ jobs:
     name: Helm lint + template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
       - run: helm lint deploy/helm/ecphoria
       # Render with defaults, and with the optional features on, to catch template errors.
@@ -304,10 +304,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      - uses: Mozilla-Actions/sccache-action@v0.0.11
       - name: Enable sccache only if the cache service answers
         # When the GitHub Actions cache is down, `sccache` fails to start its server and every
         # `cargo` invocation that uses it as RUSTC_WRAPPER dies with exit 101. A compiler cache
@@ -332,7 +332,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: ecphoria-server
@@ -357,7 +357,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: ecphoria-server
