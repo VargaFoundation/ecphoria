@@ -264,7 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint deploy/helm/ecphoria
       # Render with defaults, and with the optional features on, to catch template errors.
       - run: helm template ecphoria deploy/helm/ecphoria >/dev/null
@@ -311,7 +311,7 @@ jobs:
             echo "::warning::sccache unavailable — building without a compiler cache"
           fi
       - run: cargo build --release --workspace
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ecphoria-server
           path: target/release/ecphoria-server
@@ -322,7 +322,7 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ecphoria-server
           path: target/release
@@ -347,7 +347,7 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ecphoria-server
           path: target/release

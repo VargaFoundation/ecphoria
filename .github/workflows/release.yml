@@ -58,7 +58,7 @@ jobs:
           flavor: |
             suffix=${{ matrix.suffix }},onlatest=true
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         id: build
         with:
           context: .
@@ -104,7 +104,7 @@ jobs:
         run: cosign attest --yes --predicate "ecphoria-sbom-${VARIANT}.spdx.json" --type spdxjson "${IMAGE}@${DIGEST}"
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ecphoria-sbom-${{ matrix.variant }}
           path: ecphoria-sbom-${{ matrix.variant }}.spdx.json
@@ -136,7 +136,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         id: build
         with:
           context: ops/operator
@@ -178,13 +178,13 @@ jobs:
       # Attach both images' SBOMs to the GitHub Release — the docker job is a matrix (full,
       # memory), so each leg uploads its own artifact and `merge-multiple` flattens them here.
       - name: Download SBOMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ecphoria-sbom-*
           merge-multiple: true
         continue-on-error: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           files: |
