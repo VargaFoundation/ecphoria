@@ -76,5 +76,10 @@ jobs:
           BENCH_SECONDS: "30"
           BENCH_READS_PER_SEC: "20"
           BENCH_WRITES_PER_SEC: "2"
-          BENCH_P95_MS: "2000"
+          # Deliberately loose. Nobody has measured this profile on a 2-core hosted runner yet, so
+          # a tight gate here would be a guess that fails nightly for its own reasons. The first
+          # green runs establish the real baseline; tighten it then, against numbers rather than
+          # against an estimate. What this catches meanwhile is a several-fold regression, which is
+          # the failure worth waking up to.
+          BENCH_P95_MS: "5000"
         run: cargo run --release -p ecphoria-core --example choregos_bench
