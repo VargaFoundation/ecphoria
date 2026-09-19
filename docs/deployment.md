@@ -79,10 +79,20 @@ curl http://localhost:8432/cluster/status
 # {"node_id":1,"state":"Leader","current_leader":1,"current_term":1,...}
 ```
 
-Writes to a follower node return a 307 redirect to the leader:
+A write that lands on a follower is **forwarded to the leader** and the leader's answer is
+returned, so a client behind a Service does not have to know or care which node it reached:
 
 ```bash
-curl -X POST http://localhost:8433/api/v1/ingest -d '...'
+curl -X POST http://localhost:8433/api/v1/ingest -d '...'   # a follower
+# 200 — served by the leader, proxied back
+```
+
+This needs `cluster.peer_http` (the Helm chart sets it), because Raft only knows a peer's *Raft*
+address and that is not where its REST API lives. Without the mapping the follower answers a 307
+naming the leader by id and **with no `Location`**, which no HTTP client can follow — behind a
+Service, that means (N-1)/N of writes fail for an ordinary client:
+
+```bash
 # 307 {"error":"not_leader","leader_id":1,"message":"..."}
 ```
 
@@ -398,6 +408,7 @@ alert on, a timer has a log line.
 | `cluster.node_id` | `ECPHORIA_CLUSTER__NODE_ID` | `1` | This node's Raft ID |
 | `cluster.listen` | `ECPHORIA_CLUSTER__LISTEN` | `0.0.0.0:9433` | Raft RPC listen address |
 | `cluster.peers` | `ECPHORIA_CLUSTER__PEERS` | `[]` | Comma-separated peer addresses |
+| `cluster.peer_http` | `ECPHORIA_CLUSTER__PEER_HTTP` | `""` | `id@base-url` of each peer's **HTTP** gateway. With it, a follower forwards a write to the leader and returns its answer, so an ordinary client behind a Service just works. Without it, a follower answers `307` naming the leader by id and **with no `Location`** — which no HTTP client can follow, so (N-1)/N of writes fail unless the client implements leader discovery. The Helm chart sets it |
 
 ## Sharded operations (multi-Raft)
 

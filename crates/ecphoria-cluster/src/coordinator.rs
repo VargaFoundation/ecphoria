@@ -68,6 +68,32 @@ impl ClusterCoordinator {
             .collect()
     }
 
+    /// `node_id` → HTTP base URL for each peer, parsed from `cluster.peer_http`
+    /// (`1@http://host:8432,2@...`). Entries that are malformed are skipped with a warning rather
+    /// than failing startup: a typo in one peer should degrade that one hop, not the node.
+    pub fn peer_http(&self) -> std::collections::HashMap<u64, String> {
+        let mut out = std::collections::HashMap::new();
+        for entry in self.config.peer_http.split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            match entry.split_once('@') {
+                Some((id, url)) => match id.trim().parse::<u64>() {
+                    Ok(id) => {
+                        out.insert(id, url.trim().trim_end_matches('/').to_string());
+                    }
+                    Err(_) => {
+                        tracing::warn!(%entry, "cluster.peer_http: node id is not a number — ignored")
+                    }
+                },
+                None => {
+                    tracing::warn!(%entry, "cluster.peer_http: expected `id@base-url` — ignored")
+                }
+            }
+        }
+        out
+    }
+
     /// Start the Raft instance with the production gRPC network, and (in multi-node mode) serve
     /// this node's Raft instance to peers over gRPC on `cluster.listen`.
     pub async fn start_raft(&mut self, engine: Arc<EcphoriaEngine>) -> crate::Result<()> {
@@ -612,5 +638,38 @@ mod tests {
         );
 
         coord.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn peer_http_maps_ids_to_base_urls() {
+        let coord = ClusterCoordinator::new(crate::config::ClusterConfig {
+            peer_http: " 1@http://a:8432 , 2@http://b:8432/ ,, 3@http://c:8432 ".into(),
+            ..Default::default()
+        });
+        let map = coord.peer_http();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1).map(String::as_str), Some("http://a:8432"));
+        // A trailing slash would produce `http://b:8432//api/v1/...` when joined with the path.
+        assert_eq!(map.get(&2).map(String::as_str), Some("http://b:8432"));
+        assert_eq!(map.get(&3).map(String::as_str), Some("http://c:8432"));
+    }
+
+    #[test]
+    fn a_malformed_peer_http_entry_is_skipped_not_fatal() {
+        // One typo should cost that one hop, not the node's startup — the rest of the fleet is
+        // still reachable, and a server that refuses to boot over it is strictly worse.
+        let coord = ClusterCoordinator::new(crate::config::ClusterConfig {
+            peer_http: "1@http://a:8432,not-an-entry,x@http://b:8432".into(),
+            ..Default::default()
+        });
+        let map = coord.peer_http();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&1).map(String::as_str), Some("http://a:8432"));
+    }
+
+    #[test]
+    fn no_peer_http_means_no_forwarding() {
+        let coord = ClusterCoordinator::new(crate::config::ClusterConfig::default());
+        assert!(coord.peer_http().is_empty());
     }
 }

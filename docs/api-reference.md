@@ -367,15 +367,24 @@ Response:
 
 ### Leader Forwarding
 
-When a write request (POST, PUT, DELETE) arrives at a follower node, it returns a 307 redirect:
+A write (POST, PUT, DELETE) that arrives at a follower is **proxied to the leader**, and the
+leader's response is returned unchanged. A client talking to a Service therefore never sees a
+redirect it has to handle. The hop is marked so two followers cannot bounce a request between them
+during an election, and `ecphoria_leader_forward_total{outcome}` counts it.
+
+This requires `cluster.peer_http` (the Helm chart sets it). Without it, a follower answers:
 
 ```json
 {
   "error": "not_leader",
   "leader_id": 1,
-  "message": "This node is not the leader. Retry on the leader node."
+  "message": "This node is not the leader. Retry on the leader node, or configure cluster.peer_http…"
 }
 ```
+
+with status **307 and no `Location` header** — the node knows the leader's Raft address, not its
+HTTP one, and inventing a URL would send clients somewhere that may not answer. An ordinary HTTP
+client cannot follow that, so the caller must implement leader discovery itself.
 
 GET requests (reads) are always served locally from the follower's engine for low-latency reads.
 

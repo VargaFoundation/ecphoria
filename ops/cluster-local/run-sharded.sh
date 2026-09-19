@@ -59,6 +59,13 @@ for s in $(seq 0 $((SHARDS - 1))); do
     peers+="$((r + 1))@http://${HOST}:$((RAFT_BASE + p)),"
   done
   peers="${peers%,}"
+  # HTTP addresses within this shard, so a follower forwards writes to its shard's leader.
+  peer_http=""
+  for r in $(seq 0 $((REPLICAS - 1))); do
+    p=$((s * REPLICAS + r))
+    peer_http+="$((r + 1))@http://${HOST}:$((HTTP_BASE + p)),"
+  done
+  peer_http="${peer_http%,}"
 
   for r in $(seq 0 $((REPLICAS - 1))); do
     p=$((s * REPLICAS + r))
@@ -71,6 +78,7 @@ for s in $(seq 0 $((SHARDS - 1))); do
       ECPHORIA_CLUSTER__NODE_ID="$((r + 1))" \
       ECPHORIA_CLUSTER__LISTEN="0.0.0.0:${raft}" \
       ECPHORIA_CLUSTER__PEERS="$peers" \
+      ECPHORIA_CLUSTER__PEER_HTTP="$peer_http" \
       ECPHORIA_CLUSTER__SHARDS="$SHARDS" \
       ECPHORIA_CLUSTER__SHARD_INDEX="$s" \
       ECPHORIA_CLUSTER__SHARD_BASE_URLS="$BASE_URLS" \

@@ -326,13 +326,25 @@ impl GatewayServer {
             None
         };
 
-        // Build cluster state for leader-forwarding middleware
-        let cluster_state =
-            coordinator
-                .as_ref()
-                .map(|coord| crate::cluster::leader_forward::ClusterState {
-                    coordinator: coord.clone(),
-                });
+        // Build cluster state for leader-forwarding middleware. `peer_http` is what lets a
+        // follower forward a write instead of answering a 307 the client cannot follow.
+        let cluster_state = match coordinator.as_ref() {
+            Some(coord) => {
+                let peer_http = coord.read().await.peer_http();
+                if peer_http.is_empty() {
+                    tracing::warn!(
+                        "cluster.peer_http is not set — followers will answer writes with a 307 \
+                         naming the leader by id, which an ordinary HTTP client cannot follow. \
+                         Behind a Service that means (N-1)/N of writes fail for such a client."
+                    );
+                }
+                Some(crate::cluster::leader_forward::ClusterState::new(
+                    coord.clone(),
+                    peer_http,
+                ))
+            }
+            None => None,
+        };
 
         // Build shard-routing state from the cluster config (the router gates on shards > 1).
         let shard_state = match coordinator.as_ref() {

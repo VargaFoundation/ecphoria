@@ -221,7 +221,7 @@ and applied deterministically on every node, so committed writes survive leader 
 
 ```
         client (write)
-           │  (follower → 307 leader-forward)
+           │  (follower proxies writes to the leader)
            ▼
    ┌─────────────┐  Raft: AppendEntries / Vote / InstallSnapshot
    │  LEADER      │◄──────── gRPC (tonic, HTTP/2) + MessagePack ────────►┐
@@ -283,7 +283,7 @@ leader's RunDispatcher resumes from the trace.
 
 **Memory search** (agent tool or `POST /memories/search`): §4.1 — read served locally on any node.
 
-**HA write** (ingest/state/memory): follower → 307 → leader → `client_write(AppRequest)` → commit →
+**HA write** (ingest/state/memory): follower → proxied to leader → `client_write(AppRequest)` → commit →
 apply on all nodes.
 
 ---

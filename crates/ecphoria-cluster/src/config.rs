@@ -89,6 +89,19 @@ pub struct ClusterConfig {
     /// Rust) — the `config` crate's env→Vec parsing is fragile and can silently drop the whole config.
     #[serde(default)]
     pub shard_base_urls: String,
+    /// `id@base-url` of every peer's **HTTP** gateway, comma-separated — e.g.
+    /// `1@http://ecphoria-0.ecphoria-headless:8432,2@http://ecphoria-1...`.
+    ///
+    /// Raft only knows a peer's Raft address (`id@http://host:9433`), which is not where its REST
+    /// API lives. With this mapping a follower forwards a write to the leader and returns its
+    /// answer, so an ordinary HTTP client behind a Service works; without it the follower can only
+    /// answer a 307 naming the leader by id, which no HTTP client can follow. The Helm chart fills
+    /// it from the same headless DNS it builds `peers` from.
+    ///
+    /// A String for the same reason as `shard_base_urls`: the `config` crate's env→Vec parsing is
+    /// fragile and can silently drop the whole config.
+    #[serde(default)]
+    pub peer_http: String,
 }
 
 fn default_shards() -> usize {
@@ -108,6 +121,7 @@ impl Default for ClusterConfig {
             shards: 1,
             shard_index: 0,
             shard_base_urls: String::new(),
+            peer_http: String::new(),
         }
     }
 }
@@ -172,6 +186,7 @@ mod tests {
             shards: 1,
             shard_index: 0,
             shard_base_urls: String::new(),
+            peer_http: String::new(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.node_id, 5);

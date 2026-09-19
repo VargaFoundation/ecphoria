@@ -20,7 +20,7 @@ LLM proxy) into calls on `ecphoria_core::EcphoriaEngine`. Also handles authentic
 | Auth | **Working** | API key, JWT HS256, OIDC RS256 (JWKS), RBAC, per-key rate limiting, **durable (file-backed) audit log**, and **tenant isolation enforced on all read paths** (SQL/memories/semantic/state/schema/sessions) across REST + MCP + proxy + gRPC |
 | OIDC | **Working** | RS256 JWKS validation, configurable issuer/audience/role_claim, auto-refresh with TTL cache |
 | Cluster routes | **Working** | /raft/append, /raft/vote, /raft/snapshot (inter-node RPC), /cluster/status |
-| Leader forwarding | **Working** | Middleware returns 307 redirect for writes on follower nodes, serves reads locally |
+| Leader forwarding | **Working** | A follower **proxies** a write to the leader (`cluster.peer_http` maps node id → HTTP base URL; the chart fills it) and returns its answer, so an ordinary client behind a Service works. Loop-guarded with `x-ecphoria-leader-forwarded`. Without the mapping: a 307 naming the leader by id and no `Location`, which no HTTP client can follow. Reads are served locally |
 | Prometheus | **Working** | /metrics endpoint with Raft metrics, LLM cache hit/miss counters |
 
 ## REST Routes

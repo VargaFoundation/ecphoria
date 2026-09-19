@@ -135,17 +135,21 @@ pub async fn route_to_owning_shard(
                     .into_response();
             }
             let marker = state.forward_secret.as_ref().map(|s| s.as_str());
-            proxy(&state.http, &base, req, marker).await
+            proxy(&state.http, &base, req, FORWARD_MARKER, marker).await
         }
     }
 }
 
 /// Reverse-proxy `req` to `base` + its path/query, returning the upstream response. `marker` is the
 /// value stamped into the forward marker (the shared secret) so the destination can authenticate it.
-async fn proxy(
+///
+/// Shared with [`super::leader_forward`], which needs the same thing for a different reason: one
+/// forwards across shards, the other to the leader within a shard.
+pub(crate) async fn proxy(
     client: &reqwest::Client,
     base: &str,
     req: Request,
+    marker_header: &'static str,
     marker: Option<&str>,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -190,7 +194,7 @@ async fn proxy(
     // is configured or the secret isn't a valid header value — the destination then re-counts).
     let marker_val = HeaderValue::from_str(marker.unwrap_or("1"))
         .unwrap_or_else(|_| HeaderValue::from_static("1"));
-    fwd_headers.insert(HeaderName::from_static(FORWARD_MARKER), marker_val);
+    fwd_headers.insert(HeaderName::from_static(marker_header), marker_val);
 
     // The destination's intra-shard leader-forward may 307 a write that lands on a follower; retry a
     // few times so a subsequent connection (via the shard Service) reaches the leader.

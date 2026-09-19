@@ -34,6 +34,7 @@ async fn single_node(engine: Arc<EcphoriaEngine>) -> ClusterCoordinator {
         shards: 1,
         shard_index: 0,
         shard_base_urls: String::new(),
+        peer_http: String::new(),
     };
     let mut coord = ClusterCoordinator::new(config);
     coord.start_raft(engine).await.unwrap();

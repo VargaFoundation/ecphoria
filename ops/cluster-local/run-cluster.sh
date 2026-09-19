@@ -41,6 +41,16 @@ for i in $(seq 1 "$NODES"); do
 done
 PEERS="${PEERS%,}"
 
+# …and the same nodes' HTTP addresses, so a follower forwards a write to the leader rather than
+# answering a 307 that names it only by node id. Here the ports differ per node, which is exactly
+# why this cannot be derived from the Raft address.
+PEER_HTTP=""
+for i in $(seq 1 "$NODES"); do
+  http_port=$((HTTP_BASE + i - 1))
+  PEER_HTTP+="${i}@http://${HOST}:${http_port},"
+done
+PEER_HTTP="${PEER_HTTP%,}"
+
 mkdir -p "$RUN_DIR"
 echo "Starting $NODES-node cluster (membership: $PEERS)"
 for i in $(seq 1 "$NODES"); do
@@ -61,6 +71,7 @@ for i in $(seq 1 "$NODES"); do
     ECPHORIA_CLUSTER__NODE_ID="$i" \
     ECPHORIA_CLUSTER__LISTEN="0.0.0.0:${raft}" \
     ECPHORIA_CLUSTER__PEERS="$PEERS" \
+    ECPHORIA_CLUSTER__PEER_HTTP="$PEER_HTTP" \
     ECPHORIA_GATEWAY__LISTEN="0.0.0.0:${http}" \
     ECPHORIA_GATEWAY__PG_LISTEN="0.0.0.0:${pg}" \
     ECPHORIA_GATEWAY__GRPC_LISTEN="0.0.0.0:${grpc}" \

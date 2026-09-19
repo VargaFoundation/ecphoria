@@ -136,6 +136,14 @@ spec:
                 if [ -z "$PEERS" ]; then PEERS="${PID}@${ADDR}"; else PEERS="$PEERS,${PID}@${ADDR}"; fi
               done
               export ECPHORIA_CLUSTER__PEERS=$PEERS
+              # Peer HTTP addresses within THIS shard — leader-forwarding is intra-shard.
+              PEER_HTTP=""
+              for i in $(seq 0 $(({{ $root.Values.sharding.replicasPerShard }} - 1))); do
+                PID=$((i + 1))
+                HURL="http://{{ include "ecphoria.fullname" $root }}-shard-{{ $shard }}-${i}.{{ include "ecphoria.fullname" $root }}-shard-{{ $shard }}-headless.{{ $root.Release.Namespace }}.svc.cluster.local:{{ $root.Values.service.httpPort }}"
+                if [ -z "$PEER_HTTP" ]; then PEER_HTTP="${PID}@${HURL}"; else PEER_HTTP="$PEER_HTTP,${PID}@${HURL}"; fi
+              done
+              export ECPHORIA_CLUSTER__PEER_HTTP=$PEER_HTTP
               export ECPHORIA_CLUSTER__LISTEN="0.0.0.0:9433"
               exec ecphoria-server
           {{- with $root.Values.probes.liveness }}

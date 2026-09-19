@@ -56,6 +56,7 @@ async fn three_node_grpc_cluster_replicates_over_sockets() {
             shards: 1,
             shard_index: 0,
             shard_base_urls: String::new(),
+            peer_http: String::new(),
         };
         let mut coord = ClusterCoordinator::new(config);
         // Production path: gRPC network factory + gRPC server bound to cluster.listen.
@@ -153,6 +154,7 @@ async fn three_node_grpc_cluster_replicates_over_mtls() {
             shards: 1,
             shard_index: 0,
             shard_base_urls: String::new(),
+            peer_http: String::new(),
         };
         let mut coord = ClusterCoordinator::new(config);
         coord.start_raft(engine.clone()).await.unwrap();
