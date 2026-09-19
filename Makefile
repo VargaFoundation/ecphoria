@@ -6,7 +6,7 @@ CAP_GB ?= 40
 export CAP_GB
 GUARD  := scripts/target-guard.sh
 
-.PHONY: build test check fmt clippy run guard disk clean clean-all release bench bench-smoke cluster-up cluster-down cluster-failover cluster-sharded
+.PHONY: build test check fmt clippy run guard disk clean clean-all release bench bench-smoke bench-choregos bench-failover versions cluster-up cluster-down cluster-failover cluster-sharded
 
 ## Guarded common tasks (auto-clean target/ if it's over the cap, then run cargo).
 build: guard ; cargo build --workspace
@@ -26,6 +26,13 @@ clippy: guard ; cargo clippy --workspace --all-targets -- -D warnings
 ## runs the full overnight eval. Results are teed under /tmp/ecphoria-bench/.
 bench-smoke: guard ; CONVS=1 QA_LIMIT=5 EXTRACTION=none bash ops/bench/run-locomo-claude.sh
 bench:       guard ; bash ops/bench/run-locomo-claude.sh
+
+## The Choregos profile: 20k typed facts + 200k events, 50 reads/s + 5 writes/s sustained.
+## Measures service, not retrieval quality. See docs/benchmarks-choregos.md.
+bench-choregos: guard ; cargo run --release -p ecphoria-core --example choregos_bench
+## What losing a node costs under load: brings up a local 3-node cluster, drives it, kills the
+## leader partway through, prints a per-second timeline.
+bench-failover: guard ; bash ops/cluster-local/failover-load.sh
 
 ## Local N-node Raft cluster (real processes; needs `make release` first). See ops/cluster-local/.
 cluster-up:       ; bash ops/cluster-local/run-cluster.sh

@@ -3,6 +3,11 @@ name: Benchmarks
 on:
   pull_request:
     branches: [main]
+  # The profile bench is slow (it builds a corpus before it measures anything), so it runs on a
+  # schedule and on demand rather than on every PR.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +16,7 @@ permissions:
 jobs:
   bench:
     name: Criterion benchmarks
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,3 +55,26 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           comment-always: true
           summary-always: true
+
+  profile:
+    name: Choregos profile (service under load)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A quarter of the production profile: a GitHub runner has 2–4 cores, so the absolute numbers
+      # mean nothing next to a workstation's. What this catches is a *regression* — a change that
+      # makes retrieval several times slower shows up here whatever the hardware, which is why the
+      # gate is set well above the measured baseline rather than at it.
+      - name: Run the profile bench
+        env:
+          BENCH_FACTS: "5000"
+          BENCH_EVENTS: "50000"
+          BENCH_SECONDS: "30"
+          BENCH_READS_PER_SEC: "20"
+          BENCH_WRITES_PER_SEC: "2"
+          BENCH_P95_MS: "2000"
+        run: cargo run --release -p ecphoria-core --example choregos_bench

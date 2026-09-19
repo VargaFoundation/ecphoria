@@ -332,6 +332,7 @@ Ecphoria automatically:
 - [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Ecphoria adds for free
 - [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
 - [KB benchmarks](docs/benchmarks-kb.md) — retrieval on an engineering corpus, measured to 200k memories
+- [Service benchmarks](docs/benchmarks-choregos.md) — latency under a sustained mixed load, and what losing a node costs
 - [Web Explorer](examples/web-ui/) — single-file UI for SQL, memory search, and run traces
 
 ## Full Dev Stack
