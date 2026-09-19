@@ -112,7 +112,7 @@ futures = { version = "0.3" }
 async-trait = { version = "0.1" }
 parking_lot = { version = "0.12" }
 dashmap = { version = "6" }
-rand = { version = "0.9" }
+rand = { version = "0.10" }
 
 # Regex — fact-subject grammars and the small JSON Schema validator (`memory::schema`).
 # Already in the tree transitively; declared here so the version is pinned in one place.
