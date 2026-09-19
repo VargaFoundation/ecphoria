@@ -81,6 +81,27 @@ parked with the reason. Label: `deferred/major-bump`.
    directly (the first two conflicted once their siblings landed on the same lines, and the
    token in use may not merge a PR that touches a workflow file) and closed against the commit.
    Nineteen open PRs became ten, and the ten left are exactly those that need a code change.
-4. ⬜ Open a single "operator: kube 4 + k8s-openapi 0.28 + schemars 1" PR and close #10, #14, #12.
-5. ⬜ Handle the four workflow-action bumps together, with one release dry-run at the end.
-6. ⬜ Leave #13, #17 and #16 until someone touches those subsystems for another reason.
+4. ✅ The operator's three-way major landed as one change: kube 4 + k8s-openapi 0.28 + schemars 1
+   (#10, #14, #12). Three call sites moved — `Recorder` takes the object per event now, and
+   k8s-openapi swapped chrono for **jiff**, so the leader-election lease had to follow. The
+   generated CRD was diffed, not assumed: same group, plural, properties, required set and status
+   subresource.
+5. ✅ The five action majors went together (#2, #6, #5, #1): they are all the same migration to a
+   Node 24 runtime, needing Actions Runner ≥ 2.327.1 — which hosted runners have. Every input we
+   pass was checked against the release notes; `download-artifact` moved to v8 alongside
+   `upload-artifact` v7, since the pair has to match.
+6. ✅ The three "leave it until someone touches that subsystem" bumps turned out to cost nothing
+   and are in:
+   - **#17 toml 1.x** — the surface `doctor` uses is unchanged; zero edits.
+   - **#16 fastembed 5** — the options builder kept its shape and `ort` stays on the same
+     release candidate, so the native runtime does not move. Checked with the features on, which
+     is the only way this code compiles at all.
+   - **#13 prost 0.14 + tonic 0.14** — the one that looked worst. tonic 0.14 split prost support
+     into `tonic-prost` (codec) and `tonic-prost-build` (codegen), and renamed the TLS feature by
+     crypto provider (`tls` → `tls-ring`). Changing those three lines and the two build scripts
+     was the whole migration: no call site moved, 695 tests pass, and the Raft transport's mTLS
+     is unchanged. `tonic 0.12` stays in the lockfile for `opentelemetry-proto` under the
+     optional `otlp` feature — someone else's tree, not ours.
+
+**All nineteen PRs are resolved.** Nine merged or applied, two closed as already-on-main, eight
+landed as the four grouped changes above.

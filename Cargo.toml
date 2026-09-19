@@ -41,10 +41,14 @@ hyper = { version = "1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # gRPC
-tonic = { version = "0.12", features = ["tls"] }
-prost = { version = "0.13" }
-prost-types = { version = "0.13" }
-tonic-build = { version = "0.12" }
+# tonic 0.14 split prost support out of the core crate: the runtime codec lives in `tonic-prost`
+# and the code generator in `tonic-prost-build`. The TLS feature also split by crypto provider —
+# `tls-ring` matches the provider the rest of the workspace uses (rustls/ring).
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = { version = "0.14" }
+prost = { version = "0.14" }
+prost-types = { version = "0.14" }
+tonic-prost-build = { version = "0.14" }
 protobuf-src = { version = "2" }
 
 # PostgreSQL wire protocol
