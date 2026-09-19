@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ecphoria-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for the Ecphoria context lake"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,6 +23,11 @@ Documentation = "https://github.com/VargaFoundation/ecphoria/tree/main/sdk/pytho
 dev = ["pytest"]
 langchain = ["langchain-core>=0.1"]
 llama-index = ["llama-index-core>=0.10"]
+
+[tool.hatch.build.targets.wheel]
+# The distribution is `ecphoria-client`, the import name is `ecphoria`: hatchling cannot guess
+# that, and the optional integrations ship alongside it.
+packages = ["ecphoria", "langchain_ecphoria", "llama_index_ecphoria"]
 
 [tool.pytest.ini_options]
 # Make `import ecphoria` work in-repo without an editable install.
