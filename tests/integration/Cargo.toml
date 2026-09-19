@@ -31,5 +31,5 @@ axum.workspace = true
 tower = { workspace = true, features = ["util"] }
 serde_json.workspace = true
 toml.workspace = true
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 tempfile.workspace = true

@@ -100,7 +100,7 @@ opentelemetry-otlp = { version = "0.27", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.28" }
 
 # Auth
-jsonwebtoken = { version = "9" }
+jsonwebtoken = { version = "11" }
 hmac = { version = "0.12" }
 sha2 = { version = "0.10" }
 
