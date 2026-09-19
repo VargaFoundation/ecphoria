@@ -14,16 +14,19 @@ locally, the bump was applied and built.
 | :-- | :-- | :-- |
 | Clippy, Test, Operator | `sccache: Server startup failed: cache storage failed to read` — the GitHub Actions cache service was down during the 2026-08-13 run | No. Transient infrastructure. `cargo clippy --workspace --all-targets` and `cargo test --workspace` (613 tests) pass locally on `main` |
 | Python SDK (build + pytest) | `pip install -e .` fails: `readme = "README.md"` pointed at a file that did not exist, and hatchling could not infer the wheel's packages (distribution `ecphoria-client`, import name `ecphoria`) | **Yes** — fixed in this branch: `sdk/python/README.md` added, `[tool.hatch.build.targets.wheel] packages` declared. `pip install -e ".[dev]"`, `python -m build` and the 15 tests now pass |
-| Security audit (RUSTSEC) | 15 advisories in the dependency tree | **Yes** — nine of them were stale lockfile entries and are fixed here (`crossbeam-epoch`, `postgres-protocol`, `quinn-proto`, `rustls`, `rustls-webpki` 0.103, `tokio-postgres`, plus the AWS SDK chain). Five remain, and they need a decision rather than a bump — see below |
+| Security audit (RUSTSEC) | 15 advisories in the dependency tree | **Yes** — 14 are fixed here: nine by lockfile bumps (`crossbeam-epoch`, `postgres-protocol`, `quinn-proto`, `rustls`, `rustls-webpki` 0.103, `tokio-postgres`, the AWS SDK chain), and five more by dropping the AWS SDK's legacy hyper-0.14 client, which nothing uses. One remains — see below |
 | Retrieval quality (KB eval) | Gated eval; needs a fresh run to judge | To re-check |
 
-### The five advisories a lockfile bump cannot fix
+### The one advisory left
 
 | Advisory | Crate | Why it is stuck |
 | :-- | :-- | :-- |
-| RUSTSEC-2026-0258 | `h2` 0.3.27 | Reached through `aws-smithy-http-client`'s `hyper-014` feature, on by default via `aws-config`. The patch is `h2` 0.4.16, i.e. the hyper-1 client. Turning the legacy client off (`aws-config = { default-features = false, … }`) is a deliberate change to the S3 path, not a lockfile edit |
-| RUSTSEC-2026-0098/0099/0104 | `rustls-webpki` 0.101.7 | Same chain: `rustls` 0.21 ← `hyper-rustls` 0.24 ← the legacy client. The 0.103 line is already in the tree for everything else |
-| RUSTSEC-2026-0235 | `rkyv` 0.7.46 | Pulled by `rust_decimal` (itself via `duckdb` and `pgwire`). The patch is `rkyv` 0.8, which `rust_decimal` 1.43 has not adopted — upstream work |
+| RUSTSEC-2026-0235 | `rkyv` 0.7.46 | Pulled by `rust_decimal` (itself via `duckdb` and `pgwire`). The patch is `rkyv` 0.8, which `rust_decimal` 1.43 has not adopted — upstream work, not ours |
+
+The other five went away with the AWS SDK's `default-features = false`: `aws-sdk-s3` and
+`aws-config` were pulling *two* HTTP clients, the hyper-1 one they use and a legacy hyper-0.14
+one they do not, and the legacy one carried `h2` 0.3 and `rustls` 0.21. Verified beyond
+compiling: an attachment uploaded through the API lands in MinIO and reads back byte-for-byte.
 
 **So the first action is not a merge**: push the Python SDK fix, let CI re-run on a green `main`,
 and only then read the PR checks for what they say about the bumps themselves.

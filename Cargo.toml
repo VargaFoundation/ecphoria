@@ -58,8 +58,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 usearch = { version = "2" }
 
 # Object storage (S3/MinIO)
-aws-sdk-s3 = { version = "1" }
-aws-config = { version = "1" }
+# `rustls` (the default) pulls the SDK's *legacy* hyper-0.14 client alongside the modern one,
+# which drags in h2 0.3 and rustls 0.21 — three RUSTSEC advisories for a code path nothing uses.
+# The `default-https-client` feature is the hyper-1 client on its own.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
 
 # Consensus
 openraft = { version = "0.9", features = ["serde"] }
