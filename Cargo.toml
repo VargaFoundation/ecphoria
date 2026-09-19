@@ -101,7 +101,7 @@ tracing-opentelemetry = { version = "0.28" }
 
 # Auth
 jsonwebtoken = { version = "9" }
-hmac = { version = "0.12" }
+hmac = { version = "0.13" }
 sha2 = { version = "0.10" }
 
 # Utilities
