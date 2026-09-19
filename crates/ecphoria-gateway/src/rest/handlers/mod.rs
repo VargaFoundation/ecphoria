@@ -1651,6 +1651,9 @@ const PUBLISH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15
 /// short-TTL cache. A burst of unauthenticated `/public` hits triggers at most one full tenant scan
 /// per TTL — the DoS-amplifier mitigation for these unauthenticated routes. (Per-client rate limiting
 /// is best applied at the ingress/CDN in front of a public deployment.)
+// L'erreur EST la réponse HTTP à renvoyer : la boxer obligerait chaque appelant à la
+// déballer pour la rendre, sans rien gagner.
+#[allow(clippy::result_large_err)]
 async fn published_items(
     engine: &EcphoriaEngine,
     state: &PublishState,

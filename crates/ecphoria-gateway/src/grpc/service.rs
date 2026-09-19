@@ -52,6 +52,7 @@ impl EcphoriaGrpcService {
     }
 
     /// Resolve the caller's tenant for a **read** RPC. See [`Self::resolve`].
+    #[allow(clippy::result_large_err)] // `Status` vient de tonic, pas de nous
     async fn tenant_from<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
         self.resolve(req, false).await
     }
@@ -59,6 +60,7 @@ impl EcphoriaGrpcService {
     /// Resolve the caller's tenant for a **mutating** RPC, additionally enforcing the RBAC role
     /// (a Reader token is rejected on writes — the gRPC analogue of the REST middleware's method
     /// check, which gRPC previously skipped).
+    #[allow(clippy::result_large_err)] // `Status` vient de tonic, pas de nous
     async fn tenant_from_write<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
         self.resolve(req, true).await
     }
@@ -66,6 +68,7 @@ impl EcphoriaGrpcService {
     /// Resolve the caller's tenant from `authorization: Bearer <jwt>`; when `write`, require a role
     /// permitted to write; enforce shard ownership. Auth disabled → `None` (no scoping, dev mode);
     /// a missing/invalid token is rejected.
+    #[allow(clippy::result_large_err)] // `Status` vient de tonic, pas de nous
     async fn resolve<T>(&self, req: &Request<T>, write: bool) -> Result<Option<String>, Status> {
         let Some(state) = &self.auth else {
             return Ok(None);

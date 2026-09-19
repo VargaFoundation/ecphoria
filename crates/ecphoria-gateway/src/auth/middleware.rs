@@ -416,6 +416,9 @@ impl RateLimiter {
 /// On success, injects `AuthContext` into request extensions.
 /// Enforces RBAC: rejects requests the role is not allowed to make.
 /// Enforces per-key rate limits if configured.
+// `Result<Response, Response>` est la signature qu'axum attend d'un middleware : la boxer
+// romprait le contrat du framework pour gagner 128 octets sur un chemin d'erreur.
+#[allow(clippy::result_large_err)]
 pub async fn require_auth(
     axum::extract::State(state): axum::extract::State<AuthState>,
     mut req: Request,
