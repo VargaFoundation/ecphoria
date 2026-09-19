@@ -26,7 +26,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -34,7 +34,7 @@ jobs:
         with:
           cache-on-failure: true
 
-      - uses: Mozilla-Actions/sccache-action@v0.0.6
+      - uses: Mozilla-Actions/sccache-action@v0.0.11
 
       - name: Enable sccache only if the cache service answers
         # Same guard as `ci.yml`: when the Actions cache is unavailable — which is the normal
@@ -73,7 +73,7 @@ jobs:
       # never move again. Pull requests only read; `main` writes a new entry per commit, and the
       # prefix restore picks up the most recent one.
       - name: Baseline measured on `main`
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ./bench-cache
           key: bench-${{ runner.os }}-main-
@@ -98,7 +98,7 @@ jobs:
 
       - name: Publish the new baseline
         if: github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ./bench-cache
           key: bench-${{ runner.os }}-main-${{ github.sha }}
@@ -111,7 +111,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
