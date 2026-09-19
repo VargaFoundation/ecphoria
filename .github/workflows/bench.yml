@@ -29,11 +29,30 @@ jobs:
 
       - uses: Mozilla-Actions/sccache-action@v0.0.6
 
-      - name: Run benchmarks
-        run: cargo bench -p ecphoria-core -- --output-format bencher | tee bench-output.txt
+      - name: Enable sccache only if the cache service answers
+        # Same guard as `ci.yml`: when the Actions cache is unavailable — which is the normal
+        # state on a Dependabot pull request, where the cache is read-only — `sccache` fails to
+        # start its server, and every `cargo` invocation using it as RUSTC_WRAPPER dies. A
+        # compiler cache is an optimisation: losing it should slow the benchmark, not fail it.
         env:
           SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache unavailable — benchmarking without a compiler cache"
+          fi
+
+      - name: Run benchmarks
+        # `pipefail` is the point: without it the exit status is `tee`'s, so a `cargo bench` that
+        # never compiled leaves an empty `bench-output.txt` and a green step — the failure then
+        # surfaces two steps later as "No benchmark result was found", pointing at the wrong
+        # thing entirely.
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench -p ecphoria-core -- --output-format bencher | tee bench-output.txt
 
       - name: Download previous benchmark results
         uses: actions/cache@v4
@@ -49,11 +68,14 @@ jobs:
           tool: cargo
           output-file-path: bench-output.txt
           external-data-json-path: ./bench-cache/benchmark-data.json
-          comment-on-alert: true
+          # Dependabot's GITHUB_TOKEN is read-only whatever this workflow declares, so a comment
+          # is a guaranteed 403 — and the action treats that as a failure. The measurement still
+          # runs and still lands in the job summary; only the comment is skipped.
+          comment-on-alert: ${{ github.actor != 'dependabot[bot]' }}
           alert-threshold: "130%"
           fail-on-alert: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          comment-always: true
+          comment-always: ${{ github.actor != 'dependabot[bot]' }}
           summary-always: true
 
   profile:
