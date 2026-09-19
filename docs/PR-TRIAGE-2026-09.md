@@ -69,12 +69,15 @@ parked with the reason. Label: `deferred/major-bump`.
 | #5 | azure/setup-helm 4 → 5 | used with no inputs in `ci.yml` (just `- uses:`), so the risk is low — but it is still a major, and the chart lint is what gates every release |
 | #1 | softprops/action-gh-release 2 → 3 | the release workflow passes `body_path` and `files` and relies on the pushed tag. Check both survive the major before a release depends on it |
 
-## Suggested order
+## What was done, 2026-09-19
 
-1. Merge the Python SDK fix (README + wheel packages) so `main` can be green.
-2. Re-run CI on `main`; read the Security audit and KB-eval results on a fresh run.
-3. Close #7 and #15.
-4. Merge the seven safe ones, one at a time, letting CI run between each.
-5. Open a single "operator: kube 4 + k8s-openapi 0.28 + schemars 1" PR and close #10, #14, #12.
-6. Handle the four workflow-action bumps together, with one release dry-run at the end.
-7. Leave #13, #17 and #16 until someone touches those subsystems for another reason.
+1. ✅ `main` is green again. Four separate causes, all fixed: the sccache probe (the Actions
+   cache was down that day and is down again today), the operator's `cargo fmt` drift, the
+   Python SDK's missing README and undeclared wheel packages, and fourteen of the fifteen
+   RUSTSEC advisories. Clippy also needed attention: CI runs Rust 1.98, which enforces
+   `result_large_err` on tonic- and axum-shaped signatures that 1.96 let pass.
+2. ✅ #7 and #15 closed — `main` already carried their target versions.
+3. ✅ The seven safe bumps merged, one at a time.
+4. ⬜ Open a single "operator: kube 4 + k8s-openapi 0.28 + schemars 1" PR and close #10, #14, #12.
+5. ⬜ Handle the four workflow-action bumps together, with one release dry-run at the end.
+6. ⬜ Leave #13, #17 and #16 until someone touches those subsystems for another reason.

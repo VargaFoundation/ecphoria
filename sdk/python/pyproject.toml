@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"
 dependencies = [
-    "httpx>=0.25",
+    "httpx>=0.28.1",
     "websockets>=16.1",
 ]
 keywords = ["ai", "agents", "context-lake", "memory", "vector-search"]
@@ -22,7 +22,7 @@ Documentation = "https://github.com/VargaFoundation/ecphoria/tree/main/sdk/pytho
 [project.optional-dependencies]
 dev = ["pytest"]
 langchain = ["langchain-core>=1.4.9"]
-llama-index = ["llama-index-core>=0.10"]
+llama-index = ["llama-index-core>=0.14.23"]
 
 [tool.hatch.build.targets.wheel]
 # The distribution is `ecphoria-client`, the import name is `ecphoria`: hatchling cannot guess
