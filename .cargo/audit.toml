@@ -1,0 +1,19 @@
+# Advisories deliberately not failing the build, each with the reason and what would end it.
+#
+# An ignore list is a promise to revisit, not a way to make a job green. Anything added here
+# must say why the advisory cannot reach this code, and what change removes the entry.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0235 — rkyv < 0.8.17: out-of-bounds reads when *deserializing an untrusted
+    # rkyv archive* that contains Rc/Arc with mismatched pointer metadata.
+    #
+    # Reachability: rkyv arrives through `rust_decimal`'s optional feature, pulled by `duckdb`
+    # and `pgwire`. Ecphoria never deserializes a caller-supplied rkyv archive — decimals cross
+    # the wire as PostgreSQL values and as JSON, both parsed by their own decoders. The
+    # vulnerable path has no input from outside.
+    #
+    # Removal: `rust_decimal` adopting rkyv 0.8. Re-check on every dependency review; if it has
+    # moved, drop this entry rather than bumping its justification.
+    "RUSTSEC-2026-0235",
+]
