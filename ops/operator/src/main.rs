@@ -235,19 +235,20 @@ async fn reconcile(plan: Arc<EcphoriaShardPlan>, ctx: Arc<Ctx>) -> Result<Action
             format!("{desired} shards steady ({} tenant moves)", moves.len()),
         ),
     };
-    let recorder = Recorder::new(
-        ctx.client.clone(),
-        ctx.reporter.clone(),
-        plan.object_ref(&()),
-    );
+    // kube 4: a `Recorder` is bound to a client + reporter, and the object it is *about* is given
+    // per event. One recorder can therefore serve several objects, which is why the reference moved.
+    let recorder = Recorder::new(ctx.client.clone(), ctx.reporter.clone());
     let _ = recorder
-        .publish(Event {
-            type_: EventType::Normal,
-            reason: reason.into(),
-            note: Some(note),
-            action: "Reconcile".into(),
-            secondary: None,
-        })
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: reason.into(),
+                note: Some(note),
+                action: "Reconcile".into(),
+                secondary: None,
+            },
+            &plan.object_ref(&()),
+        )
         .await;
 
     Ok(Action::requeue(Duration::from_secs(60)))
@@ -478,7 +479,10 @@ mod lease {
     use super::{Api, ResourceExt};
     use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-    use k8s_openapi::chrono::{Duration, Utc};
+    // k8s-openapi 0.28 moved its time type from chrono to jiff, so `MicroTime` wraps a
+    // `jiff::Timestamp`. Using the re-export rather than a direct jiff dependency keeps the two in
+    // step: a version skew here would not fail to compile, it would fail to *accept* a timestamp.
+    use k8s_openapi::jiff::{Span, Timestamp};
     use kube::api::{ObjectMeta, PostParams};
 
     pub const NAME: &str = "ecphoria-operator";
@@ -496,7 +500,7 @@ mod lease {
 
     /// Try to acquire or renew the lease; returns true iff we hold it after this call.
     pub async fn acquire_or_renew(leases: &Api<Lease>, id: &str) -> bool {
-        let now = MicroTime(Utc::now());
+        let now = MicroTime(Timestamp::now());
         match leases.get_opt(NAME).await {
             Ok(None) => {
                 let lease = Lease {
@@ -521,7 +525,13 @@ mod lease {
                     .renew_time
                     .as_ref()
                     .zip(spec.lease_duration_seconds)
-                    .map(|(rt, d)| rt.0 + Duration::seconds(d as i64) < Utc::now())
+                    .map(|(rt, d)| {
+                        rt.0.checked_add(Span::new().seconds(d as i64))
+                            .map(|deadline| deadline < Timestamp::now())
+                            // An unrepresentable deadline means the stored lease is nonsense;
+                            // treat it as expired rather than letting it block the fleet for ever.
+                            .unwrap_or(true)
+                    })
                     .unwrap_or(true);
                 // A live lease held by someone else → not ours.
                 if !held_by_us && !expired && spec.holder_identity.is_some() {
