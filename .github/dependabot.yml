@@ -2,25 +2,58 @@ version: 2
 updates:
   # Keep third-party GitHub Actions current (and, if SHA-pinned, bumped) — supply-chain hygiene,
   # so the CI workflows don't drift on floating tags without oversight.
+  #
+  # Grouped, because ungrouped is how this got out of hand: nineteen open PRs by September, of
+  # which several could not be merged on their own at all. Five action majors were the same Node
+  # 24 migration; three operator crates were one `CustomResource` derive.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # One PR per week for the whole CI surface. A runtime bump that lands in four actions at
+      # once is one decision, not four.
+      github-actions:
+        patterns: ["*"]
 
   # Rust dependencies (root workspace).
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # `prost` and `tonic` release together and their generated code must match: bumping one
+      # alone splits the codec from the runtime, which is exactly the PR that sat open for months.
+      grpc-stack:
+        patterns: ["tonic*", "prost*"]
+      # Same reasoning for the AWS SDK: one HTTP client, one behaviour version, one PR.
+      aws-sdk:
+        patterns: ["aws-*"]
+      # Everything else that is only a patch or a minor — individually harmless, collectively
+      # noisy. Majors stay on their own so each one gets read.
+      cargo-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # The standalone k8s operator crate has its own lockfile, outside the workspace.
   - package-ecosystem: cargo
     directory: /ops/operator
     schedule:
       interval: weekly
+    groups:
+      # `kube-derive` generates the `JsonSchema` impl for `CustomResource`, so schemars and kube
+      # are one change, and `k8s-openapi` must match the kube release. Three PRs for this is
+      # three PRs that each break the build.
+      kube-stack:
+        patterns: ["kube*", "k8s-openapi", "schemars"]
 
   # Python SDK.
   - package-ecosystem: pip
     directory: /sdk/python
     schedule:
       interval: weekly
+    groups:
+      # The SDK's own dependencies move together or not at all — httpx, websockets and the
+      # framework extras were four separate PRs that conflicted with each other on the same lines.
+      python-sdk:
+        patterns: ["*"]
