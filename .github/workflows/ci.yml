@@ -65,6 +65,13 @@ jobs:
       # embed-image is pure Rust (no ONNX) — build + test it here too.
       - run: cargo test -p ecphoria-core --features embed-image image_basic
 
+  versions:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-versions.sh
+
   memory-only:
     name: Memory-only build (no agent runtime, no LLM proxy)
     runs-on: ubuntu-latest

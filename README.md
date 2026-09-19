@@ -327,6 +327,7 @@ Ecphoria automatically:
 - [Typed facts](docs/facts.md) — the fact vocabulary, the subject grammar that makes supersession work, and per-tenant governance
 - [Editions](docs/editions.md) — `ecphoria:memory` vs `ecphoria:full`, and why the split is a build choice
 - [Choregos integration](docs/integrations/choregos.md) — context packs, fact writes, governed proposals
+- [Releasing](docs/releasing.md) — what a release produces, how to cut one, how to verify a signed image
 - [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Ecphoria adds for free
 - [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
 - [KB benchmarks](docs/benchmarks-kb.md) — retrieval on an engineering corpus, measured to 200k memories

@@ -15,6 +15,9 @@ check: guard ; cargo fmt --all -- --check && cargo clippy --workspace --all-targ
 release: guard ; cargo build --release --bin ecphoria-server
 run: guard ; cargo run --bin ecphoria-server
 
+## Versions that must move together (server / chart appVersion / operator). See docs/releasing.md.
+versions: ; ./scripts/check-versions.sh
+
 fmt:    ; cargo fmt --all
 clippy: guard ; cargo clippy --workspace --all-targets -- -D warnings
 

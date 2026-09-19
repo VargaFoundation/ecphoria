@@ -1,0 +1,49 @@
+# cargo-release — see docs/releasing.md
+#
+# The workspace releases as one unit: every crate carries `version.workspace = true`, so a release
+# is one version, one tag, one set of artifacts. Publishing a single crate at its own pace would
+# mean `ecphoria-gateway 0.4` against `ecphoria-core 0.3`, a combination nobody tests.
+
+# One version across the workspace.
+shared-version = true
+
+# The tag the release workflow triggers on. Only one tag for the whole workspace — a per-crate tag
+# would fire the workflow N times for one release.
+tag-name = "v{{version}}"
+tag-message = "Ecphoria {{version}}"
+consolidate-commits = true
+
+# Nothing is published to crates.io yet: the artifacts are the container images, the Helm chart and
+# the SDKs. Flip this when the crates are ready to be depended on individually.
+publish = false
+
+# Pushing the tag is what starts the release workflow, so it stays a deliberate, separate step:
+# `cargo release` prepares and tags locally, and you push when the working tree is what you meant.
+push = false
+
+pre-release-commit-message = "chore(release): {{version}}"
+
+# Keep the things that must move with the server version in step. The SDKs are deliberately absent:
+# they version independently (they are separate packages with their own compatibility story), and
+# `scripts/check-versions.sh` enforces exactly this distinction.
+[[pre-release-replacements]]
+file = "deploy/helm/ecphoria/Chart.yaml"
+search = '^appVersion: ".*"$'
+replace = 'appVersion: "{{version}}"'
+prerelease = true
+
+[[pre-release-replacements]]
+file = "deploy/helm/ecphoria/Chart.yaml"
+search = '^version: .*$'
+replace = "version: {{version}}"
+prerelease = true
+
+[[pre-release-replacements]]
+file = "ops/operator/Cargo.toml"
+search = '^version = ".*"$'
+replace = 'version = "{{version}}"'
+prerelease = true
+
+# The changelog is generated from the commit history by git-cliff rather than hand-written, so it
+# cannot drift from what actually shipped.
+pre-release-hook = ["git", "cliff", "--tag", "v{{version}}", "--output", "CHANGELOG.md"]
