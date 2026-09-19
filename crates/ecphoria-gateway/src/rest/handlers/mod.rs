@@ -31,6 +31,28 @@ pub(crate) fn api_error(status: StatusCode, code: &str, message: String) -> Resp
     (status, Json(body)).into_response()
 }
 
+/// Map a core error from a memory operation onto an HTTP status.
+///
+/// [`ecphoria_core::Error::Validation`] is the **writer's** to fix — a fact that does not match
+/// its schema, a subject that does not follow its kind's grammar, a write with no provenance in a
+/// tenant that requires one — so it is a 422 carrying the list of what is wrong. Everything else
+/// is ours and stays a 500: a caller cannot do anything about a disk error, and dressing one up
+/// as a client error sends them looking in the wrong place.
+pub(crate) fn memory_error(e: ecphoria_core::Error) -> Response {
+    match e {
+        ecphoria_core::Error::Validation(message) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            message,
+        ),
+        other => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            other.to_string(),
+        ),
+    }
+}
+
 pub(crate) fn api_ok(body: serde_json::Value) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }

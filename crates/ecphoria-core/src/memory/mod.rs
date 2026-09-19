@@ -1,8 +1,10 @@
 pub mod cognition;
 pub mod episodic;
+pub mod facts;
 pub mod graph_analytics;
 pub mod lexical;
 pub mod migrations;
 pub mod query_log;
+pub mod schema;
 pub mod semantic;
 pub mod state;

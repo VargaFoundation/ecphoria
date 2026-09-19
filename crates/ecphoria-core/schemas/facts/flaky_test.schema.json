@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/flaky_test.schema.json",
+  "title": "flaky_test",
+  "description": "A test that fails without the code changing. Subject: flaky_test:<path>::<name>.",
+  "type": "object",
+  "required": ["test_path", "test_name"],
+  "properties": {
+    "test_path": {"type": "string", "minLength": 1},
+    "test_name": {"type": "string", "minLength": 1},
+    "failure_rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "runs_observed": {"type": "integer", "minimum": 1},
+    "first_seen": {"type": "string", "format": "date-time"},
+    "last_seen": {"type": "string", "format": "date-time"},
+    "quarantined": {"type": "boolean"}
+  }
+}

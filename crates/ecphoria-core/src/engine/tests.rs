@@ -4285,3 +4285,289 @@ async fn searches_are_not_recorded_by_default() {
         "queries were recorded without being enabled"
     );
 }
+
+// ── Governance: attribution and typed facts (E-04, E-10) ──────────────────────
+
+/// A config where one tenant is governed and the rest of the store is not.
+fn governed_config(
+    tenant: &str,
+    require_provenance: bool,
+    validation: crate::memory::facts::FactValidation,
+) -> CoreConfig {
+    let mut c = inmem_config();
+    c.memory.governance.tenants.insert(
+        tenant.to_string(),
+        crate::config::TenantGovernance {
+            require_provenance: Some(require_provenance),
+            fact_validation: Some(validation),
+        },
+    );
+    c
+}
+
+fn fact(tenant: &str, subject: &str, metadata: serde_json::Value) -> MemoryInput {
+    let mut input = MemoryInput::new(MemoryScope::tenant(tenant), "the fact's text");
+    input.subject = Some(subject.to_string());
+    input.metadata = metadata;
+    input
+}
+
+#[tokio::test]
+async fn an_ungoverned_tenant_writes_exactly_as_before() {
+    let engine = EcphoriaEngine::new(governed_config(
+        "strict-tenant",
+        true,
+        crate::memory::facts::FactValidation::Strict,
+    ))
+    .await
+    .unwrap();
+
+    // Same write, a different tenant: governance is per tenant, so this one is untouched.
+    engine
+        .memory_add(fact("other-tenant", "whatever", serde_json::json!({})))
+        .await
+        .expect("an ungoverned tenant keeps writing anything");
+}
+
+#[tokio::test]
+async fn a_write_without_provenance_is_refused_when_the_tenant_requires_it() {
+    let engine = EcphoriaEngine::new(governed_config(
+        "acme",
+        true,
+        crate::memory::facts::FactValidation::Off,
+    ))
+    .await
+    .unwrap();
+
+    let err = engine
+        .memory_add(fact("acme", "deploy.target", serde_json::json!({})))
+        .await
+        .expect_err("no provenance, and acme requires it");
+    assert!(matches!(err, crate::Error::Validation(_)), "{err:?}");
+    assert!(err.to_string().contains("provenance"), "{err}");
+
+    // An empty provenance object is what a client sends when it has nothing — it must not pass.
+    let err = engine
+        .memory_add(fact(
+            "acme",
+            "deploy.target",
+            serde_json::json!({"provenance": {}}),
+        ))
+        .await
+        .expect_err("an empty provenance object is not provenance");
+    assert!(matches!(err, crate::Error::Validation(_)), "{err:?}");
+
+    engine
+        .memory_add(fact(
+            "acme",
+            "deploy.target",
+            serde_json::json!({"provenance": {"source": "gitlab", "ref": "MR-12"}}),
+        ))
+        .await
+        .expect("with a source, the same write goes through");
+}
+
+#[tokio::test]
+async fn strict_validation_refuses_a_malformed_fact_and_says_what_is_wrong() {
+    let engine = EcphoriaEngine::new(governed_config(
+        "acme",
+        false,
+        crate::memory::facts::FactValidation::Strict,
+    ))
+    .await
+    .unwrap();
+
+    let err = engine
+        .memory_add(fact(
+            "acme",
+            "the checkout outage",
+            serde_json::json!({"kind": "incident"}),
+        ))
+        .await
+        .expect_err("an incident with no service, no date and a free-text subject");
+    let message = err.to_string();
+    assert!(message.contains("service"), "{message}");
+    assert!(message.contains("occurred_at"), "{message}");
+    assert!(
+        message.contains("incident:<service>:<yyyy-mm-dd>"),
+        "{message}"
+    );
+
+    engine
+        .memory_add(fact(
+            "acme",
+            "incident:checkout-api:2026-09-14",
+            serde_json::json!({
+                "kind": "incident",
+                "service": "checkout-api",
+                "occurred_at": "2026-09-14T03:12:00Z",
+            }),
+        ))
+        .await
+        .expect("the well-formed version is accepted");
+}
+
+#[tokio::test]
+async fn warn_mode_accepts_what_strict_would_refuse() {
+    let engine = EcphoriaEngine::new(governed_config(
+        "acme",
+        false,
+        crate::memory::facts::FactValidation::Warn,
+    ))
+    .await
+    .unwrap();
+
+    // The migration mode: the write lands, and the operator sees the counter move.
+    engine
+        .memory_add(fact(
+            "acme",
+            "a free-text subject",
+            serde_json::json!({"kind": "incident"}),
+        ))
+        .await
+        .expect("warn never refuses");
+}
+
+#[tokio::test]
+async fn a_proposal_is_held_to_the_same_rules_as_a_write() {
+    let engine = EcphoriaEngine::new(governed_config(
+        "acme",
+        true,
+        crate::memory::facts::FactValidation::Strict,
+    ))
+    .await
+    .unwrap();
+
+    // Proposing must not be the way around the tenant's rules.
+    let err = engine
+        .memory_propose(fact(
+            "acme",
+            "the checkout outage",
+            serde_json::json!({"kind": "incident"}),
+        ))
+        .await
+        .expect_err("a proposal is a write");
+    assert!(matches!(err, crate::Error::Validation(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_proposal_subject_is_normalized_like_any_other() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let mut input = MemoryInput::new(MemoryScope::tenant("t"), "the api is versioned by header");
+    input.subject = Some("  Decision:API:Versioning  ".into());
+    let proposal = engine.memory_propose(input).await.unwrap();
+    assert_eq!(proposal.subject.as_deref(), Some("decision:api:versioning"));
+}
+
+#[tokio::test]
+async fn the_engine_own_housekeeping_is_attributable() {
+    // `require_provenance` must not turn consolidation or document ingest off: both write their
+    // own provenance, so a governed tenant can still use them.
+    let engine = EcphoriaEngine::new(governed_config(
+        "acme",
+        true,
+        crate::memory::facts::FactValidation::Off,
+    ))
+    .await
+    .unwrap();
+
+    let scope = MemoryScope::tenant("acme");
+    let result = engine
+        .document_ingest(
+            crate::engine::DocumentIngest {
+                path: "docs/runbook.md",
+                content: "# Runbook\n\nRestart the worker.\n",
+                metadata: serde_json::json!({}),
+                valid_from: None,
+                project: None,
+            },
+            &scope,
+            &crate::ingest::chunk::ChunkOptions::default(),
+        )
+        .await
+        .expect("a document section carries the document as its source");
+    assert!(result.inserted > 0, "{result:?}");
+}
+
+#[tokio::test]
+async fn the_kind_column_is_filled_from_metadata_and_queryable_in_sql() {
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    engine
+        .memory_add(fact(
+            "default",
+            "incident:payments:2026-01-02",
+            serde_json::json!({
+                "kind": "incident",
+                "service": "payments",
+                "occurred_at": "2026-01-02T00:00:00Z",
+            }),
+        ))
+        .await
+        .unwrap();
+    engine
+        .memory_add(fact(
+            "default",
+            "decision:api:versioning",
+            serde_json::json!({"kind": "decision"}),
+        ))
+        .await
+        .unwrap();
+    // An untyped memory leaves the column NULL rather than inventing a kind.
+    engine
+        .memory_add(MemoryInput::new(
+            MemoryScope::tenant("default"),
+            "free text",
+        ))
+        .await
+        .unwrap();
+
+    let rows = engine
+        .query_sql("SELECT kind, COUNT(*)::VARCHAR AS n FROM memories GROUP BY kind ORDER BY kind")
+        .await
+        .unwrap();
+    let counts: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["kind"].as_str().unwrap_or("null").to_string(),
+                r["n"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts.get("incident").map(String::as_str),
+        Some("1"),
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.get("decision").map(String::as_str),
+        Some("1"),
+        "{counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_write_fills_the_kind_column_too() {
+    // The batch path uses the DuckDB Appender, which lists its columns separately from the
+    // single-row INSERT — the two drifting apart is exactly the bug this catches.
+    let engine = EcphoriaEngine::new(inmem_config()).await.unwrap();
+    let inputs = vec![
+        fact(
+            "default",
+            "hotspot:src/billing/invoice.rs",
+            serde_json::json!({"kind": "hotspot", "path": "src/billing/invoice.rs"}),
+        ),
+        fact(
+            "default",
+            "hotspot:src/billing/tax.rs",
+            serde_json::json!({"kind": "hotspot", "path": "src/billing/tax.rs"}),
+        ),
+    ];
+    engine.memory_add_batch(inputs).await.unwrap();
+
+    let rows = engine
+        .query_sql("SELECT COUNT(*)::VARCHAR AS n FROM memories WHERE kind = 'hotspot'")
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["n"], "2");
+}

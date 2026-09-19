@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/incident.schema.json",
+  "title": "incident",
+  "description": "Something that broke, when, and to what. Subject: incident:<service>:<date>. `service` and `occurred_at` are required because an incident nobody can date or attribute is unusable as evidence.",
+  "type": "object",
+  "required": ["service", "occurred_at"],
+  "properties": {
+    "service": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "resolved_at": {"type": "string", "format": "date-time"},
+    "severity": {"type": "string", "enum": ["sev1", "sev2", "sev3", "sev4"]},
+    "postmortem": {"type": "string", "minLength": 1},
+    "root_cause": {"type": "string", "minLength": 1}
+  }
+}

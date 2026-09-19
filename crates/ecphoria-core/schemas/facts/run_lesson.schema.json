@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/run_lesson.schema.json",
+  "title": "run_lesson",
+  "description": "What a run taught, so the next one does not relearn it. Subject: run_lesson:<workflow>:<slug>.",
+  "type": "object",
+  "required": ["workflow"],
+  "properties": {
+    "workflow": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "outcome": {"type": "string", "enum": ["success", "failure", "cancelled"]},
+    "stage": {"type": "string", "minLength": 1}
+  }
+}

@@ -102,6 +102,83 @@ pub struct MemoryConfig {
     pub cognition: CognitionConfig,
     pub promotion: PromotionConfig,
     pub query_log: QueryLogConfig,
+    pub governance: GovernanceConfig,
+}
+
+/// What a tenant is allowed to write — attribution and fact shape.
+///
+/// Per tenant, because these are *editorial* rules, not engine settings: a team running a curated
+/// corpus wants every memory attributable and every typed fact well formed, while the tenant next
+/// to it is still importing a decade of unattributed notes. One global switch would force the
+/// strictest tenant's policy on the loosest, so the global value is only the default and each
+/// tenant may override it.
+///
+/// ```toml
+/// [memory.governance]
+/// require_provenance = false          # default for every tenant
+/// fact_validation = "warn"
+///
+/// [memory.governance.tenants.acme]
+/// require_provenance = true           # acme's writers must say where a fact came from
+/// fact_validation = "strict"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct GovernanceConfig {
+    /// Refuse a memory whose origin is not recorded (`metadata.provenance.source`, or
+    /// `source_event_ids`). Off by default.
+    pub require_provenance: bool,
+    /// How hard the typed-fact schemas are enforced: `off` (default), `warn`, `strict`.
+    pub fact_validation: crate::memory::facts::FactValidation,
+    /// Per-tenant overrides, keyed by tenant id.
+    pub tenants: std::collections::HashMap<String, TenantGovernance>,
+}
+
+/// One tenant's overrides. `None` means "inherit the global value" — which is why these are
+/// `Option`s rather than plain fields with defaults: a missing key must not silently mean `false`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TenantGovernance {
+    pub require_provenance: Option<bool>,
+    pub fact_validation: Option<crate::memory::facts::FactValidation>,
+}
+
+/// The rules that actually apply to one write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveGovernance {
+    pub require_provenance: bool,
+    pub fact_validation: crate::memory::facts::FactValidation,
+}
+
+impl EffectiveGovernance {
+    /// Nothing is demanded — the default, and what every tenant gets until configured otherwise.
+    pub fn permissive() -> Self {
+        Self {
+            require_provenance: false,
+            fact_validation: crate::memory::facts::FactValidation::Off,
+        }
+    }
+
+    /// Is there anything to check at all? Lets the write path skip validation entirely for the
+    /// overwhelmingly common case of an unconfigured tenant.
+    pub fn is_permissive(&self) -> bool {
+        !self.require_provenance && self.fact_validation.is_off()
+    }
+}
+
+impl GovernanceConfig {
+    /// Resolve the rules for one tenant: its own override if it has one, else the global default.
+    pub fn for_tenant(&self, tenant_id: &str) -> EffectiveGovernance {
+        let over = self.tenants.get(tenant_id);
+        EffectiveGovernance {
+            require_provenance: over
+                .and_then(|t| t.require_provenance)
+                .unwrap_or(self.require_provenance),
+            fact_validation: over
+                .and_then(|t| t.fact_validation)
+                .unwrap_or(self.fact_validation),
+        }
+    }
 }
 
 /// Recording of searches, so retrieval quality can be measured against real questions.

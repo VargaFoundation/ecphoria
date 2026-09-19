@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/finding.schema.json",
+  "title": "finding",
+  "description": "Something a tool reported about the code. Subject: finding:<tool>:<rule>.",
+  "type": "object",
+  "required": ["tool", "rule"],
+  "properties": {
+    "tool": {"type": "string", "minLength": 1},
+    "rule": {"type": "string", "minLength": 1},
+    "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+    "path": {"type": "string", "minLength": 1},
+    "line": {"type": "integer", "minimum": 1},
+    "cve": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["open", "triaged", "fixed", "accepted_risk", "false_positive"]}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/convention.schema.json",
+  "title": "convention",
+  "description": "A rule the code is expected to follow. Subject: convention:<area>:<slug>.",
+  "type": "object",
+  "properties": {
+    "enforced_by": {"description": "What checks it — a linter rule, a CI job, or `review` when only a human does.", "type": "string", "minLength": 1},
+    "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+    "since": {"type": "string", "format": "date-time"}
+  }
+}

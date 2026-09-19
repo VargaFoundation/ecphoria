@@ -11,7 +11,10 @@ use ecphoria_core::EcphoriaEngine;
 
 use crate::rest::models::*;
 
-use super::{api_error, api_ok, cluster_write_error, parse_as_of, scope_with_header, TenantHeader};
+use super::{
+    api_error, api_ok, cluster_write_error, memory_error, parse_as_of, scope_with_header,
+    TenantHeader,
+};
 
 /// `POST /api/v1/memories` — write a memory, or **propose** one with `?status=pending`.
 ///
@@ -82,13 +85,7 @@ pub async fn memory_add(
     if let Some(Extension(coord)) = cluster {
         let (result, rows) = match engine.memory_plan(input).await {
             Ok(pair) => pair,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MEMORY_ERROR",
-                    e.to_string(),
-                )
-            }
+            Err(e) => return memory_error(e),
         };
         let coord = coord.read().await;
         let ar = ecphoria_cluster::raft::types::AppRequest::MemoryUpsert { rows };
@@ -100,11 +97,7 @@ pub async fn memory_add(
 
     match engine.memory_add(input).await {
         Ok(added) => api_ok(serde_json::to_value(added).unwrap_or_default()),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -318,13 +311,7 @@ pub async fn memory_add_batch(
         for input in inputs {
             let (result, rows) = match engine.memory_plan(input).await {
                 Ok(pair) => pair,
-                Err(e) => {
-                    return api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "MEMORY_ERROR",
-                        e.to_string(),
-                    )
-                }
+                Err(e) => return memory_error(e),
             };
             let ar = ecphoria_cluster::raft::types::AppRequest::MemoryUpsert { rows };
             if let Err(e) = coord.client_write(ar).await {
@@ -343,11 +330,7 @@ pub async fn memory_add_batch(
             "added": added.len(),
             "memories": added,
         })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -385,11 +368,7 @@ pub async fn memory_search(
     };
     match result {
         Ok(hits) => api_ok(serde_json::json!({ "results": hits, "count": hits.len() })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -507,11 +486,7 @@ pub async fn memory_list(
             "limit": params.limit,
             "offset": params.offset,
         })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -544,11 +519,7 @@ pub async fn memory_get(
             "NOT_FOUND",
             format!("memory '{id}' not found"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -581,11 +552,7 @@ pub async fn memory_delete(
             "NOT_FOUND",
             format!("memory '{id}' not found"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -637,13 +604,7 @@ pub async fn memory_update(
             .await
         {
             Ok(p) => p,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MEMORY_ERROR",
-                    e.to_string(),
-                )
-            }
+            Err(e) => return memory_error(e),
         };
         let Some((updated, rows)) = plan else {
             return api_error(
@@ -667,11 +628,7 @@ pub async fn memory_update(
             "NOT_FOUND",
             format!("memory '{id}' not found"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -715,11 +672,7 @@ pub async fn memory_history_by_subject(
             "count": memories.len(),
             "memories": memories,
         })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -753,13 +706,7 @@ pub async fn memory_history(
                 format!("memory '{id}' not found"),
             )
         }
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            )
-        }
+        Err(e) => return memory_error(e),
     };
 
     match mem.subject.clone() {
@@ -769,11 +716,7 @@ pub async fn memory_history(
                 "history": history,
                 "count": history.len(),
             })),
-            Err(e) => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            ),
+            Err(e) => memory_error(e),
         },
         // No subject → no supersession chain; the memory is its own history.
         None => api_ok(serde_json::json!({ "history": [mem], "count": 1 })),
@@ -815,11 +758,7 @@ pub async fn memory_provenance(
             "NOT_FOUND",
             format!("memory '{id}' not found"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -872,13 +811,7 @@ pub async fn memory_feedback(
                 format!("memory '{id}' not found"),
             )
         }
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            )
-        }
+        Err(e) => return memory_error(e),
     };
 
     // Cluster mode: replicate the materialized change through the Raft log so followers converge.
@@ -899,11 +832,7 @@ pub async fn memory_feedback(
 
     match engine.memory_feedback_apply(action).await {
         Ok(()) => api_ok(serde_json::json!({ "verdict": req.verdict, "memory": memory })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -931,11 +860,7 @@ pub async fn memory_contradictions(
         Ok(groups) => {
             api_ok(serde_json::json!({ "contradictions": groups, "count": groups.len() }))
         }
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -982,11 +907,7 @@ pub async fn memory_resolve_contradiction(
     }
     match engine.memory_apply_rows(rows).await {
         Ok(_) => api_ok(serde_json::json!({ "kept": req.keep_id, "superseded": superseded })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1036,11 +957,7 @@ pub async fn memory_reembed(
     }
     match engine.memory_apply_rows(rows).await {
         Ok(_) => api_ok(serde_json::json!({ "reembedded": reembedded })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1074,24 +991,12 @@ pub async fn memory_consolidate(
         let plan = match engine.memory_consolidate_plan(&scope, keep).await {
             Ok(Some(p)) => p,
             Ok(None) => return api_ok(serde_json::json!({ "consolidated": null })),
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MEMORY_ERROR",
-                    e.to_string(),
-                )
-            }
+            Err(e) => return memory_error(e),
         };
         let (input, expired) = plan;
         let (result, rows) = match engine.memory_plan(input).await {
             Ok(pair) => pair,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "MEMORY_ERROR",
-                    e.to_string(),
-                )
-            }
+            Err(e) => return memory_error(e),
         };
         let coord = coord.read().await;
         if let Err(e) = coord
@@ -1112,11 +1017,7 @@ pub async fn memory_consolidate(
     match engine.memory_consolidate(&scope, keep).await {
         Ok(Some(m)) => api_ok(serde_json::json!({ "consolidated": m })),
         Ok(None) => api_ok(serde_json::json!({ "consolidated": null })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1148,13 +1049,7 @@ pub async fn memory_consolidate_similar(
         .await
     {
         Ok(p) => p,
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            )
-        }
+        Err(e) => return memory_error(e),
     };
     let clusters = plans.len();
 
@@ -1164,13 +1059,7 @@ pub async fn memory_consolidate_similar(
         for (input, expired) in plans {
             let (_result, rows) = match engine.memory_plan(input).await {
                 Ok(p) => p,
-                Err(e) => {
-                    return api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "MEMORY_ERROR",
-                        e.to_string(),
-                    )
-                }
+                Err(e) => return memory_error(e),
             };
             if let Err(e) = coord
                 .client_write(ecphoria_cluster::raft::types::AppRequest::MemoryUpsert { rows })
@@ -1192,18 +1081,10 @@ pub async fn memory_consolidate_similar(
 
     for (input, expired) in plans {
         if let Err(e) = engine.memory_add(input).await {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            );
+            return memory_error(e);
         }
         if let Err(e) = engine.memory_expire(&expired).await {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            );
+            return memory_error(e);
         }
     }
     api_ok(serde_json::json!({ "clusters_folded": clusters }))
@@ -1316,11 +1197,7 @@ pub async fn memory_link(
     };
     match result {
         Ok(()) => api_ok(serde_json::json!({ "status": "ok" })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1343,11 +1220,7 @@ pub async fn memory_edges(
         .await
     {
         Ok(edges) => api_ok(serde_json::json!({ "edges": edges, "count": edges.len() })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1398,11 +1271,7 @@ pub async fn memory_propose(
             "status": "pending",
             "memory": memory,
         })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1425,11 +1294,7 @@ pub async fn pending_list(
     );
     match engine.memory_pending(&scope, params.limit).await {
         Ok(items) => api_ok(serde_json::json!({ "items": items, "count": items.len() })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1452,11 +1317,7 @@ pub async fn pending_accept(
             "NOT_PENDING",
             format!("no pending proposal {id} for this tenant"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1479,11 +1340,7 @@ pub async fn pending_reject(
             "NOT_PENDING",
             format!("no pending proposal {id} for this tenant"),
         ),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1571,11 +1428,7 @@ pub async fn memory_upsert_by_external_id(
             "outcome": added.outcome,
             "memory": added.memory,
         })),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MEMORY_ERROR",
-            e.to_string(),
-        ),
+        Err(e) => memory_error(e),
     }
 }
 
@@ -1623,13 +1476,7 @@ pub async fn context_pack(
         .await
     {
         Ok(hits) => hits,
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "MEMORY_ERROR",
-                e.to_string(),
-            )
-        }
+        Err(e) => return memory_error(e),
     };
 
     let mut memories = Vec::new();

@@ -35,6 +35,17 @@ db_path = "./data/state.db"
 # contradiction_review = false   # true → contradictions queue for human review instead of auto-superseding
 # decay_interval_secs = 0        # >0 → leader forgets decayed memories on this interval (0 = off)
 
+# Per-tenant rules over what may be written: attribution, and the shape of typed facts.
+# Both are off by default — see docs/facts.md.
+[memory.governance]
+# require_provenance = false     # true → a write needs metadata.provenance.source (or source_event_ids)
+# fact_validation = "off"        # "off" | "warn" (count + log) | "strict" (refuse with 422)
+
+# Per-tenant overrides. Anything left out inherits the values above.
+# [memory.governance.tenants.acme]
+# require_provenance = true
+# fact_validation = "strict"
+
 [embedding]
 provider = "ollama"            # "ollama" | "openai" | "local" | "none"
 # "local" = in-process ONNX embeddings (no sidecar) — build with `--features embed-local`.

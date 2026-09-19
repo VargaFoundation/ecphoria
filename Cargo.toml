@@ -108,6 +108,10 @@ parking_lot = { version = "0.12" }
 dashmap = { version = "6" }
 rand = { version = "0.9" }
 
+# Regex — fact-subject grammars and the small JSON Schema validator (`memory::schema`).
+# Already in the tree transitively; declared here so the version is pinned in one place.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+
 # SQL parsing (visitor feature: AST rewriting for tenant scoping)
 sqlparser = { version = "0.53", features = ["visitor"] }
 

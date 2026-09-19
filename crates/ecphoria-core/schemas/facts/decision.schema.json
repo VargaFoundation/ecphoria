@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/decision.schema.json",
+  "title": "decision",
+  "description": "A choice that was made, and is expected to hold until superseded. Subject: decision:<area>:<slug>.",
+  "type": "object",
+  "properties": {
+    "status": {"type": "string", "enum": ["proposed", "accepted", "superseded", "rejected"]},
+    "adr": {"description": "Reference to the written record (ADR number, document path or URL).", "type": "string", "minLength": 1},
+    "alternatives": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "decided_at": {"type": "string", "format": "date-time"},
+    "decided_by": {"type": "string", "minLength": 1}
+  }
+}

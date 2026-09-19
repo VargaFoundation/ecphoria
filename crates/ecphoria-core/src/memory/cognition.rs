@@ -594,6 +594,21 @@ pub fn normalize_subject(subject: &str) -> String {
         .to_lowercase()
 }
 
+/// The fact `kind` stored in its own column, read from `metadata.kind`.
+///
+/// Derived, never authoritative: `metadata` stays the wire format and the Rust model reads the
+/// kind from there. The column exists for SQL — "every incident this quarter" is a question this
+/// store should answer over PG-wire without a JSON extraction per row, and an index cannot be
+/// built on one. `NULL` for an untyped memory.
+pub(crate) fn fact_kind_of(memory: &Memory) -> Option<String> {
+    memory
+        .metadata
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Tokenize for BM25 + graph matching: split on non-alphanumerics, lowercase, drop stop words, and
 /// apply a light stemmer so reworded terms still match.
 pub fn tokenize(text: &str) -> Vec<String> {
@@ -930,6 +945,22 @@ impl MemoryStore {
                     sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS project VARCHAR;
                           CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(tenant_id, project);",
                 },
+                super::migrations::Migration {
+                    version: 7,
+                    // Typed facts (`memory::facts`): the fact `kind` gets its own column.
+                    //
+                    // It stays *derived* from `metadata.kind`, which remains the wire format — the
+                    // column exists for the SQL surface. "Every incident this quarter" is a
+                    // question this store should answer over PG-wire without a JSON extraction on
+                    // every row, and an index cannot be built on one.
+                    //
+                    // Backfilled from existing metadata, so the column is right for memories
+                    // written before it existed.
+                    sql: "ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind VARCHAR;
+                          UPDATE memories SET kind = json_extract_string(metadata, '$.kind')
+                            WHERE kind IS NULL AND metadata IS NOT NULL;
+                          CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(tenant_id, kind);",
+                },
             ],
         );
 
@@ -1034,9 +1065,9 @@ impl MemoryStore {
             "INSERT OR IGNORE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, mem_type, embedding, project)
+              created_at, updated_at, metadata, mem_type, embedding, project, kind)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?,?)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -1058,6 +1089,7 @@ impl MemoryStore {
                 memory.mem_type,
                 embedding_json,
                 memory.project,
+                fact_kind_of(memory),
             ],
         )
         .map_err(|e| crate::Error::Ingest(format!("insert memory: {e}")))?;
@@ -1092,9 +1124,9 @@ impl MemoryStore {
             "INSERT OR REPLACE INTO memories
              (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
               valid_from, valid_to, state, supersedes, source_event_ids, version,
-              created_at, updated_at, metadata, mem_type, embedding, project)
+              created_at, updated_at, metadata, mem_type, embedding, project, kind)
              VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
+                     ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?,?)",
             duckdb::params![
                 memory.id.to_string(),
                 memory.scope.tenant_id,
@@ -1116,6 +1148,7 @@ impl MemoryStore {
                 memory.mem_type,
                 embedding_json,
                 memory.project,
+                fact_kind_of(memory),
             ],
         )
         .map_err(|e| crate::Error::Ingest(format!("upsert memory: {e}")))?;
@@ -1161,9 +1194,9 @@ impl MemoryStore {
                     "INSERT OR REPLACE INTO memories
                      (id, tenant_id, user_id, agent_id, session_id, subject, content, importance,
                       valid_from, valid_to, state, supersedes, source_event_ids, version,
-                      created_at, updated_at, metadata, mem_type, embedding, project)
+                      created_at, updated_at, metadata, mem_type, embedding, project, kind)
                      VALUES (?,?,?,?,?,?,?,?, ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?,?,?,?, \
-                             ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?)",
+                             ?::TIMESTAMPTZ,?::TIMESTAMPTZ,?::JSON,?,?::JSON,?,?)",
                 )
                 .map_err(|e| crate::Error::Ingest(format!("prepare error: {e}")))?;
             for row in rows {
@@ -1207,6 +1240,7 @@ impl MemoryStore {
                     memory.mem_type,
                     embedding_json,
                     memory.project,
+                    fact_kind_of(memory),
                 ])
                 .map_err(|e| crate::Error::Ingest(format!("insert memory: {e}")))?;
             }
@@ -1294,6 +1328,7 @@ impl MemoryStore {
                         "mem_type",
                         "embedding",
                         "project",
+                        "kind",
                     ],
                 )
                 .map_err(|e| crate::Error::Ingest(format!("memories appender: {e}")))?;
@@ -1334,6 +1369,7 @@ impl MemoryStore {
                             .as_ref()
                             .map(|e| serde_json::to_string(e).unwrap_or_default()),
                         m.project.clone(),
+                        fact_kind_of(m),
                     ])
                     .map_err(|e| crate::Error::Ingest(format!("append memory: {e}")))?;
             }
@@ -2429,11 +2465,28 @@ impl MemoryStore {
                 .map_err(|e| crate::Error::Storage(format!("import memories snapshot: {e}")))?;
         }
         let db = self.write_db.lock();
+        db.execute_batch(&format!("ATTACH '{staging_str}' AS snap (READ_ONLY);"))
+            .map_err(|e| crate::Error::Storage(format!("attach memories snapshot: {e}")))?;
+
+        // Copy **by name**, not `SELECT *`.
+        //
+        // A snapshot outlives the schema it was taken from: restoring a backup made before
+        // migration 7 into a table that now has `kind` is exactly when a restore matters, and
+        // positional copy fails there on a column count mismatch. Columns the snapshot does not
+        // have take their default; columns it has and we no longer do are dropped, with a warning
+        // rather than in silence.
+        let columns = match Self::shared_columns(&db) {
+            Ok(cols) => cols,
+            Err(e) => {
+                let _ = db.execute_batch("DETACH snap");
+                return Err(e);
+            }
+        };
+        let list = columns.join(", ");
         let swap = format!(
-            "ATTACH '{staging_str}' AS snap (READ_ONLY);
-             BEGIN TRANSACTION;
+            "BEGIN TRANSACTION;
              DELETE FROM memories;
-             INSERT INTO memories SELECT * FROM snap.memories;
+             INSERT INTO memories ({list}) SELECT {list} FROM snap.memories;
              COMMIT;"
         );
         if let Err(e) = db.execute_batch(&swap) {
@@ -2443,6 +2496,39 @@ impl MemoryStore {
         }
         let _ = db.execute_batch("DETACH snap");
         Ok(())
+    }
+
+    /// Columns present in **both** the live `memories` table and the attached `snap.memories`,
+    /// in the live table's order. Requires `snap` to be attached.
+    fn shared_columns(db: &Connection) -> crate::Result<Vec<String>> {
+        let read = |db: &Connection, table: &str| -> crate::Result<Vec<String>> {
+            let mut stmt = db
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .map_err(|e| crate::Error::Storage(format!("describe {table}: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| crate::Error::Storage(format!("describe {table}: {e}")))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        };
+        let live = read(db, "memories")?;
+        let snapshot = read(db, "snap.memories")?;
+        let shared: Vec<String> = live
+            .iter()
+            .filter(|c| snapshot.contains(c))
+            .cloned()
+            .collect();
+        if shared.is_empty() {
+            return Err(crate::Error::Storage(
+                "memories snapshot shares no column with this schema — refusing to restore".into(),
+            ));
+        }
+        for missing in live.iter().filter(|c| !snapshot.contains(c)) {
+            tracing::info!(column = %missing, "restoring an older memories snapshot — column left at its default");
+        }
+        for dropped in snapshot.iter().filter(|c| !live.contains(c)) {
+            tracing::warn!(column = %dropped, "memories snapshot has a column this schema no longer holds — dropped");
+        }
+        Ok(shared)
     }
 
     /// Load all active memories together with their persisted embeddings, so the in-memory

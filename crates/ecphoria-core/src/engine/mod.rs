@@ -2239,6 +2239,66 @@ impl EcphoriaEngine {
 
     // ── Memory Cognition ──────────────────────────────────────────────
 
+    /// Apply the tenant's governance rules to one write: attribution, then fact shape.
+    ///
+    /// Both are off by default, and the common case — an unconfigured tenant — costs one map
+    /// lookup and returns. See [`crate::config::GovernanceConfig`].
+    ///
+    /// `warn` exists because turning validation on in a store that already holds untyped memories
+    /// would otherwise mean choosing between breaking every writer and learning nothing: in `warn`
+    /// the write succeeds, and `ecphoria_fact_validation_failures_total` counts what `strict`
+    /// would have refused.
+    fn check_governance(
+        &self,
+        scope: &crate::memory::cognition::MemoryScope,
+        subject: Option<&str>,
+        metadata: &serde_json::Value,
+        source_event_ids: &[uuid::Uuid],
+    ) -> Result<()> {
+        let rules = self.config.memory.governance.for_tenant(&scope.tenant_id);
+        if rules.is_permissive() {
+            return Ok(());
+        }
+
+        if rules.require_provenance
+            && !crate::memory::facts::has_provenance(metadata, source_event_ids)
+        {
+            metrics::counter!(
+                "ecphoria_memory_writes_refused_total",
+                "reason" => "provenance"
+            )
+            .increment(1);
+            return Err(crate::Error::Validation(
+                "this tenant requires provenance: set `metadata.provenance.source` (or supply                  `source_event_ids`) so the fact can be traced back to where it came from"
+                    .into(),
+            ));
+        }
+
+        if rules.fact_validation.is_off() {
+            return Ok(());
+        }
+        let errors = crate::memory::facts::validate(subject, metadata);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let mode = if rules.fact_validation == crate::memory::facts::FactValidation::Strict {
+            "strict"
+        } else {
+            "warn"
+        };
+        metrics::counter!("ecphoria_fact_validation_failures_total", "mode" => mode).increment(1);
+        if mode == "warn" {
+            tracing::warn!(
+                tenant = %scope.tenant_id,
+                subject = subject.unwrap_or("<none>"),
+                errors = %errors.join("; "),
+                "fact does not validate — accepted because this tenant is in `warn` mode"
+            );
+            return Ok(());
+        }
+        Err(crate::Error::Validation(errors.join("; ")))
+    }
+
     /// Add a memory through the deterministic cognition pipeline.
     ///
     /// Behaviour (deterministic core, no LLM required):
@@ -2316,6 +2376,12 @@ impl EcphoriaEngine {
             .subject
             .map(|s| crate::memory::cognition::normalize_subject(&s))
             .filter(|s| !s.is_empty());
+        self.check_governance(
+            &input.scope,
+            input.subject.as_deref(),
+            &input.metadata,
+            &input.source_event_ids,
+        )?;
         let cog = &self.config.memory.cognition;
         let importance = input.importance.unwrap_or(cog.default_importance);
 
@@ -2696,6 +2762,12 @@ impl EcphoriaEngine {
                 let mut meta = metadata.clone();
                 if let Some(obj) = meta.as_object_mut() {
                     obj.insert("doc_path".into(), doc_path.into());
+                    // A section's origin is the document it was cut from. Set unless the importer
+                    // said something more precise, so `require_provenance` does not turn the
+                    // document importer off.
+                    obj.entry("provenance").or_insert_with(
+                        || serde_json::json!({"source": "document", "ref": doc_path}),
+                    );
                     obj.insert("heading_path".into(), chunk.heading_path.clone().into());
                     obj.insert("ordinal".into(), chunk.ordinal.into());
                 }
@@ -3762,6 +3834,22 @@ impl EcphoriaEngine {
         if input.scope.tenant_id.is_empty() {
             input.scope.tenant_id = "default".into();
         }
+        // Normalize here too, not only on the accept path: the proposal's subject is what a
+        // reviewer reads and what `memory_pending` groups by, and a proposal whose key differs in
+        // casing from the memory it would supersede reads as unrelated to the one fact it is about.
+        input.subject = input
+            .subject
+            .map(|s| crate::memory::cognition::normalize_subject(&s))
+            .filter(|s| !s.is_empty());
+        // A proposal is still a write: an agent that may only suggest should not be the one path
+        // that escapes the tenant's rules, or `warn`/`strict` would be trivially bypassed by
+        // proposing and accepting.
+        self.check_governance(
+            &input.scope,
+            input.subject.as_deref(),
+            &input.metadata,
+            &input.source_event_ids,
+        )?;
         let now = chrono::Utc::now();
         let memory = Memory {
             id: uuid::Uuid::new_v4(),
@@ -4305,6 +4393,9 @@ impl EcphoriaEngine {
         input.metadata = serde_json::json!({
             "consolidated": true,
             "source_memory_ids": source_ids,
+            // The engine's own writes are attributable too — otherwise `require_provenance` would
+            // refuse consolidation, which is Ecphoria refusing its own housekeeping.
+            "provenance": {"source": "ecphoria:consolidation"},
         });
         let expired: Vec<uuid::Uuid> = to_fold.iter().map(|m| m.id).collect();
         Ok(Some((input, expired)))
@@ -4391,6 +4482,7 @@ impl EcphoriaEngine {
                 "consolidated": true,
                 "consolidation": "semantic",
                 "source_memory_ids": source_ids,
+                "provenance": {"source": "ecphoria:consolidation"},
             });
             let expired: Vec<uuid::Uuid> = cluster.iter().map(|m| m.id).collect();
             plans.push((input, expired));

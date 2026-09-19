@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/ticket_summary.schema.json",
+  "title": "ticket_summary",
+  "description": "What a tracker item was about, once it is done. Subject: ticket:<tracker>:<key>.",
+  "type": "object",
+  "required": ["tracker", "key"],
+  "properties": {
+    "tracker": {"type": "string", "enum": ["jira", "gitlab", "github", "azure_devops", "linear", "other"]},
+    "key": {"type": "string", "minLength": 1},
+    "state": {"type": "string", "minLength": 1},
+    "url": {"type": "string", "format": "uri"},
+    "closed_at": {"type": "string", "format": "date-time"}
+  }
+}

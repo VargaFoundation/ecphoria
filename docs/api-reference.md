@@ -195,6 +195,26 @@ the previous version is **superseded**, not overwritten — it stays queryable t
 as-of. Omit it and the memory is deduplicated by vector similarity instead (when embeddings are
 configured), or simply inserted.
 
+#### Typed facts
+
+`metadata.kind` promotes a memory to a typed fact — `decision`, `convention`, `incident`,
+`ticket_summary`, `run_lesson`, `flaky_test`, `hotspot`, `finding`, `other` — which gives it a
+subject grammar (`incident:<service>:<yyyy-mm-dd>`) and a per-kind schema. Off by default; a
+tenant can switch it to `warn` or `strict`, and can require provenance on every write. A write
+that does not validate is a **422** listing everything wrong at once. See [facts.md](./facts.md).
+
+```bash
+POST /api/v1/memories
+{ "subject": "incident:checkout-api:2026-09-14",
+  "content": "checkout returned 503 for 40 minutes after the 03:05 deploy",
+  "metadata": { "kind": "incident", "service": "checkout-api",
+                "occurred_at": "2026-09-14T03:12:00Z", "severity": "sev2",
+                "provenance": { "source": "pagerduty", "ref": "PD-4412" } } }
+```
+
+The kind is also a column on `memories`, so `WHERE kind = 'incident'` is an indexed predicate over
+SQL/PG-wire rather than a JSON extraction per row.
+
 ### Search
 
 ```bash
@@ -529,7 +549,9 @@ HTTP status codes:
 - `403` — Forbidden (insufficient permissions)
 - `404` — Not found
 - `408` — Request Timeout (query exceeded `query.timeout_ms`)
-- `422` — Unprocessable entity (valid JSON, invalid semantics — e.g., non-SELECT SQL)
+- `422` — Unprocessable entity (valid JSON, invalid semantics — a non-SELECT SQL query, or a
+  memory that fails its tenant's governance rules: `code: VALIDATION_FAILED`, `message` listing
+  every problem, see [facts.md](./facts.md))
 - `500` — Internal server error
 - `503` — Service Unavailable (no leader elected yet)
 - `504` — Gateway Timeout (request exceeded 30s HTTP timeout)

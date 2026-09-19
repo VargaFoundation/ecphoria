@@ -2177,6 +2177,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "proptest",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

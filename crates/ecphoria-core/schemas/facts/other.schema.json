@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/other.schema.json",
+  "title": "other",
+  "description": "An untyped fact. The escape hatch: the envelope still holds, nothing else is demanded, and no subject grammar applies.",
+  "type": "object"
+}

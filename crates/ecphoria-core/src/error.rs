@@ -23,6 +23,13 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// The request is well-formed but what it asks for is not acceptable: a fact that does not
+    /// match its schema, a subject that does not follow its kind's grammar, a write with no
+    /// provenance in a tenant that requires it. Distinct from the others because the gateway owes
+    /// it a 422 and the message is meant for the writer, not for an operator reading logs.
+    #[error("validation error: {0}")]
+    Validation(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -69,6 +76,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "configuration error: missing field 'data_dir'"
+        );
+    }
+
+    #[test]
+    fn error_display_validation() {
+        let err = Error::Validation("subject: does not match `incident:<service>:<date>`".into());
+        assert_eq!(
+            err.to_string(),
+            "validation error: subject: does not match `incident:<service>:<date>`"
         );
     }
 

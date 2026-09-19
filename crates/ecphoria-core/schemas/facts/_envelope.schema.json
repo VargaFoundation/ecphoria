@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ecphoria.dev/schemas/facts/_envelope.schema.json",
+  "title": "Fact envelope",
+  "description": "Shape shared by every typed fact, validated before the kind-specific schema. Metadata stays open — unknown fields are a caller's business — but the fields Ecphoria itself reads must hold their shape.",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["decision", "convention", "incident", "ticket_summary", "run_lesson", "flaky_test", "hotspot", "finding", "other"]
+    },
+    "paths": {
+      "description": "Code this fact is about. A fact that names paths is only offered to a task allowed to touch one of them.",
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "external_id": {
+      "description": "The writer's own identifier, used for idempotent re-delivery.",
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {"type": "string", "minLength": 1},
+    "provenance": {
+      "description": "Where this fact came from. `source` is what makes it checkable later.",
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "ref": {"type": "string"},
+        "run_id": {"type": "string"},
+        "work_item_key": {"type": "string"},
+        "author": {"type": "string"},
+        "ts": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}
