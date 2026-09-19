@@ -25,6 +25,13 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub allow_insecure: bool,
     pub max_pg_connections: usize,
+    /// Seconds a PG-wire connection may take to authenticate before it is closed.
+    ///
+    /// Bounds the one thing that costs an attacker nothing: opening `max_pg_connections` sockets
+    /// and never speaking. Applies to the handshake only — an authenticated session then runs as
+    /// long as it likes. 0 disables it (not recommended on an exposed port).
+    #[serde(default = "default_pg_handshake_timeout_secs")]
+    pub pg_handshake_timeout_secs: u64,
     /// API keys that are allowed to access the server (when auth_enabled = true).
     /// Entry forms: `<secret>`, `<secret>@<tenant>`, `<secret>@<tenant>:<role>`; the secret part
     /// may be `sha256:<64-hex>` (digest of the secret) so no plaintext credential sits at rest.
@@ -111,6 +118,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("auth_enabled", &self.auth_enabled)
             .field("allow_insecure", &self.allow_insecure)
             .field("max_pg_connections", &self.max_pg_connections)
+            .field("pg_handshake_timeout_secs", &self.pg_handshake_timeout_secs)
             .field("api_keys", &format!("[{} keys]", self.api_keys.len()))
             .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| "***"))
             .field("cors_origins", &self.cors_origins)
@@ -119,6 +127,12 @@ impl std::fmt::Debug for GatewayConfig {
             .field("audit_db_path", &self.audit_db_path)
             .finish()
     }
+}
+
+/// Ten seconds: long enough for a TLS handshake plus a password round-trip over a slow link,
+/// short enough that holding a connection slot costs something.
+fn default_pg_handshake_timeout_secs() -> u64 {
+    10
 }
 
 impl Default for GatewayConfig {
@@ -132,6 +146,7 @@ impl Default for GatewayConfig {
             auth_enabled: false,
             allow_insecure: false,
             max_pg_connections: 256,
+            pg_handshake_timeout_secs: default_pg_handshake_timeout_secs(),
             api_keys: vec![],
             jwt_secret: None,
             cors_origins: vec![],
@@ -418,6 +433,12 @@ impl GatewayServer {
             pg_auth,
             pg_shard,
             config.pg_tls.clone(),
+            // 0 = no budget; anything else is a handshake deadline.
+            std::time::Duration::from_secs(if config.pg_handshake_timeout_secs == 0 {
+                u64::MAX / 2
+            } else {
+                config.pg_handshake_timeout_secs
+            }),
         )
         .await
         {

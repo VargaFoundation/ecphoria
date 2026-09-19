@@ -84,6 +84,12 @@ fn build_tls_acceptor(
 pub struct EcphoriaStartupHandler {
     auth: Option<AuthState>,
     params: DefaultServerParameterProvider,
+    /// Set once this connection has finished authenticating. The accept loop watches it: a socket
+    /// that opens and never authenticates holds a connection permit, and 256 of those are all it
+    /// takes to make the PG port unavailable at no cost to the client.
+    authenticated: Arc<std::sync::atomic::AtomicBool>,
+    /// For the audit entry — a failed password is exactly the event an investigation looks for.
+    peer: Option<String>,
 }
 
 #[async_trait]
@@ -110,6 +116,8 @@ impl StartupHandler for EcphoriaStartupHandler {
                         .await?;
                 } else {
                     finish_authentication(client, &self.params).await?;
+                    self.authenticated
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
@@ -121,8 +129,34 @@ impl StartupHandler for EcphoriaStartupHandler {
                                 client.metadata_mut().insert("tenant_id".to_string(), t);
                             }
                             finish_authentication(client, &self.params).await?;
+                            self.authenticated
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         None => {
+                            // Audited and counted. Without this, someone working through API keys
+                            // on :5432 leaves no trace at all — the audit log only ever held
+                            // requests that succeeded over HTTP.
+                            metrics::counter!(
+                                "ecphoria_auth_denials_total",
+                                "protocol" => "pgwire",
+                                "status" => "401"
+                            )
+                            .increment(1);
+                            if let Some(log) = auth.audit_log() {
+                                log.record(
+                                    "invalid-token",
+                                    "PG",
+                                    "startup",
+                                    401,
+                                    std::time::Duration::from_millis(0),
+                                    None,
+                                    self.peer.as_deref(),
+                                );
+                            }
+                            tracing::warn!(
+                                peer = self.peer.as_deref().unwrap_or("unknown"),
+                                "PG wire authentication failed"
+                            );
                             let error = ErrorResponse::from(ErrorInfo::new(
                                 "FATAL".to_owned(),
                                 "28P01".to_owned(),
@@ -417,6 +451,10 @@ impl ExtendedQueryHandler for PgWireHandler {
 pub struct PgWireFactory {
     handler: Arc<PgWireHandler>,
     auth: Option<AuthState>,
+    /// Per-connection: the accept loop builds one factory per socket so this flag tracks *that*
+    /// connection's handshake.
+    authenticated: Arc<std::sync::atomic::AtomicBool>,
+    peer: Option<String>,
 }
 
 impl PgWireFactory {
@@ -428,7 +466,23 @@ impl PgWireFactory {
         Self {
             handler: Arc::new(PgWireHandler::new(engine, shard)),
             auth,
+            authenticated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peer: None,
         }
+    }
+
+    /// A factory for one connection, sharing the handler and reusing this factory's engine.
+    fn for_connection(&self, peer: String) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                handler: self.handler.clone(),
+                auth: self.auth.clone(),
+                authenticated: authenticated.clone(),
+                peer: Some(peer),
+            },
+            authenticated,
+        )
     }
 }
 
@@ -451,6 +505,8 @@ impl PgWireServerHandlers for PgWireFactory {
         Arc::new(EcphoriaStartupHandler {
             auth: self.auth.clone(),
             params: DefaultServerParameterProvider::default(),
+            authenticated: self.authenticated.clone(),
+            peer: self.peer.clone(),
         })
     }
 
@@ -489,6 +545,7 @@ pub async fn start_pg_wire(
     auth: Option<AuthState>,
     shard: Option<ShardRoutingState>,
     tls: Option<PgTlsConfig>,
+    handshake_timeout: std::time::Duration,
 ) -> Result<PgWireHandle, Box<dyn std::error::Error>> {
     let factory = Arc::new(PgWireFactory::new(engine, auth, shard));
     // Optional TLS: when configured, the listener negotiates `SSLRequest` and upgrades the socket.
@@ -505,6 +562,7 @@ pub async fn start_pg_wire(
         addr,
         max_connections,
         tls = tls_acceptor.is_some(),
+        handshake_timeout_secs = handshake_timeout.as_secs(),
         "PG wire server listening"
     );
 
@@ -524,16 +582,50 @@ pub async fn start_pg_wire(
                                         %peer_addr,
                                         "PG wire connection rejected: max connections reached"
                                     );
+                                    metrics::counter!("ecphoria_pg_connections_rejected_total")
+                                        .increment(1);
                                     drop(socket);
                                     continue;
                                 }
                             };
-                            let factory_ref = factory.clone();
+                            // One factory per connection, so the handshake flag below tracks this
+                            // socket rather than the fleet.
+                            let (conn_factory, authenticated) =
+                                factory.for_connection(peer_addr.to_string());
+                            let conn_factory = Arc::new(conn_factory);
                             let conns = active_conns.clone();
                             let acceptor = tls_acceptor.clone();
                             conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tokio::spawn(async move {
-                                let _ = pgwire::tokio::process_socket(socket, acceptor, factory_ref).await;
+                                // A connection that never authenticates holds a permit for as long
+                                // as it stays open, and `max_connections` of those make the port
+                                // unavailable at no cost to the attacker — no credential, no
+                                // traffic, just open sockets. The budget applies to the handshake
+                                // only: once authenticated, a session runs as long as it likes.
+                                let proc = pgwire::tokio::process_socket(
+                                    socket,
+                                    acceptor,
+                                    conn_factory,
+                                );
+                                tokio::pin!(proc);
+                                tokio::select! {
+                                    _ = &mut proc => {}
+                                    _ = tokio::time::sleep(handshake_timeout) => {
+                                        if authenticated.load(std::sync::atomic::Ordering::Relaxed) {
+                                            let _ = proc.await;
+                                        } else {
+                                            tracing::warn!(
+                                                %peer_addr,
+                                                timeout_secs = handshake_timeout.as_secs(),
+                                                "PG wire handshake timed out — closing"
+                                            );
+                                            metrics::counter!(
+                                                "ecphoria_pg_handshake_timeouts_total"
+                                            )
+                                            .increment(1);
+                                        }
+                                    }
+                                }
                                 conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 drop(permit);
                             });
@@ -636,9 +728,17 @@ mod tests {
         let port = free_port();
         let addr = format!("127.0.0.1:{port}");
         let auth = AuthState::new(vec![], Some(SECRET.into()), 0);
-        let _handle = start_pg_wire(&addr, engine().await, 16, Some(auth), None, None)
-            .await
-            .unwrap();
+        let _handle = start_pg_wire(
+            &addr,
+            engine().await,
+            16,
+            Some(auth),
+            None,
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Valid token as password → connects and queries.
@@ -738,5 +838,141 @@ jEeVrC/BdHMwDCBig3WODjgE\n\
         let empty = dir.path().join("empty.pem");
         std::fs::write(&empty, "not a pem").unwrap();
         assert!(build_tls_acceptor(empty.to_str().unwrap(), key.to_str().unwrap()).is_err());
+    }
+
+    /// A socket that opens and says nothing must not hold a connection slot for ever.
+    ///
+    /// This is the cheapest denial there is — no credential, no traffic, just open sockets — and
+    /// before the handshake budget, `max_pg_connections` of them made the port unusable until the
+    /// server restarted.
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_and_gives_its_slot_back() {
+        use tokio::io::AsyncReadExt;
+
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let auth = AuthState::new(vec![], Some(SECRET.into()), 0);
+        // One slot, one-second budget: if the silent socket kept it, the second connect below
+        // would be refused.
+        let _handle = start_pg_wire(
+            &addr,
+            engine().await,
+            1,
+            Some(auth),
+            None,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // The server closes it; the read returns 0 bytes rather than hanging.
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the connection must be closed, not held open");
+        assert_eq!(closed.unwrap_or(0), 0);
+
+        // …and the slot it was holding is free for a real client.
+        let ok = format!(
+            "host=127.0.0.1 port={port} user=ecphoria password={} dbname=ecphoria",
+            jwt("tenant-1")
+        );
+        let (client, conn) = tokio_postgres::connect(&ok, tokio_postgres::NoTls)
+            .await
+            .expect("the freed slot should accept a real client");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        assert!(!client
+            .simple_query("SELECT 1 AS n")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// An authenticated session outlives the handshake budget — the deadline is on the handshake,
+    /// not on the connection.
+    #[tokio::test]
+    async fn an_authenticated_session_is_not_cut_off_by_the_handshake_budget() {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let auth = AuthState::new(vec![], Some(SECRET.into()), 0);
+        let _handle = start_pg_wire(
+            &addr,
+            engine().await,
+            4,
+            Some(auth),
+            None,
+            None,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let ok = format!(
+            "host=127.0.0.1 port={port} user=ecphoria password={} dbname=ecphoria",
+            jwt("tenant-1")
+        );
+        let (client, conn) = tokio_postgres::connect(&ok, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        // Well past the handshake budget…
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // …and the session still works.
+        assert!(!client
+            .simple_query("SELECT 1 AS n")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A rejected password lands in the audit log. Before this, working through API keys on :5432
+    /// left nothing behind — the audit log only ever held HTTP requests that succeeded.
+    #[tokio::test]
+    async fn a_failed_password_is_audited() {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let auth = AuthState::new(vec![], Some(SECRET.into()), 0);
+        let log = auth.audit_log().cloned();
+        let _handle = start_pg_wire(
+            &addr,
+            engine().await,
+            4,
+            Some(auth),
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let bad = format!(
+            "host=127.0.0.1 port={port} user=ecphoria password=not-a-token dbname=ecphoria"
+        );
+        assert!(tokio_postgres::connect(&bad, tokio_postgres::NoTls)
+            .await
+            .is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let entries = log
+            .expect("auth state carries an audit log")
+            .query_since("1970-01-01", None)
+            .unwrap();
+        let denial = entries
+            .iter()
+            .find(|e| e.method == "PG" && e.status == 401)
+            .expect("the failed password should be recorded");
+        assert_eq!(denial.identity, "invalid-token");
+        // The password itself is never stored — an audit log is not a place to collect other
+        // people's credentials.
+        assert!(!format!("{denial:?}").contains("not-a-token"));
     }
 }

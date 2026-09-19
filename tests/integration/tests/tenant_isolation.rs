@@ -288,3 +288,101 @@ async fn webhook_is_tenant_scoped() {
     .await;
     assert_eq!(body["rows"][0]["c"], "1");
 }
+
+// ── Denials are the entries an investigation needs (E-13) ────────────────────────────
+
+/// Same router, but keeping a handle on the audit log so a test can read it back.
+async fn authed_router_with_audit() -> (axum::Router, ecphoria_gateway::auth::audit::AuditLog) {
+    let mut config = CoreConfig::default();
+    config.memory.episodic.db_path = ":memory:".into();
+    config.memory.state.db_path = ":memory:".into();
+    config.memory.cognition.db_path = ":memory:".into();
+    let engine = Arc::new(EcphoriaEngine::new(config).await.unwrap());
+
+    let auth = ecphoria_gateway::auth::middleware::AuthState::new(vec![], Some(SECRET.into()), 0);
+    let log = auth.audit_log().cloned().expect("audit log");
+    let gw = ecphoria_gateway::server::GatewayConfig {
+        auth_enabled: true,
+        ..Default::default()
+    };
+    (
+        ecphoria_gateway::rest::router_with_engine_and_auth(engine, Some(auth), None, None, &gw),
+        log,
+    )
+}
+
+/// Mint a reader-role token (allowed to read, not to reach `/admin/`).
+fn reader_jwt(tenant: &str) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let claims = serde_json::json!({
+        "sub": format!("reader-{tenant}"),
+        "role": "reader",
+        "exp": exp,
+        "tenant_id": tenant,
+    });
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_rejected_token_is_recorded() {
+    let (app, log) = authed_router_with_audit().await;
+    let (status, _) = send(&app, "GET", "/api/v1/memories", Some("not-a-token"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let entries = log.query_since("1970-01-01", None).unwrap();
+    let denial = entries.iter().find(|e| e.status == 401).expect(
+        "a rejected token must leave an audit entry — it is the one an investigation wants",
+    );
+    assert_eq!(denial.identity, "invalid-token");
+    assert_eq!(denial.path, "/api/v1/memories");
+    // The token itself is never stored: an audit log is not a place to collect other people's
+    // credentials, and a mistyped *valid* key would be the worst thing to keep.
+    assert!(!format!("{denial:?}").contains("not-a-token"));
+}
+
+#[tokio::test]
+async fn a_missing_credential_is_recorded_as_anonymous() {
+    let (app, log) = authed_router_with_audit().await;
+    let (status, _) = send(&app, "GET", "/api/v1/memories", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let entries = log.query_since("1970-01-01", None).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.status == 401 && e.identity == "anonymous"),
+        "{entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_rbac_refusal_records_who_tried() {
+    let (app, log) = authed_router_with_audit().await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/v1/admin/backup",
+        Some(&reader_jwt("tenant-1")),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let entries = log.query_since("1970-01-01", None).unwrap();
+    let denial = entries
+        .iter()
+        .find(|e| e.status == 403)
+        .expect("a reader reaching for /admin/ is exactly what an audit log is for");
+    assert_eq!(denial.identity, "reader-tenant-1");
+    assert_eq!(denial.tenant.as_deref(), Some("tenant-1"));
+    assert!(denial.path.contains("/admin/backup"), "{}", denial.path);
+}

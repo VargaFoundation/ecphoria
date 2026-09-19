@@ -61,6 +61,7 @@ config:
     # -- Optional gateway tuning. Empty / 0 / false means "use the server default" and emits
     #    no env var. See ecphoria.toml for the semantics of each key.
     maxPgConnections: 0                     # PG-wire connection cap (0 = server default, 256)
+    pgHandshakeTimeoutSecs: 0               # close a PG connection that hasn't authenticated (0 = server default, 10)
     corsOrigins: []                         # e.g. ["https://app.example.com"] (default: reflect none)
     rateLimitPerKey: 0                      # requests/sec per API key (0 = unlimited)
     auditDbPath: ""                         # durable audit log, e.g. /data/audit.db

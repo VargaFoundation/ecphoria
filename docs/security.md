@@ -43,6 +43,11 @@ cluster's integrity, (3) secrets (JWT/API keys, provider keys).
   Secret + [Stakater Reloader](https://github.com/stakater/Reloader) (`reloader.stakater.com/auto:
   "true"`, exposed via the chart's `podAnnotations`) restarts the pods on change (same pattern as the
   Raft certs).
+- **A PG connection has a handshake budget** (`gateway.pg_handshake_timeout_secs`, default 10s). A
+  socket that opens and never authenticates used to hold one of `max_pg_connections` slots for as
+  long as it stayed open — the cheapest denial there is: no credential, no traffic, just open
+  sockets. The budget applies to the handshake only; an authenticated session runs as long as it
+  likes.
 - `/health`, `/ready`, `/metrics` are intentionally unauthenticated (probes / Prometheus scraping);
   restrict them with network policy.
 
@@ -56,6 +61,15 @@ Cross-tenant leak tests live in `tests/integration/tests/tenant_isolation.rs`.
 
 The **audit log** records each request's tenant and client IP (`X-Forwarded-For`/`X-Real-IP`);
 `GET /api/v1/admin/audit?tenant=<t>&since=<iso>` filters by tenant (and aggregates across shards).
+
+**Denials are recorded too**, which was not true before 0.2: the log held only requests that got
+through — which is to say, exactly the ones nobody asks about afterwards. It now records a rejected
+token (`identity: invalid-token`), a request with no credential (`anonymous`), an RBAC refusal (403,
+under the identity that tried), a rate-limit rejection (429), and a failed PG-wire password
+(`method: PG`, `path: startup`). The presented token is **never** stored — an audit log is not a
+place to accumulate other people's credentials, and a mistyped *valid* key would be the worst thing
+to keep. The counter `ecphoria_auth_denials_total{protocol,status}` carries the same events for
+alerting.
 
 ## Secrets
 
@@ -198,7 +212,15 @@ CI also runs `cargo-audit` (RUSTSEC advisories) and `cargo-deny` (license/ban po
 - Body limit 16 MB; per-batch ingest cap 10k events; SQL `query.max_rows` cap (default 10k), also
   applied to `memory_all`/`session_list`/`query_by_source` to prevent unbounded result sets.
 - Connection limits on PG wire (semaphore) and a configurable DuckDB read pool
-  (`...__READ_POOL_SIZE`).
+  (`...__READ_POOL_SIZE`). A PG connection that has not authenticated within
+  `gateway.pg_handshake_timeout_secs` is closed, so a slot cannot be held by a silent socket.
+- **The parsers that read untrusted input are property-tested**, because a panic on the ingest path
+  is a denial of service: the webhook normalizers (every vendor, arbitrary JSON), the tenant SQL
+  rewriter, the Markdown chunker, the fact validator and the JSON-Schema subset validator. The
+  properties are "never panics", "deterministic", and — for the chunker — "every section keeps a
+  unique, stable address". That last one has already caught a real bug: a document containing a
+  blank heading addressed that section as the document itself, so a re-import silently kept one of
+  the two sections and dropped the other.
 
 ## Deployment hardening checklist (Kubernetes)
 
@@ -215,5 +237,10 @@ CI also runs `cargo-audit` (RUSTSEC advisories) and `cargo-deny` (license/ban po
       possible; resource requests/limits set.
 - [ ] mTLS via mesh for inter-node + client traffic (or TLS-terminating ingress).
 - [ ] `allow_insecure` is **false** (default); the server refuses unauthenticated public binds.
-- [ ] Durable `audit_db_path` on a PVC; CI runs the RUSTSEC `cargo-audit` job.
+- [ ] Durable `audit_db_path` on a PVC; CI runs the RUSTSEC `cargo-audit` job. Alert on
+      `ecphoria_auth_denials_total` — a burst of 401s is the signal you want before the breach, not
+      after it.
+- [ ] Scheduled backups with a **result**: the chart's `backup.cronjob`, not only the in-process
+      timer. Alert on the job's absence as well as its failure — a CronJob that stopped being
+      scheduled produces no failed job at all (`docs/backup-restore.md`).
 - [ ] Restore drills: confirm `restore_from_backup` passes manifest verification on your backups.

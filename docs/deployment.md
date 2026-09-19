@@ -227,6 +227,7 @@ Ecphoria loads configuration from three sources (in order of precedence):
 | `gateway.llm_proxy_enabled` | `ECPHORIA_GATEWAY__LLM_PROXY_ENABLED` | `false` | Enable LLM proxy |
 | `gateway.auth_enabled` | `ECPHORIA_GATEWAY__AUTH_ENABLED` | `false` | Enable API key authentication |
 | `gateway.max_pg_connections` | `ECPHORIA_GATEWAY__MAX_PG_CONNECTIONS` | `256` | Max concurrent PG wire connections |
+| `gateway.pg_handshake_timeout_secs` | `ECPHORIA_GATEWAY__PG_HANDSHAKE_TIMEOUT_SECS` | `10` | Seconds a PG connection may take to authenticate before it is closed. Bounds the cheapest denial there is — open `max_pg_connections` sockets and say nothing. Applies to the handshake only; 0 disables it |
 
 ### Gateway — security & advanced
 

@@ -551,4 +551,64 @@ mod tests {
         let v = compile(json!({"type": "string", "maxLength": 3}));
         assert!(v.validate(&json!("éàü")).is_empty());
     }
+
+    // ── Fuzzing ──────────────────────────────────────────────────────────────────────
+    //
+    // The documents this validates are attacker-controlled (`metadata` on a memory write), so the
+    // property is: whatever the document, `validate` returns. The *schemas* are ours, which is why
+    // `compile` may reject — but it must reject rather than panic.
+
+    use proptest::prelude::*;
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(Value::from),
+            ".*".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(4, 24, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                prop::collection::hash_map(".*", inner, 0..6)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        /// Every embedded fact schema, against arbitrary documents.
+        #[test]
+        fn validating_arbitrary_documents_never_panics(document in arb_value()) {
+            for kind in crate::memory::facts::FactKind::ALL {
+                let schema: Value = serde_json::from_str(kind.schema_json()).unwrap();
+                let validator = Validator::compile(&schema).unwrap();
+                let _ = validator.validate(&document);
+            }
+        }
+
+        /// Compiling arbitrary JSON as a schema returns — an error for anything that is not one,
+        /// never a panic. `compile` runs at startup on files from disk in some deployments.
+        #[test]
+        fn compiling_arbitrary_json_never_panics(schema in arb_value()) {
+            let _ = Validator::compile(&schema);
+        }
+
+        /// Same document, same verdict: a validator whose answer depended on map iteration order
+        /// would refuse a write intermittently.
+        #[test]
+        fn validation_is_deterministic(document in arb_value()) {
+            let schema: Value = serde_json::from_str(
+                crate::memory::facts::FactKind::Incident.schema_json(),
+            )
+            .unwrap();
+            let validator = Validator::compile(&schema).unwrap();
+            prop_assert_eq!(validator.validate(&document), validator.validate(&document));
+        }
+    }
 }

@@ -481,4 +481,110 @@ mod tests {
             errors[0]
         );
     }
+
+    // ── Fuzzing the write path's validators ──────────────────────────────────────────
+    //
+    // `validate` runs on every memory write, including ones that arrive from a webhook or an
+    // untrusted agent. A panic here is a denial of service on the whole write path, so the
+    // property is simply: whatever `metadata` is, this returns.
+
+    use proptest::prelude::*;
+
+    fn arb_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(Value::from),
+            ".*".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(4, 32, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(Value::Array),
+                prop::collection::hash_map(".*", inner, 0..8)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// Metadata shaped like a real fact — so the generator spends its budget on the paths that
+    /// actually branch, instead of on documents that fail the first type check.
+    fn arb_fact_metadata() -> impl Strategy<Value = Value> {
+        (
+            prop_oneof![
+                Just(None::<String>),
+                prop::sample::select(
+                    FactKind::ALL
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>()
+                )
+                .prop_map(Some),
+                ".{0,12}".prop_map(Some),
+            ],
+            arb_json(),
+        )
+            .prop_map(|(kind, extra)| {
+                let mut obj = match extra {
+                    Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                if let Some(k) = kind {
+                    obj.insert("kind".into(), Value::from(k));
+                }
+                Value::Object(obj)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        #[test]
+        fn validate_never_panics(subject in prop::option::of(".{0,64}"), metadata in arb_json()) {
+            let _ = validate(subject.as_deref(), &metadata);
+        }
+
+        #[test]
+        fn validate_never_panics_on_fact_shaped_metadata(
+            subject in prop::option::of("[a-z_]{0,10}:[^\\s]{0,20}:?[^\\s]{0,20}"),
+            metadata in arb_fact_metadata(),
+        ) {
+            let _ = validate(subject.as_deref(), &metadata);
+        }
+
+        /// Deterministic: the same input must produce the same verdict. A validator that depends on
+        /// map iteration order would refuse a write intermittently, which is the worst way for a
+        /// rule to behave.
+        #[test]
+        fn validate_is_deterministic(
+            subject in prop::option::of(".{0,32}"),
+            metadata in arb_fact_metadata(),
+        ) {
+            let first = validate(subject.as_deref(), &metadata);
+            let second = validate(subject.as_deref(), &metadata);
+            prop_assert_eq!(first, second);
+        }
+
+        /// An accepted fact is accepted for a reason the *kind* can explain: whenever validation
+        /// passes with a known kind, the subject really does match that kind's grammar.
+        #[test]
+        fn an_accepted_typed_fact_matches_its_grammar(
+            subject in "[a-z_]{1,12}:[a-z0-9._/-]{1,20}:[a-z0-9._/-]{1,20}",
+            metadata in arb_fact_metadata(),
+        ) {
+            if validate(Some(&subject), &metadata).is_empty() {
+                if let Some(kind) = metadata
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(FactKind::parse)
+                {
+                    if let Some((_, pattern)) = kind.subject_grammar() {
+                        prop_assert!(regex::Regex::new(pattern).unwrap().is_match(&subject));
+                    }
+                }
+            }
+        }
+    }
 }

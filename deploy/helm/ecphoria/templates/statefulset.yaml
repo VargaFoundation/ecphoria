@@ -98,6 +98,10 @@ spec:
             - name: ECPHORIA_GATEWAY__MAX_PG_CONNECTIONS
               value: {{ .Values.config.gateway.maxPgConnections | quote }}
             {{- end }}
+            {{- if gt (int .Values.config.gateway.pgHandshakeTimeoutSecs) 0 }}
+            - name: ECPHORIA_GATEWAY__PG_HANDSHAKE_TIMEOUT_SECS
+              value: {{ .Values.config.gateway.pgHandshakeTimeoutSecs | quote }}
+            {{- end }}
             {{- if .Values.config.gateway.corsOrigins }}
             - name: ECPHORIA_GATEWAY__CORS_ORIGINS
               value: {{ join "," .Values.config.gateway.corsOrigins | quote }}

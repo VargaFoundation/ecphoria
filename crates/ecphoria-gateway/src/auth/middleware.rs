@@ -1,7 +1,7 @@
 //! Authentication middleware — Tower layer for request authentication.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -429,20 +429,65 @@ pub async fn require_auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok());
 
+    // A denial is the entry an investigation actually needs.
+    //
+    // The audit log used to record only requests that got through — which is to say, exactly the
+    // ones nobody asks about afterwards. A rejected token, a reader reaching for `/admin/`, a key
+    // hitting its rate limit: all of them left nothing behind. `deny` records the attempt and
+    // returns the response, so every early return below is audited by construction.
+    let request_ip = client_ip(&req);
+    let request_method = req.method().to_string();
+    // The URI as the *client* sent it. Inside a nested router `req.uri()` is the sub-path, so the
+    // audit log recorded `/memories` for a request to `/api/v1/memories` — the same event under two
+    // names depending on where the middleware sits, which is precisely what a log of record must
+    // not do.
+    let request_path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let deny = |status: StatusCode, identity: &str, tenant: Option<&str>| -> Response {
+        metrics::counter!(
+            "ecphoria_auth_denials_total",
+            "protocol" => "http",
+            "status" => status.as_u16().to_string()
+        )
+        .increment(1);
+        if let Some(ref log) = state.audit_log {
+            log.record(
+                identity,
+                &request_method,
+                &request_path,
+                status.as_u16(),
+                Duration::from_millis(0),
+                tenant,
+                request_ip.as_deref(),
+            );
+        }
+        status.into_response()
+    };
+
     let token = match auth_header {
         Some(header) if header.starts_with("Bearer ") => &header[7..],
-        _ => return Err(StatusCode::UNAUTHORIZED.into_response()),
+        // No credential at all — `anonymous`, so a burst of these is visible as one identity.
+        _ => return Err(deny(StatusCode::UNAUTHORIZED, "anonymous", None)),
     };
 
     // Auth chain: OIDC (RS256) → JWT (HS256) → API key (shared with the gRPC interceptor).
     let auth_ctx = match state.authenticate(token).await {
         Some(ctx) => ctx,
-        None => return Err(StatusCode::UNAUTHORIZED.into_response()),
+        // The token itself is never recorded: an audit log is not a place to accumulate other
+        // people's credentials, and a typo'd valid key would be the worst thing to store.
+        None => return Err(deny(StatusCode::UNAUTHORIZED, "invalid-token", None)),
     };
 
     // ── RBAC: check method permission ────────────────────────────
     if !auth_ctx.role.allows_method(req.method()) {
-        return Err(StatusCode::FORBIDDEN.into_response());
+        return Err(deny(
+            StatusCode::FORBIDDEN,
+            &auth_ctx.identity,
+            auth_ctx.tenant_id.as_deref(),
+        ));
     }
 
     // ── RBAC: admin-only paths ───────────────────────────────────
@@ -451,7 +496,11 @@ pub async fn require_auth(
     if (path.contains("/admin/") || path.contains("/cluster/"))
         && !auth_ctx.role.allows_admin_path()
     {
-        return Err(StatusCode::FORBIDDEN.into_response());
+        return Err(deny(
+            StatusCode::FORBIDDEN,
+            &auth_ctx.identity,
+            auth_ctx.tenant_id.as_deref(),
+        ));
     }
 
     // ── Agent scope: reject access to other agents' state ────────
@@ -464,7 +513,11 @@ pub async fn require_auth(
                 if let Some(pos) = segments.iter().position(|&s| s == "state") {
                     if let Some(path_agent) = segments.get(pos + 1) {
                         if *path_agent != scoped_agent.as_str() {
-                            return Err(StatusCode::FORBIDDEN.into_response());
+                            return Err(deny(
+                                StatusCode::FORBIDDEN,
+                                &auth_ctx.identity,
+                                auth_ctx.tenant_id.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -494,7 +547,11 @@ pub async fn require_auth(
         } else {
             let (allowed, remaining) = limiter.try_acquire(&rl_key);
             if !allowed {
-                let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
+                let mut resp = deny(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &auth_ctx.identity,
+                    auth_ctx.tenant_id.as_deref(),
+                );
                 resp.headers_mut()
                     .insert("X-RateLimit-Remaining", "0".parse().unwrap());
                 return Err(resp);
@@ -507,9 +564,9 @@ pub async fn require_auth(
     // Capture for audit logging
     let audit_identity = auth_ctx.identity.clone();
     let audit_tenant = auth_ctx.tenant_id.clone();
-    let audit_ip = client_ip(&req);
-    let audit_method = req.method().to_string();
-    let audit_path = path.clone();
+    let audit_ip = request_ip.clone();
+    let audit_method = request_method.clone();
+    let audit_path = request_path.clone();
     let audit_log = state.audit_log.clone();
     let audit_start = Instant::now();
 

@@ -62,8 +62,20 @@ impl Chunk {
     /// the parts stay distinct.
     pub fn subject(&self, doc_path: &str, part: Option<usize>) -> String {
         let trail = self.heading_path.join(" > ");
-        let base = if trail.is_empty() {
-            doc_path.to_string()
+        let base = if trail.trim().is_empty() {
+            // No usable heading trail. That is the preamble (ordinal 0) — and also, awkwardly, any
+            // section under an *empty* heading (`# ` on a line of its own), whose trail joins to
+            // nothing. Both addressed as `doc_path` meant the two collided: on re-import each
+            // superseded the other and the document silently kept one of them.
+            //
+            // The preamble keeps the bare path — it is by far the common case, and changing it
+            // would re-address every already-imported document — while a later blank-titled
+            // section falls back to its position. Found by `subjects_are_unique_within_a_document`.
+            if self.ordinal == 0 {
+                doc_path.to_string()
+            } else {
+                format!("{doc_path}#§{}", self.ordinal)
+            }
         } else {
             format!("{doc_path}#{trail}")
         };
@@ -468,5 +480,93 @@ cluster cannot tolerate any failure at all and that surprises people regularly.
         let cs = chunks(md);
         let trails: Vec<String> = cs.iter().map(|c| c.heading_path.join(" > ")).collect();
         assert_eq!(trails, vec!["A", "A > B", "A > B > C", "A > D"]);
+    }
+
+    /// A document with a blank heading used to address that section as the document itself,
+    /// colliding with the preamble — so re-importing kept one of the two and dropped the other,
+    /// silently and for good. Found by `subjects_are_unique_within_a_document`.
+    #[test]
+    fn a_blank_heading_does_not_collide_with_the_preamble() {
+        let chunks = chunk_markdown(
+            "intro text\n\n# \n\nbody under a nameless heading",
+            &ChunkOptions::default(),
+        );
+        let subjects: Vec<String> = chunks
+            .iter()
+            .map(|(c, part)| c.subject("docs/x.md", Some(*part)))
+            .collect();
+        let unique: std::collections::HashSet<&String> = subjects.iter().collect();
+        assert_eq!(unique.len(), subjects.len(), "{subjects:?}");
+        // The preamble keeps the bare path, so already-imported documents do not move.
+        assert_eq!(subjects[0], "docs/x.md");
+    }
+
+    // ── Fuzzing the document parser ──────────────────────────────────────────────────
+    //
+    // `document_ingest` feeds arbitrary Markdown through here — a README from a repository an
+    // importer was pointed at, a page from a wiki. A panic is a denial of service on the ingest
+    // path, and a chunker that loses text silently loses a document.
+
+    use proptest::prelude::*;
+
+    /// Markdown-ish text: headings, fences and prose in the proportions that actually exercise the
+    /// state machine, rather than uniformly random bytes that are all prose.
+    fn arb_markdown() -> impl Strategy<Value = String> {
+        let line = prop_oneof![
+            "#{1,7} .{0,40}",    // heading (including 7 hashes, which is not one)
+            "```.{0,10}",        // fence open/close
+            ".{0,60}",           // prose
+            Just(String::new()), // blank
+            "    .{0,40}",       // indented code
+            "[-*] .{0,40}",      // list item
+        ];
+        prop::collection::vec(line, 0..40).prop_map(|lines| lines.join("\n"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn chunking_never_panics(text in arb_markdown()) {
+            let _ = chunk_markdown(&text, &ChunkOptions::default());
+        }
+
+        /// Every chunk is addressable: a section with no stable subject cannot be superseded on
+        /// re-import, so the document's history would fork silently on the next sync.
+        #[test]
+        fn every_chunk_has_a_subject(text in arb_markdown()) {
+            for (chunk, part) in chunk_markdown(&text, &ChunkOptions::default()) {
+                let subject = chunk.subject("docs/x.md", Some(part));
+                prop_assert!(!subject.trim().is_empty());
+            }
+        }
+
+        /// Deterministic: the same document must chunk identically, or a re-import would supersede
+        /// sections that did not change.
+        #[test]
+        fn chunking_is_deterministic(text in arb_markdown()) {
+            let a = chunk_markdown(&text, &ChunkOptions::default());
+            let b = chunk_markdown(&text, &ChunkOptions::default());
+            prop_assert_eq!(a.len(), b.len());
+            for ((ca, pa), (cb, pb)) in a.iter().zip(b.iter()) {
+                prop_assert_eq!(&ca.text, &cb.text);
+                prop_assert_eq!(&ca.heading_path, &cb.heading_path);
+                prop_assert_eq!(pa, pb);
+            }
+        }
+
+        /// Subjects are unique within one document. Two sections sharing a subject would
+        /// supersede each other on every import — the document would keep exactly one of them.
+        #[test]
+        fn subjects_are_unique_within_a_document(text in arb_markdown()) {
+            let chunks = chunk_markdown(&text, &ChunkOptions::default());
+            let mut seen = std::collections::HashSet::new();
+            for (chunk, part) in &chunks {
+                let subject = crate::memory::cognition::normalize_subject(
+                    &chunk.subject("docs/x.md", Some(*part)),
+                );
+                prop_assert!(seen.insert(subject.clone()), "duplicate subject: {}", subject);
+            }
+        }
     }
 }
