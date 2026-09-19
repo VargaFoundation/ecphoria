@@ -101,8 +101,8 @@ tracing-opentelemetry = { version = "0.28" }
 
 # Auth
 jsonwebtoken = { version = "9" }
-hmac = { version = "0.12" }
-sha2 = { version = "0.10" }
+hmac = { version = "0.13" }
+sha2 = { version = "0.11" }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
