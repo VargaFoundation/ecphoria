@@ -37,7 +37,7 @@ spec:
             - name: backup
               # The server image, for `curl` and for nothing else: the job is an HTTP call, and a
               # second image would be a second thing to patch for no gain.
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}

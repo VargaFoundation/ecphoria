@@ -44,7 +44,7 @@ spec:
       {{- end }}
       containers:
         - name: ecphoria
-          image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+          image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag | default $root.Chart.AppVersion }}"
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           securityContext:
             {{- toYaml $root.Values.securityContext | nindent 12 }}

@@ -18,7 +18,12 @@ sharding:
 
 image:
   repository: ghcr.io/vargafoundation/ecphoria
-  tag: latest
+  # -- Image tag. Empty means the chart's appVersion, which is the version this chart was
+  # released with — the image it was tested against. The previous default was `latest`, which
+  # is a moving tag: it pins nothing, it is refused outright by admission policies that forbid
+  # mutable references (Choregos runs one), and it silently upgrades the server under a chart
+  # that has not changed.
+  tag: ""
   pullPolicy: IfNotPresent
 
 # -- Ecphoria server configuration (maps to ecphoria.toml / env vars)
