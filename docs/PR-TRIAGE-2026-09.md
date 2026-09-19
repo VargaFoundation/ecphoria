@@ -105,3 +105,62 @@ parked with the reason. Label: `deferred/major-bump`.
 
 **All nineteen PRs are resolved.** Nine merged or applied, two closed as already-on-main, eight
 landed as the four grouped changes above.
+
+## The second wave, same day
+
+Dependabot's weekly run opened nine more (#22–#30) a few hours after the first nineteen were
+cleared. They are *already* the grouped kind — `.github/dependabot.yml` now groups
+`github-actions`, `grpc-stack`, `aws-sdk`, `kube-stack`, `python-sdk` and everything minor or
+patch — so nine is what a week costs rather than what a quarter costs.
+
+**All nine were red, and none of them for its own reason.**
+
+### Every pull request failed the benchmark job, including a one-line patch bump
+
+`bench.yml` set `RUSTC_WRAPPER: sccache` unconditionally. On a Dependabot pull request the
+Actions cache is read-only, `sccache` cannot start its server against it, and `cargo bench` dies
+before compiling. `cargo bench … | tee bench-output.txt` then reported **success**, because a
+pipeline's exit status is the last command's and `tee` had nothing to complain about — so the
+failure surfaced two steps later as *"No benchmark result was found in bench-output.txt"*, which
+reads like a problem with the comparison. On top of that, `comment-always: true` posts with a
+token Dependabot only ever gets read-only: a guaranteed 403, counted as a failure.
+
+`ci.yml` had carried the sccache guard for weeks. `bench.yml` never got it. Fixed in
+`20ecd53`: the guard, `set -o pipefail`, and no comment when the actor is Dependabot.
+
+### One pull request also failed a test it cannot reach
+
+#23 bumps `serde` in `/ops/operator` — a crate outside the workspace, which
+`ecphoria-cluster` does not compile against. It failed
+`three_node_grpc_cluster_replicates_over_mtls`. The wait was a count, not a deadline:
+`for _ in 0..100 { … sleep(100ms) }` reads like ten seconds but each turn also pays for
+`event_count().await`, and three Raft nodes forming over real TLS sockets on a two-core hosted
+runner occasionally need more. Fixed in `1d5f065` — both waits, in both tests, are deadlines
+now, and the assertion says how long it waited and what the node actually held.
+
+### Three of them were one change
+
+| PR | Bump | Why it could not merge alone |
+| :-- | :-- | :-- |
+| #30 | sha2 0.10 → 0.11 | moves to `digest 0.11` |
+| #28 | hmac 0.12 → 0.13 | moves to `digest 0.11` |
+| #29 | jsonwebtoken 9 → 11 | rides the same generation |
+
+Bump either of the first two on its own and `Hmac<Sha256>` holds a `Sha256` from the other
+generation: `the trait bound Sha256: CoreProxy is not satisfied`. Moved together, the whole
+adaptation is one import — `hmac 0.13` no longer re-exports `KeyInit` through `Mac`. Opened as
+**#31**, which closes #28, #29 and #30.
+
+### The other six
+
+| PR | Bump | Status |
+| :-- | :-- | :-- |
+| #22 | futures 0.3.32 → 0.3.34 (operator) | green but for the benchmark job |
+| #23 | serde 1.0.228 → 1.0.229 (operator) | green but for the benchmark job and the flake above |
+| #24 | anyhow 1.0.103 → 1.0.104 (operator) | green but for the benchmark job |
+| #25 | the `github-actions` group, 10 updates | re-running |
+| #26 | the `cargo-minor` group, 18 updates | green but for the benchmark job |
+| #27 | rand 0.9.2 → 0.10.2 | green but for the benchmark job |
+
+Both causes are fixed on `main`, so a rebase turns them green. They are left for a human to
+merge: this session's token is not allowed to merge a pull request without review.
