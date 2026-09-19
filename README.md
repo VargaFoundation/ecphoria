@@ -324,6 +324,9 @@ Ecphoria automatically:
 - [Daily use with Claude Code](ops/daily/) — MCP tools + session capture, one setup script
 - [Knowledge base guide](docs/knowledge-base.md) — docs, ADRs, incidents and tickets in one searchable, bi-temporal store
 - [Agentic platform](docs/agentic-platform.md) — runs, agent loop, HITL, workflows, triggers, tools
+- [Typed facts](docs/facts.md) — the fact vocabulary, the subject grammar that makes supersession work, and per-tenant governance
+- [Editions](docs/editions.md) — `ecphoria:memory` vs `ecphoria:full`, and why the split is a build choice
+- [Choregos integration](docs/integrations/choregos.md) — context packs, fact writes, governed proposals
 - [Migrate from Mem0](docs/migrate-from-mem0.md) — 1:1 mapping + what Ecphoria adds for free
 - [LoCoMo benchmarks](docs/benchmarks-locomo.md) — reproducible eval recipe + measured baseline
 - [KB benchmarks](docs/benchmarks-kb.md) — retrieval on an engineering corpus, measured to 200k memories
