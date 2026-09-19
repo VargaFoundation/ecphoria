@@ -10,6 +10,8 @@ pub mod materialized;
 pub mod memory;
 pub mod query;
 pub mod rerank;
+/// Agent-runtime substrate: run types (always — they are the Raft wire format), plus the ledger
+/// and driver seams behind the `agentic` feature.
 pub mod runtime;
 pub mod storage;
 

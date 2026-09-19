@@ -7,9 +7,19 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Protocol gateway for the Ecphoria context lake"
 
+[features]
+default = ["agentic", "llm-proxy"]
+# Runs, agents, tools, triggers — the REST surface of the agent runtime, the downstream MCP tool
+# gateway, and the MCP tools that drive them. Implies `ecphoria-core/agentic`.
+agentic = ["ecphoria-core/agentic", "ecphoria-cluster/agentic"]
+# The OpenAI-/Anthropic-compatible proxy (`/v1/chat/completions`, `/v1/embeddings`, `/v1/messages`)
+# with auto-RAG and the semantic response cache. Without it the server makes no outbound completion
+# call on behalf of a client.
+llm-proxy = []
+
 [dependencies]
-ecphoria-core.workspace = true
-ecphoria-cluster.workspace = true
+ecphoria-core = { workspace = true, default-features = false }
+ecphoria-cluster = { workspace = true, default-features = false }
 openraft.workspace = true
 
 tokio.workspace = true

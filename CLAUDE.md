@@ -57,7 +57,9 @@ cargo fmt --all -- --check                              # Check format (CI)
 cargo clippy --workspace --all-targets -- -D warnings   # Lint
 cargo test --workspace                                  # All tests (~474 tests)
 cargo test -p ecphoria-core                               # Single crate tests
-cargo build --release                                   # Release build
+cargo build --release                                   # Release build (everything)
+cargo build --release --no-default-features              # Memory-only build (docs/editions.md)
+cargo test --workspace --no-default-features             # …and its tests
 cargo run --bin ecphoria-server                           # Run server
 cargo run --bin ecphoria -- status                        # Run CLI
 ```
@@ -177,6 +179,7 @@ All prefixed with `ECPHORIA_`. Nested keys use `__`. Examples:
 | **External identity** | Working | `PUT /memories/by-external-id` — `(source, external_id)` → stable subject, so a webhook redelivery or a rerun backfill confirms instead of duplicating |
 | **Context pack** | Working | `POST /api/v1/context-pack` — hybrid retrieval split into memories/incidents, filtered by kind and by overlap with the task's allowed paths, truncated to a token budget highest-rank-first |
 | **Tenant header** | Working | `X-Ecphoria-Tenant` selects the tenant per request for a client serving several; a tenant-scoped token still wins. `POST /admin/tenants` confirms existence + write access before provisioning sends data |
+| **Two editions** | Working | Cargo features `agentic` + `llm-proxy` (default on) split the binary in two: `ecphoria:full` and `ecphoria:memory`. The memory build has no run ledger (no `runs.db` is opened), no agent driver, no `/runs` · `/agents` · `/tools` · `/triggers`, and no `/v1/*` proxy — those paths answer 404. Raft `RunCreate`/`RunUpdate` variants stay in the log format either way (positional MessagePack), and a memory-only node skips them with a warning. Every internal dep spells out `default-features = false` so unification cannot re-enable them. CI builds and tests both. See `docs/editions.md` |
 | **Benchmark harness** | Working | LoCoMo eval (`examples/locomo_eval.rs`) + `ops/bench/` turnkey runner using the Claude CLI (no API key) |
 
 ## Parallel Development Guidelines

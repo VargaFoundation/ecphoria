@@ -10,9 +10,20 @@ publish = false
 name = "ecphoria_integration_tests"
 path = "src/lib.rs"
 
+[features]
+default = ["agentic", "llm-proxy"]
+# Mirrors the server's features so `--no-default-features` exercises the memory-only build rather
+# than failing on routes that build does not mount.
+agentic = [
+    "ecphoria-core/agentic",
+    "ecphoria-gateway/agentic",
+    "ecphoria-cluster/agentic",
+]
+llm-proxy = ["ecphoria-gateway/llm-proxy"]
+
 [dev-dependencies]
 ecphoria-core.workspace = true
-ecphoria-gateway.workspace = true
+ecphoria-gateway = { workspace = true, default-features = false }
 ecphoria-cluster.workspace = true
 
 tokio.workspace = true

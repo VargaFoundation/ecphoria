@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         drop(coord);
         // Route the agent driver's run/step writes through Raft so runs started via /agents/run
         // (and their traces) replicate and survive leader failover.
+        #[cfg(feature = "agentic")]
         engine.set_run_replicator(Arc::new(ecphoria_cluster::CoordinatorRunReplicator::new(
             coordinator.clone(),
         )));
@@ -110,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Run dispatcher: on the leader (or single-node), periodically resume agent runs orphaned by a
     // crash / leader failover — the durable-execution recovery loop. No-op without a completion
-    // provider or when this node isn't the leader.
+    // provider or when this node isn't the leader. A memory-only build has no runs to resume, and
+    // does not spawn the loop at all.
+    #[cfg(feature = "agentic")]
     {
         let engine = engine.clone();
         let coord = cluster_handle.clone();

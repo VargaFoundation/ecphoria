@@ -8,6 +8,12 @@ rust-version.workspace = true
 description = "Core engine for the Ecphoria context lake"
 
 [features]
+default = ["agentic"]
+# The agent runtime: the durable run ledger, the agent driver, HITL approvals, DAG workflows,
+# event triggers and the downstream tool gateway (`engine/agentic.rs`, `runtime/`). On by default.
+# Build without it for a memory-only Ecphoria — no run ledger, no runtime database, no agent loop:
+#   cargo build -p ecphoria-server --no-default-features
+agentic = []
 # Local ONNX cross-encoder reranker (bge-reranker via fastembed/ort). Off by default — pulls a heavy
 # native onnxruntime dependency and downloads model weights on first use.
 rerank-local = ["dep:fastembed"]

@@ -442,6 +442,7 @@ async fn three_node_cluster_replicates_graph_supersede() {
 /// Replicate the agent-run ledger across a real 3-node cluster: create a run then patch it to
 /// Succeeded through quorum, and assert every node converges to the identical run row. Proves the
 /// agentic-platform run ledger is HA (survives failover), not single-node.
+#[cfg(feature = "agentic")]
 #[tokio::test]
 async fn three_node_cluster_replicates_runs() {
     use ecphoria_core::runtime::{RunPatch, RunStatus};

@@ -11,8 +11,21 @@ permissions:
 
 jobs:
   docker:
-    name: Build & Push Docker
+    name: Build & Push Docker (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Everything: memory substrate + agent runtime + LLM proxy.
+          - variant: full
+            features: ""
+            suffix: ""
+          # Memory only: no run ledger, no agent driver, no outbound completion call. Same image
+          # shape, a strictly smaller thing to reason about when the job is to hold facts.
+          - variant: memory
+            features: "--no-default-features"
+            suffix: "-memory"
     permissions:
       contents: read
       packages: write # push to GHCR
@@ -42,6 +55,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
 
       - uses: docker/build-push-action@v6
         id: build
@@ -49,10 +64,14 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            FEATURES=${{ matrix.features }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Keyed per variant: the two builds share no compiled artifact (different features), and
+          # one cache for both would thrash.
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
       # Keyless signature (Sigstore/Fulcio via GitHub OIDC) over the pushed image by digest.
       - name: Sign image with cosign
@@ -75,19 +94,20 @@ jobs:
         with:
           image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          output-file: ecphoria-sbom.spdx.json
+          output-file: ecphoria-sbom-${{ matrix.variant }}.spdx.json
 
       - name: Attest SBOM with cosign
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign attest --yes --predicate ecphoria-sbom.spdx.json --type spdxjson "${IMAGE}@${DIGEST}"
+          VARIANT: ${{ matrix.variant }}
+        run: cosign attest --yes --predicate "ecphoria-sbom-${VARIANT}.spdx.json" --type spdxjson "${IMAGE}@${DIGEST}"
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ecphoria-sbom
-          path: ecphoria-sbom.spdx.json
+          name: ecphoria-sbom-${{ matrix.variant }}
+          path: ecphoria-sbom-${{ matrix.variant }}.spdx.json
 
   operator-docker:
     name: Build & Push operator image

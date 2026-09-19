@@ -366,16 +366,28 @@ impl MemStore {
                 engine.memory_expire(ids).await?;
                 AppResponse::MemoryCount(ids.len() as u64)
             }
+            #[cfg(feature = "agentic")]
             AppRequest::RunCreate { run } => {
                 engine.run_apply_create(run).await?;
                 AppResponse::Ok
             }
+            #[cfg(feature = "agentic")]
             AppRequest::RunUpdate {
                 id,
                 patch,
                 updated_at,
             } => {
                 engine.run_apply_update(*id, patch, *updated_at).await?;
+                AppResponse::Ok
+            }
+            // A memory-only node still *reads* these entries — they are part of the log format —
+            // but it has no ledger to apply them to. Skipping is the only coherent answer, and
+            // saying so out loud beats an apply error on a node that was never meant to run agents.
+            #[cfg(not(feature = "agentic"))]
+            AppRequest::RunCreate { .. } | AppRequest::RunUpdate { .. } => {
+                tracing::warn!(
+                    "agent-run log entry on a node built without the `agentic` feature — skipped"
+                );
                 AppResponse::Ok
             }
         };

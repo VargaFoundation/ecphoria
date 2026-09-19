@@ -11,7 +11,11 @@ use ecphoria_core::EcphoriaEngine;
 
 use super::models::*;
 
+/// Runs, agents, tools and triggers. Feature `agentic` — their routes are not mounted without it
+/// (see `rest::routes::agent_routes`), so compiling them would only be dead weight.
+#[cfg(feature = "agentic")]
 mod runtime;
+#[cfg(feature = "agentic")]
 pub use runtime::*;
 mod memory;
 pub use memory::*;
@@ -609,6 +613,7 @@ pub async fn webhook(
             // Tag with the caller's tenant so webhook data is isolated like everything else.
             let tenant = auth.as_ref().and_then(|Extension(c)| c.tenant_id.clone());
             // Capture (source, event_type, payload) so we can evaluate event triggers after ingest.
+            #[cfg(feature = "agentic")]
             let trigger_inputs: Vec<(String, String, serde_json::Value)> = events
                 .iter()
                 .map(|e| (e.source.clone(), e.event_type.clone(), e.payload.clone()))
@@ -629,8 +634,13 @@ pub async fn webhook(
                     // Durable outcomes (tickets closed, incidents resolved) additionally become
                     // memories so they are reachable by `search_memory`, not only by SQL.
                     let promoted = engine.promote_events(tenant_str, &to_promote).await;
-                    // Event-driven agents: fire any matching triggers → start agent runs.
-                    let mut triggered_runs = Vec::new();
+                    // Event-driven agents: fire any matching triggers → start agent runs. Without
+                    // the agent runtime a webhook is ingestion and promotion only, and the field
+                    // stays in the response as an empty list rather than disappearing — a client
+                    // reading `triggered_runs` should not have to care which build it is talking to.
+                    #[allow(unused_mut)]
+                    let mut triggered_runs: Vec<String> = Vec::new();
+                    #[cfg(feature = "agentic")]
                     for (src, evt, payload) in trigger_inputs {
                         if let Ok(ids) = engine.fire_triggers(tenant_str, &src, &evt, payload).await
                         {

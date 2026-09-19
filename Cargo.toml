@@ -22,9 +22,11 @@ description = "The open-source agentic memory platform for AI agents"
 
 [workspace.dependencies]
 # Internal crates
-ecphoria-core = { path = "crates/ecphoria-core" }
-ecphoria-gateway = { path = "crates/ecphoria-gateway" }
-ecphoria-cluster = { path = "crates/ecphoria-cluster" }
+# `default-features = false` is spelled out so members can opt out (the gateway does, for the
+# memory-only build); Cargo ignores a member's `default-features` otherwise.
+ecphoria-core = { path = "crates/ecphoria-core", default-features = false }
+ecphoria-gateway = { path = "crates/ecphoria-gateway", default-features = false }
+ecphoria-cluster = { path = "crates/ecphoria-cluster", default-features = false }
 ecphoria-cli = { path = "crates/ecphoria-cli" }
 
 # Async runtime

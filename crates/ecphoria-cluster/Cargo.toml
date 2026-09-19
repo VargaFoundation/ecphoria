@@ -7,6 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Distributed clustering for the Ecphoria context lake"
 
+[features]
+default = ["agentic"]
+# Apply agent-run log entries. The `AppRequest` variants exist either way — they are the wire
+# format, and removing them would shift MessagePack's positional encoding — but a node built
+# without this has no ledger to apply them to and skips them with a warning.
+agentic = ["ecphoria-core/agentic"]
+
 [dependencies]
 ecphoria-core.workspace = true
 

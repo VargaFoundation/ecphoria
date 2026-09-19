@@ -109,7 +109,7 @@ pub fn router_with_engine_and_auth(
     let mut app = health_routes;
 
     // Protected API routes
-    let mut api_routes = Router::new()
+    let api_routes = Router::new()
         .route("/query", axum::routing::post(handlers::query))
         .route("/ingest", axum::routing::post(handlers::ingest))
         .route("/webhook/{source}", axum::routing::post(handlers::webhook))
@@ -320,46 +320,10 @@ pub fn router_with_engine_and_auth(
         .route(
             "/sessions/{session_id}/distill",
             axum::routing::post(handlers::session_distill),
-        )
-        .route(
-            "/runs",
-            axum::routing::post(handlers::run_create).get(handlers::run_list),
-        )
-        .route("/runs/{id}", axum::routing::get(handlers::run_get))
-        .route("/runs/{id}/trace", axum::routing::get(handlers::run_trace))
-        .route(
-            "/runs/{id}/cancel",
-            axum::routing::post(handlers::run_cancel),
-        )
-        .route(
-            "/runs/{id}/request-approval",
-            axum::routing::post(handlers::run_request_approval),
-        )
-        .route(
-            "/runs/{id}/approve",
-            axum::routing::post(handlers::run_approve),
-        )
-        .route(
-            "/runs/{id}/resume",
-            axum::routing::post(handlers::run_resume),
-        )
-        .route(
-            "/agents/run",
-            axum::routing::post(handlers::run_agent_endpoint),
-        )
-        .route(
-            "/tools",
-            axum::routing::post(handlers::register_tool).get(handlers::list_tools),
-        )
-        .route(
-            "/tools/{server}/call",
-            axum::routing::post(handlers::call_tool),
-        )
-        .route(
-            "/triggers",
-            axum::routing::post(handlers::trigger_register).get(handlers::trigger_list),
-        )
-        .with_state(engine.clone());
+        );
+
+    // Agent routes join the chain before the state is attached — see `agent_routes`.
+    let mut api_routes = agent_routes(api_routes).with_state(engine.clone());
 
     // Keep a handle so MCP + LLM-proxy routes can be authenticated too.
     let protocol_auth = auth_state.clone();
@@ -374,35 +338,40 @@ pub fn router_with_engine_and_auth(
         config.webhook_require_signature,
     )));
 
-    // MCP tool-gateway: a governed registry of downstream MCP servers agents can call. Also injected
-    // into the engine so the agent loop can invoke registered tools via `TOOL call`.
-    let tool_gateway = std::sync::Arc::new(crate::rest::tool_gateway::ToolGateway::new(
-        config.tool_gateway_allow_private_networks,
-    ));
-    // Repopulate the in-memory catalog from the durable copy, so a restart (or a follower that
-    // never served the original `POST /tools`) has the same tool surface as the node that
-    // registered them.
+    // The downstream tool catalog exists so an agent can call out; without the agent
+    // runtime there is nothing to call out *from*, and one fewer outbound HTTP client.
+    #[cfg(feature = "agentic")]
     {
-        let gw = tool_gateway.clone();
-        let eng = engine.clone();
-        tokio::spawn(async move {
-            match eng.tool_server_list().await {
-                Ok(servers) if !servers.is_empty() => {
-                    let n = servers.len();
-                    for (name, url) in servers {
-                        if let Err(e) = gw.register(name.clone(), url) {
-                            tracing::warn!(error = %e, %name, "persisted tool server is invalid");
+        // MCP tool-gateway: a governed registry of downstream MCP servers agents can call. Also injected
+        // into the engine so the agent loop can invoke registered tools via `TOOL call`.
+        let tool_gateway = std::sync::Arc::new(crate::rest::tool_gateway::ToolGateway::new(
+            config.tool_gateway_allow_private_networks,
+        ));
+        // Repopulate the in-memory catalog from the durable copy, so a restart (or a follower that
+        // never served the original `POST /tools`) has the same tool surface as the node that
+        // registered them.
+        {
+            let gw = tool_gateway.clone();
+            let eng = engine.clone();
+            tokio::spawn(async move {
+                match eng.tool_server_list().await {
+                    Ok(servers) if !servers.is_empty() => {
+                        let n = servers.len();
+                        for (name, url) in servers {
+                            if let Err(e) = gw.register(name.clone(), url) {
+                                tracing::warn!(error = %e, %name, "persisted tool server is invalid");
+                            }
                         }
+                        tracing::info!(servers = n, "restored downstream MCP tool catalog");
                     }
-                    tracing::info!(servers = n, "restored downstream MCP tool catalog");
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "failed to restore tool catalog"),
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "failed to restore tool catalog"),
-            }
-        });
+            });
+        }
+        engine.set_tool_executor(tool_gateway.clone());
+        api_routes = api_routes.layer(axum::Extension(tool_gateway));
     }
-    engine.set_tool_executor(tool_gateway.clone());
-    api_routes = api_routes.layer(axum::Extension(tool_gateway));
 
     // Coordinator handle for write replication (also handed to the MCP protocol routes below).
     let coordinator = cluster_state.as_ref().map(|cs| cs.coordinator.clone());
@@ -464,6 +433,7 @@ pub fn router_with_engine_and_auth(
     } else {
         tracing::info!("MCP server disabled (gateway.mcp_enabled = false)");
     }
+    #[cfg(feature = "llm-proxy")]
     if config.llm_proxy_enabled {
         protocol_routes = protocol_routes
             .route(
@@ -481,12 +451,14 @@ pub fn router_with_engine_and_auth(
     } else {
         tracing::info!("LLM proxy disabled (gateway.llm_proxy_enabled = false)");
     }
-    let mut protocol_routes = protocol_routes
-        .with_state(engine)
-        // Response-cache mode for the proxy (exact-match by default; similarity is opt-in).
-        .layer(axum::Extension(
+    let mut protocol_routes = protocol_routes.with_state(engine);
+    // Response-cache mode for the proxy (exact-match by default; similarity is opt-in).
+    #[cfg(feature = "llm-proxy")]
+    {
+        protocol_routes = protocol_routes.layer(axum::Extension(
             crate::llm_proxy::router::LlmCacheSimilarity(config.llm_cache_similarity),
         ));
+    }
 
     // MCP write tools replicate through Raft in cluster mode (MCP isn't leader-forwarded, so the
     // handler checks leadership itself).
@@ -590,6 +562,64 @@ async fn request_id_middleware(req: Request, next: Next) -> Response {
         response.headers_mut().insert(X_REQUEST_ID.clone(), val);
     }
     response
+}
+
+/// Runs, agents, tools and triggers — the routes that only mean something when the server can
+/// actually run an agent.
+///
+/// A separate function rather than a `#[cfg]` inside the builder chain: gating one arm of a method
+/// chain is not expressible, and a memory-only build should simply not have these paths. They
+/// answer 404 there, which is the honest answer — the capability is absent, not broken.
+#[cfg(feature = "agentic")]
+fn agent_routes(
+    router: Router<std::sync::Arc<EcphoriaEngine>>,
+) -> Router<std::sync::Arc<EcphoriaEngine>> {
+    router
+        .route(
+            "/runs",
+            axum::routing::post(handlers::run_create).get(handlers::run_list),
+        )
+        .route("/runs/{id}", axum::routing::get(handlers::run_get))
+        .route("/runs/{id}/trace", axum::routing::get(handlers::run_trace))
+        .route(
+            "/runs/{id}/cancel",
+            axum::routing::post(handlers::run_cancel),
+        )
+        .route(
+            "/runs/{id}/request-approval",
+            axum::routing::post(handlers::run_request_approval),
+        )
+        .route(
+            "/runs/{id}/approve",
+            axum::routing::post(handlers::run_approve),
+        )
+        .route(
+            "/runs/{id}/resume",
+            axum::routing::post(handlers::run_resume),
+        )
+        .route(
+            "/agents/run",
+            axum::routing::post(handlers::run_agent_endpoint),
+        )
+        .route(
+            "/tools",
+            axum::routing::post(handlers::register_tool).get(handlers::list_tools),
+        )
+        .route(
+            "/tools/{server}/call",
+            axum::routing::post(handlers::call_tool),
+        )
+        .route(
+            "/triggers",
+            axum::routing::post(handlers::trigger_register).get(handlers::trigger_list),
+        )
+}
+
+#[cfg(not(feature = "agentic"))]
+fn agent_routes(
+    router: Router<std::sync::Arc<EcphoriaEngine>>,
+) -> Router<std::sync::Arc<EcphoriaEngine>> {
+    router
 }
 
 #[cfg(test)]

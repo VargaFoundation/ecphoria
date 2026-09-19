@@ -26,6 +26,7 @@ async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[cfg(feature = "agentic")]
 #[tokio::test]
 async fn run_lifecycle_via_rest() {
     let app = engine_router().await;
@@ -121,6 +122,7 @@ async fn run_lifecycle_via_rest() {
     assert_eq!(json_body(resp).await["steps"].as_array().unwrap().len(), 0);
 }
 
+#[cfg(feature = "agentic")]
 #[tokio::test]
 async fn tool_gateway_register_and_list_via_rest() {
     let app = engine_router().await;
@@ -161,6 +163,7 @@ async fn tool_gateway_register_and_list_via_rest() {
     assert_eq!(servers[0]["name"], "github");
 }
 
+#[cfg(feature = "agentic")]
 #[tokio::test]
 async fn webhook_fires_trigger_into_run() {
     let app = engine_router().await;
@@ -1270,10 +1273,20 @@ async fn protocol_flags_gate_their_endpoints() {
         StatusCode::NOT_FOUND,
         "mcp_enabled = true should mount /mcp"
     );
+    // The config flag can only mount what the build contains: in a memory-only binary the proxy is
+    // not compiled, and `llm_proxy_enabled = true` mounts nothing. Both are 404 — the flag is a
+    // deployment choice, the feature is a build choice, and the build wins.
+    #[cfg(feature = "llm-proxy")]
     assert_ne!(
         status(&both_on, "/v1/chat/completions").await,
         StatusCode::NOT_FOUND,
         "llm_proxy_enabled = true should mount the proxy"
+    );
+    #[cfg(not(feature = "llm-proxy"))]
+    assert_eq!(
+        status(&both_on, "/v1/chat/completions").await,
+        StatusCode::NOT_FOUND,
+        "a build without the proxy must not mount it, whatever the config says"
     );
 
     let both_off = router_with(false, false).await;

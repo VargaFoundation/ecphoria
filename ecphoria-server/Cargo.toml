@@ -12,6 +12,19 @@ name = "ecphoria-server"
 path = "src/main.rs"
 
 [features]
+default = ["agentic", "llm-proxy"]
+# The agent runtime end to end: the run ledger and driver in the core, the /runs + /agents routes
+# and the downstream tool gateway in the gateway, the Raft apply of run entries in the cluster, and
+# this binary's dispatcher loop. Drop it for `ecphoria:memory` — a build that holds facts and
+# cannot act on them:
+#   cargo build -p ecphoria-server --release --no-default-features
+agentic = [
+    "ecphoria-core/agentic",
+    "ecphoria-gateway/agentic",
+    "ecphoria-cluster/agentic",
+]
+# The OpenAI-/Anthropic-compatible proxy (`/v1/*`) with auto-RAG and the semantic response cache.
+llm-proxy = ["ecphoria-gateway/llm-proxy"]
 # Passthrough to ecphoria-core's optional local ONNX backends (off by default; each pulls a heavy
 # native onnxruntime dep + model download). Build e.g.:
 #   cargo build -p ecphoria-server --release --features embed-local
@@ -30,7 +43,7 @@ otlp = [
 
 [dependencies]
 ecphoria-core.workspace = true
-ecphoria-gateway.workspace = true
+ecphoria-gateway = { workspace = true, default-features = false }
 ecphoria-cluster.workspace = true
 
 tokio.workspace = true

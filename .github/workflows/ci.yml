@@ -65,6 +65,23 @@ jobs:
       # embed-image is pure Rust (no ONNX) — build + test it here too.
       - run: cargo test -p ecphoria-core --features embed-image image_basic
 
+  memory-only:
+    name: Memory-only build (no agent runtime, no LLM proxy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `ecphoria:memory` is a published image, so its build has to keep working. The failure mode
+      # this catches is silent: a memory path that starts calling into the agent runtime compiles
+      # fine by default and only breaks here.
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo test --workspace --no-default-features
+      # Each feature on its own: a build with the proxy but no runtime (and the reverse) is a
+      # combination an operator can ask for, so it must compile.
+      - run: cargo check -p ecphoria-server --no-default-features --features agentic
+      - run: cargo check -p ecphoria-server --no-default-features --features llm-proxy
+
   test:
     name: Test
     runs-on: ubuntu-latest
