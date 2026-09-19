@@ -105,7 +105,10 @@ jobs:
 
   profile:
     name: Choregos profile (service under load)
-    if: github.event_name != 'pull_request'
+    # Explicitly the schedule and manual runs, not "anything that is not a pull request":
+    # adding the `push` trigger for the Criterion baseline would otherwise have signed this
+    # slow job up for every commit on `main` as a side effect.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
