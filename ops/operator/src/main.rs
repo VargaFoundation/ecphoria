@@ -298,7 +298,12 @@ async fn scale_up(sts: &Api<StatefulSet>, plan: &EcphoriaShardPlan, actual: usiz
 
 /// Scale DOWN: delete the drained shard StatefulSets `<release>-shard-<desired..actual>`. Call AFTER
 /// moving data off them (see `reconcile`), so no live data is lost.
-async fn scale_down(sts: &Api<StatefulSet>, plan: &EcphoriaShardPlan, desired: usize, actual: usize) {
+async fn scale_down(
+    sts: &Api<StatefulSet>,
+    plan: &EcphoriaShardPlan,
+    desired: usize,
+    actual: usize,
+) {
     for i in desired..actual {
         let name = format!("{}-shard-{i}", plan.spec.release);
         match sts.delete(&name, &Default::default()).await {
@@ -579,7 +584,10 @@ async fn main() -> Result<()> {
     // accepts) so you can install the CRD before running the controller.
     if std::env::args().any(|a| a == "--crd") {
         use kube::CustomResourceExt;
-        println!("{}", serde_json::to_string_pretty(&EcphoriaShardPlan::crd())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&EcphoriaShardPlan::crd())?
+        );
         return Ok(());
     }
 
