@@ -77,7 +77,10 @@ parked with the reason. Label: `deferred/major-bump`.
    RUSTSEC advisories. Clippy also needed attention: CI runs Rust 1.98, which enforces
    `result_large_err` on tonic- and axum-shaped signatures that 1.96 let pass.
 2. ✅ #7 and #15 closed — `main` already carried their target versions.
-3. ✅ The seven safe bumps merged, one at a time.
+3. ✅ The seven safe bumps are in. #21, #20, #18 and #19 merged; #11, #8 and #4 were applied
+   directly (the first two conflicted once their siblings landed on the same lines, and the
+   token in use may not merge a PR that touches a workflow file) and closed against the commit.
+   Nineteen open PRs became ten, and the ten left are exactly those that need a code change.
 4. ⬜ Open a single "operator: kube 4 + k8s-openapi 0.28 + schemars 1" PR and close #10, #14, #12.
 5. ⬜ Handle the four workflow-action bumps together, with one release dry-run at the end.
 6. ⬜ Leave #13, #17 and #16 until someone touches those subsystems for another reason.
