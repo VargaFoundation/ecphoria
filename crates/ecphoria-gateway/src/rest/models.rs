@@ -181,6 +181,121 @@ pub struct MemoryAddRequest {
     /// without splitting the store — see `docs/knowledge-base.md`.
     #[serde(default)]
     pub project: Option<String>,
+    /// When the fact *became true*, if that differs from when it is being recorded. Defaults to
+    /// now. Backfills need it: without it, an imported decision reads as taken today.
+    #[serde(default)]
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Upsert keyed on the caller's own identifier — see `memory_upsert_by_external_id`.
+#[derive(Debug, Deserialize)]
+pub struct MemoryExternalUpsertRequest {
+    /// The caller's identifier for this fact (a ticket key, a commit sha, a row id).
+    pub external_id: String,
+    /// Which system the identifier belongs to. Two systems may use the same id for different facts.
+    #[serde(default = "default_external_source")]
+    pub source: String,
+    pub content: String,
+    /// Optional stable key; defaults to `ext:{source}:{external_id}` so re-sending the same
+    /// identifier lands on the same subject and supersedes its previous version.
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub importance: Option<f32>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub mem_type: Option<String>,
+    #[serde(default)]
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn default_external_source() -> String {
+    "external".into()
+}
+
+/// Everything an agent should know before a task, assembled in one call — see `context_pack`.
+#[derive(Debug, Deserialize)]
+pub struct ContextPackRequest {
+    /// What the agent is about to do, in its own words. Drives retrieval.
+    pub query: String,
+    /// Files the task is allowed to touch. A memory that names paths is kept only if one matches.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Keep only these `metadata.kind` values (e.g. `decision`, `incident`). Empty = all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Hard ceiling on what is returned, in tokens. The pack is truncated to fit, never exceeded.
+    #[serde(default = "default_budget_tokens")]
+    pub budget_tokens: usize,
+    /// How many candidates to retrieve before the budget cut.
+    #[serde(default = "default_pack_k")]
+    pub k: usize,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn default_budget_tokens() -> usize {
+    4_000
+}
+
+fn default_pack_k() -> usize {
+    20
+}
+
+/// Query string of `POST /api/v1/memories`.
+#[derive(Debug, Deserialize)]
+pub struct MemoryAddParams {
+    /// `pending` proposes instead of writing. Anything else (or absent) writes.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Query string of `GET /api/v1/pending`.
+#[derive(Debug, Deserialize)]
+pub struct PendingListParams {
+    #[serde(default = "default_pending_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn default_pending_limit() -> usize {
+    100
+}
+
+/// Create (or confirm) a tenant — see `tenant_create`.
+#[derive(Debug, Deserialize)]
+pub struct TenantCreateRequest {
+    /// Tenant identifier. Everything stored under it is isolated from every other tenant.
+    pub name: String,
+    /// Refuse writes that carry no provenance for this tenant (see `gateway.require_provenance`).
+    #[serde(default)]
+    pub require_provenance: bool,
 }
 
 /// Re-embed active memories with the currently-configured provider (after a model/dimension change).

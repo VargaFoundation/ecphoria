@@ -873,6 +873,59 @@ pub async fn enforce_retention(
     scatter_admin(shard, &headers, "/api/v1/admin/retention", local).await
 }
 
+/// Create — or confirm — a tenant. Admin only (under `/admin/`).
+///
+/// POST /api/v1/admin/tenants { "name": "billing-api", "require_provenance": true }
+///
+/// Tenants are **implicit** in the stores: a row carries its `tenant_id` and that is the whole
+/// isolation mechanism, so nothing has to be created before writing. The endpoint exists anyway
+/// because a provisioning step needs an answer to "does this tenant exist, and is it mine to use?"
+/// *before* it sends data — and because getting a 200 here is how an operator learns their
+/// credential can actually write to that tenant. Idempotent: an existing tenant reports its
+/// current memory count and `created: false`.
+pub async fn create_tenant(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    Json(req): Json<TenantCreateRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "create_tenant").increment(1);
+
+    let name = req.name.trim();
+    if name.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "name is required".into(),
+        );
+    }
+    // A tenant-scoped credential may only provision its own tenant — otherwise any project could
+    // call itself another and start writing there.
+    if let Some(Extension(ctx)) = &auth {
+        if let Some(scoped) = &ctx.tenant_id {
+            if scoped != name {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "TENANT_MISMATCH",
+                    format!("this credential is scoped to tenant '{scoped}'"),
+                );
+            }
+        }
+    }
+
+    let scope = ecphoria_core::memory::cognition::MemoryScope {
+        tenant_id: name.to_string(),
+        user_id: None,
+        agent_id: None,
+        session_id: None,
+    };
+    let existing = engine.memory_all(&scope, 1).await.unwrap_or_default();
+    api_ok(serde_json::json!({
+        "tenant": name,
+        "created": existing.is_empty(),
+        "require_provenance": req.require_provenance,
+    }))
+}
+
 /// Trigger a backup of all stores to the configured data directory.
 /// GDPR erasure — delete ALL data for a tenant across every store. Admin only (under /admin/).
 ///
@@ -1497,6 +1550,55 @@ pub async fn session_distill(
 // ── Memory Cognition ────────────────────────────────────────────────
 
 /// Resolve a memory scope, preferring the authenticated tenant for isolation.
+/// Tenant named by the `X-Ecphoria-Tenant` request header, when the deployment lets clients pick.
+///
+/// A client with one credential and many tenants (an orchestrator serving several projects, say)
+/// would otherwise have to repeat `tenant_id` in every body — including on endpoints whose body is
+/// not a JSON object. A tenant-scoped token still wins: the header can only choose when the
+/// credential itself does not.
+#[derive(Clone, Debug)]
+pub struct TenantHeader(pub String);
+
+/// Middleware: lift `X-Ecphoria-Tenant` into a request extension.
+pub async fn tenant_header_layer(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(tenant) = req
+        .headers()
+        .get("x-ecphoria-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 200)
+        .map(str::to_string)
+    {
+        req.extensions_mut().insert(TenantHeader(tenant));
+    }
+    next.run(req).await
+}
+
+/// [`scope_from`] that also considers the `X-Ecphoria-Tenant` header.
+///
+/// Precedence, strictest first: the token's own tenant (a security boundary — a scoped key must
+/// never reach another tenant), then the request body, then the header, then `default`.
+pub(crate) fn scope_with_header(
+    auth: &Option<Extension<crate::auth::middleware::AuthContext>>,
+    header: &Option<Extension<TenantHeader>>,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+) -> ecphoria_core::memory::cognition::MemoryScope {
+    let from_header = header.as_ref().map(|Extension(t)| t.0.as_str());
+    scope_from(
+        auth,
+        tenant_id.or(from_header),
+        user_id,
+        agent_id,
+        session_id,
+    )
+}
+
 pub(crate) fn scope_from(
     auth: &Option<Extension<crate::auth::middleware::AuthContext>>,
     tenant_id: Option<&str>,
@@ -1737,6 +1839,7 @@ pub async fn memory_templates() -> Response {
 pub async fn memory_from_template(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     Json(req): Json<FromTemplateRequest>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_from_template")
@@ -1751,8 +1854,9 @@ pub async fn memory_from_template(
             ),
         );
     };
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -1877,6 +1981,7 @@ pub async fn graph_communities(
 pub async fn attachment_upload(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     axum::extract::Query(q): axum::extract::Query<AttachmentUploadQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1927,7 +2032,14 @@ pub async fn attachment_upload(
     if let Some(caption) = q.caption.as_deref().filter(|c| !c.trim().is_empty()) {
         // Scope the caption to the uploader's user (if given) so their user-scoped search surfaces it
         // — not just a tenant-wide scope. Tenant still comes from the auth context.
-        let scope = scope_from(&auth, None, q.user_id.as_deref(), None, None);
+        let scope = scope_with_header(
+            &auth,
+            &tenant_header,
+            None,
+            q.user_id.as_deref(),
+            None,
+            None,
+        );
         let mut input =
             ecphoria_core::memory::cognition::MemoryInput::new(scope, caption.to_string());
         input.metadata = serde_json::json!({

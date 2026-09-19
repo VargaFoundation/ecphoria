@@ -2209,6 +2209,7 @@ dependencies = [
  "ecphoria-gateway",
  "jsonwebtoken",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tower 0.5.3",

@@ -241,6 +241,61 @@ rest, and expires any that vanished. Returns
 Pass `valid_from` — the source commit date — so the timeline reflects when the documentation
 changed rather than when the import ran. See [Knowledge base](./knowledge-base.md).
 
+### Upsert on your own identifier
+
+```bash
+PUT /api/v1/memories/by-external-id
+{ "external_id": "PROJ-42", "source": "jira", "content": "Invoices are immutable once sent" }
+```
+
+For importers, connectors and webhooks. A redelivery, a rerun or a restarted sync must converge on
+**one** memory per source record — so the identifier maps to a stable subject
+(`ext:{source}:{external_id}` unless you pass your own). Unchanged content confirms the existing
+memory (`outcome: confirmed`); changed content supersedes it. No duplicate rows, no client-side
+bookkeeping.
+
+### Propose instead of write
+
+```bash
+POST /api/v1/memories?status=pending      # → { "id": "...", "status": "pending" }
+GET  /api/v1/pending                      # → { "items": [...], "count": N }
+POST /api/v1/pending/{id}/accept
+POST /api/v1/pending/{id}/reject
+```
+
+Some clients may contribute to memory without deciding what is true — an agent, most obviously: one
+that writes directly can talk itself into anything on the next run. A proposal is stored `pending`,
+which retrieval never reads (every read path filters `state = 'active'`), so it is invisible until
+someone accepts it. Accepting runs the **normal** cognition path, so it supersedes what it
+contradicts like any other write. Rejecting keeps the row, expired, with the decision in its
+metadata — a judgement is evidence, and deleting it loses that.
+
+### Context pack
+
+```bash
+POST /api/v1/context-pack
+{ "query": "fix the invoice rounding", "paths": ["src/billing/**"],
+  "kinds": ["convention", "incident"], "budget_tokens": 4000 }
+```
+
+One bounded answer instead of three retrieval calls. Runs hybrid retrieval, splits the result into
+`memories` (what is true) and `incidents` (what went wrong), keeps only the kinds asked for and the
+memories whose `metadata.paths` overlap the task's allowed paths, then cuts to the token budget —
+highest-ranked first, so truncation drops the least relevant. `tokens_estimated` is what was kept
+and `truncated` says whether anything was dropped: the budget is a ceiling, never a target.
+
+### Multi-tenant clients
+
+A client serving several tenants with one credential can select the tenant per request:
+
+```bash
+curl -H "X-Ecphoria-Tenant: billing-api" ...
+```
+
+A tenant-scoped token still wins — the header only chooses when the credential itself does not.
+`POST /api/v1/admin/tenants { "name": "billing-api" }` confirms a tenant exists and that the
+credential may write to it, before any data is sent.
+
 ### Provenance and feedback
 
 ```bash

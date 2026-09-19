@@ -171,6 +171,10 @@ All prefixed with `ECPHORIA_`. Nested keys use `__`. Examples:
 | **Driver replication** | Working | `RunReplicator` (`CoordinatorRunReplicator`) routes run/step/state writes through Raft → runs started via `/agents/run` survive failover |
 | **Sharding (multi-Raft)** | Working | `cluster.shards=N` independent groups; `ShardRouter` consistent hash; gateway routes by tenant (HTTP reverse-proxy; gRPC/PG reject-with-owner); `scale_plan` + k8s operator (`ops/operator/`, verified on Docker Desktop) |
 | **PG-wire tenant auth** | Working | Password = API key/JWT → tenant-scoped queries + shard-aware; validated with a real `tokio-postgres` client |
+| **Governed writes** | Working | `MemoryState::Pending` + `POST /memories?status=pending` / `GET /pending` / `accept`+`reject` — a client that may contribute without deciding. Pending is invisible to retrieval by construction (every read path filters `state='active'`); accepting runs the normal cognition path, rejecting keeps the row with the judgement |
+| **External identity** | Working | `PUT /memories/by-external-id` — `(source, external_id)` → stable subject, so a webhook redelivery or a rerun backfill confirms instead of duplicating |
+| **Context pack** | Working | `POST /api/v1/context-pack` — hybrid retrieval split into memories/incidents, filtered by kind and by overlap with the task's allowed paths, truncated to a token budget highest-rank-first |
+| **Tenant header** | Working | `X-Ecphoria-Tenant` selects the tenant per request for a client serving several; a tenant-scoped token still wins. `POST /admin/tenants` confirms existence + write access before provisioning sends data |
 | **Benchmark harness** | Working | LoCoMo eval (`examples/locomo_eval.rs`) + `ops/bench/` turnkey runner using the Claude CLI (no API key) |
 
 ## Parallel Development Guidelines

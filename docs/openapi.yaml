@@ -131,7 +131,16 @@ paths:
       responses: { '200': { description: '{ version: N }' } }
   /api/v1/memories:
     post:
-      summary: Add a memory (dedup / contradiction / importance)
+      summary: Add a memory (dedup / contradiction / importance), or propose one
+      description: >
+        `?status=pending` proposes instead of writing: the memory is stored `pending`, is invisible
+        to retrieval, and waits in the review queue (`GET /api/v1/pending`). Same body either way —
+        which of the two a client may do is a permission question, not a different endpoint.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending] }
+          description: '`pending` proposes; absent writes.'
       requestBody:
         required: true
         content:
@@ -152,7 +161,13 @@ paths:
                   description: >
                     Project this memory belongs to, within its scope. Facts with the same subject in
                     different projects are distinct, and a later search can narrow to one project.
-      responses: { '200': { description: MemoryAdd (memory + outcome) } }
+                valid_from:
+                  type: string
+                  format: date-time
+                  description: >
+                    When the fact became true, if that differs from now. A backfill without it reads
+                    as if every imported decision was taken today.
+      responses: { '200': { description: 'MemoryAdd (memory + outcome), or { id, status: pending }' } }
     get:
       summary: List active memories in a scope
       parameters:
@@ -161,6 +176,97 @@ paths:
         - { name: agent_id, in: query, schema: { type: string } }
         - { name: session_id, in: query, schema: { type: string } }
       responses: { '200': { description: '{ memories: [...], count: N }' } }
+  /api/v1/memories/by-external-id:
+    put:
+      summary: Upsert a memory keyed on the caller's own identifier
+      description: >
+        For importers, connectors and webhooks: a redelivery, a rerun or a restarted sync must all
+        converge on ONE memory per source record. The identifier maps to a stable subject
+        (`ext:{source}:{external_id}` unless you pass your own), so unchanged content confirms the
+        existing memory and changed content supersedes it — the same cognition as any other write,
+        with no duplicate row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [external_id, content]
+              properties:
+                external_id: { type: string, description: "The caller's id: ticket key, commit sha, row id." }
+                source: { type: string, default: external, description: 'Which system the id belongs to.' }
+                content: { type: string }
+                subject: { type: string }
+                importance: { type: number }
+                metadata: { type: object }
+                mem_type: { type: string }
+                valid_from: { type: string, format: date-time }
+                project: { type: string }
+      responses:
+        '200': { description: '{ id, outcome, memory }' }
+        '400': { description: blank external_id or content }
+  /api/v1/context-pack:
+    post:
+      summary: Everything an agent should know before a task, in one bounded answer
+      description: >
+        Runs hybrid retrieval, splits the result into memories (what is true) and incidents (what
+        went wrong), keeps only the kinds asked for and the memories whose paths overlap the task's
+        allowed paths, and cuts the whole thing to a token budget — highest-ranked first, so
+        truncation drops the least relevant. `tokens_estimated` is what was kept; `truncated` says
+        whether anything was dropped.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, description: 'What the agent is about to do.' }
+                paths:
+                  type: array
+                  items: { type: string }
+                  description: >
+                    Files the task may touch (globs allowed). A memory that names paths is kept only
+                    if one overlaps; a memory that names none is general knowledge and always passes.
+                kinds:
+                  type: array
+                  items: { type: string }
+                  description: 'Keep only these `metadata.kind` values. Empty = all.'
+                budget_tokens: { type: integer, default: 4000 }
+                k: { type: integer, default: 20 }
+                project: { type: string }
+      responses:
+        '200': { description: '{ memories, incidents, related_items, tokens_estimated, truncated, candidates }' }
+        '400': { description: blank query }
+  /api/v1/pending:
+    get:
+      summary: The review queue — proposals waiting for a decision, oldest first
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: user_id, in: query, schema: { type: string } }
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+      responses: { '200': { description: '{ items: [Memory], count: N }' } }
+  /api/v1/pending/{id}/accept:
+    post:
+      summary: Accept a proposal — it goes through the normal cognition path
+      description: >
+        The accepted memory supersedes what it contradicts exactly like a direct write. The
+        proposal row is retired with the decision recorded. A second accept finds nothing pending.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ accepted: true, memory }' }
+        '404': { description: not a pending proposal of this tenant }
+  /api/v1/pending/{id}/reject:
+    post:
+      summary: Reject a proposal — kept, expired, with the judgement recorded
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ rejected: true, id }' }
+        '404': { description: not a pending proposal of this tenant }
   /api/v1/memories/batch:
     post:
       summary: Bulk-add memories (same cognition, batched I/O — ~4.8x faster than a loop)
@@ -380,6 +486,27 @@ paths:
     post:
       summary: Trigger a full backup (admin)
       responses: { '200': { description: Backup path } }
+  /api/v1/admin/tenants:
+    post:
+      summary: Create — or confirm — a tenant (admin)
+      description: >
+        Tenants are implicit in the stores, so nothing has to be created before writing. This exists
+        for provisioning: it answers "does this tenant exist, and may my credential write to it?"
+        BEFORE data is sent. Idempotent — an existing tenant reports `created: false`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                require_provenance: { type: boolean, default: false }
+      responses:
+        '200': { description: '{ tenant, created, require_provenance }' }
+        '400': { description: blank name }
+        '403': { description: credential scoped to another tenant }
   /api/v1/admin/tenants/{tenant_id}:
     delete:
       summary: GDPR erasure — delete all data for a tenant across every store (admin)

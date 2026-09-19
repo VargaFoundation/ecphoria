@@ -142,6 +142,7 @@ pub fn router_with_engine_and_auth(
             "/admin/retention/policies",
             axum::routing::get(handlers::retention_policies).put(handlers::retention_policies),
         )
+        .route("/admin/tenants", axum::routing::post(handlers::create_tenant))
         .route("/admin/backup", axum::routing::post(handlers::backup))
         .route("/admin/restore", axum::routing::post(handlers::restore))
         .route("/admin/reindex", axum::routing::post(handlers::reindex))
@@ -169,7 +170,22 @@ pub fn router_with_engine_and_auth(
         )
         .route(
             "/memories",
-            axum::routing::post(handlers::memory_add).get(handlers::memory_list),
+            // `?status=pending` proposes instead of writing — same body, different authority.
+            axum::routing::post(handlers::memory_add_or_propose).get(handlers::memory_list),
+        )
+        .route(
+            "/memories/by-external-id",
+            axum::routing::put(handlers::memory_upsert_by_external_id),
+        )
+        .route("/context-pack", axum::routing::post(handlers::context_pack))
+        .route("/pending", axum::routing::get(handlers::pending_list))
+        .route(
+            "/pending/{id}/accept",
+            axum::routing::post(handlers::pending_accept),
+        )
+        .route(
+            "/pending/{id}/reject",
+            axum::routing::post(handlers::pending_reject),
         )
         .route(
             "/memories/batch",
@@ -347,6 +363,9 @@ pub fn router_with_engine_and_auth(
 
     // Keep a handle so MCP + LLM-proxy routes can be authenticated too.
     let protocol_auth = auth_state.clone();
+
+    // `X-Ecphoria-Tenant` → request extension, for clients that serve several tenants with one key.
+    api_routes = api_routes.layer(axum::middleware::from_fn(handlers::tenant_header_layer));
 
     // Expose the webhook signature verifier (per-source secrets + vendor schemes) to the handler.
     api_routes = api_routes.layer(axum::Extension(handlers::WebhookVerifier::from_config(

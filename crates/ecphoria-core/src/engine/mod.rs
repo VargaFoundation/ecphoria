@@ -2901,6 +2901,7 @@ impl EcphoriaEngine {
             MemoryState::Active => "upserted",
             MemoryState::Superseded => "superseded",
             MemoryState::Expired => "expired",
+            MemoryState::Pending => "proposed",
         };
         let _ = self.memory_change_tx.send(MemoryChange {
             id: memory.id,
@@ -3736,6 +3737,124 @@ impl EcphoriaEngine {
             }
             FeedbackAction::Retire(ids) => self.memory_expire(&ids).await,
         }
+    }
+
+    // ── Governed writes: propose → review → accept/reject ──────────────────────────────
+
+    /// Record a **proposal**: a memory a client may suggest but not decide.
+    ///
+    /// Deliberately not the cognition path. A proposal changes no belief, so it supersedes
+    /// nothing, merges with nothing, and gets no vector: it is written `pending` and is invisible
+    /// to retrieval until someone accepts it. That is the point — an agent that can write
+    /// directly into memory can talk itself into anything on the next run.
+    pub async fn memory_propose(&self, mut input: MemoryInput) -> Result<Memory> {
+        if input.scope.tenant_id.is_empty() {
+            input.scope.tenant_id = "default".into();
+        }
+        let now = chrono::Utc::now();
+        let memory = Memory {
+            id: uuid::Uuid::new_v4(),
+            scope: input.scope,
+            subject: input.subject,
+            content: input.content,
+            importance: input.importance.unwrap_or(0.5).clamp(0.0, 1.0),
+            valid_from: input.valid_from.unwrap_or(now),
+            valid_to: None,
+            state: MemoryState::Pending,
+            supersedes: None,
+            source_event_ids: input.source_event_ids,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+            metadata: input.metadata,
+            mem_type: input.mem_type.unwrap_or_else(|| "semantic".into()),
+            project: input.project,
+        };
+        self.memory_store.upsert_raw(&memory, None).await?;
+        self.publish_memory_change(&memory);
+        metrics::counter!("ecphoria_memory_proposed_total").increment(1);
+        Ok(memory)
+    }
+
+    /// The review queue for a scope: proposals waiting for a decision, oldest first.
+    pub async fn memory_pending(&self, scope: &MemoryScope, limit: usize) -> Result<Vec<Memory>> {
+        let limit = limit.min(self.config.query.max_rows);
+        self.memory_store.list_pending(scope, limit).await
+    }
+
+    /// Accept a proposal: it goes through the **normal** cognition path, so it supersedes what it
+    /// contradicts exactly like a direct write, and the proposal row is retired.
+    ///
+    /// `Ok(None)` means the id is not a pending proposal of this tenant — already decided, never
+    /// existed, or someone else's. Idempotent in effect: a second accept finds nothing pending.
+    pub async fn memory_accept(&self, id: uuid::Uuid, tenant: &str) -> Result<Option<MemoryAdd>> {
+        let Some(proposal) = self.pending_of(id, tenant).await? else {
+            return Ok(None);
+        };
+        let input = MemoryInput {
+            scope: proposal.scope.clone(),
+            subject: proposal.subject.clone(),
+            content: proposal.content.clone(),
+            importance: Some(proposal.importance),
+            source_event_ids: proposal.source_event_ids.clone(),
+            metadata: proposal.metadata.clone(),
+            mem_type: Some(proposal.mem_type.clone()),
+            valid_from: Some(proposal.valid_from),
+            project: proposal.project.clone(),
+        };
+        let added = self.memory_add(input).await?;
+        self.retire_proposal(proposal, "accepted", Some(added.memory.id))
+            .await?;
+        metrics::counter!("ecphoria_memory_proposals_resolved_total", "decision" => "accepted")
+            .increment(1);
+        Ok(Some(added))
+    }
+
+    /// Reject a proposal. The row is kept, expired, with the decision recorded in its metadata:
+    /// a rejected proposal is evidence of a judgement, and deleting it loses that.
+    pub async fn memory_reject(&self, id: uuid::Uuid, tenant: &str) -> Result<bool> {
+        let Some(proposal) = self.pending_of(id, tenant).await? else {
+            return Ok(false);
+        };
+        self.retire_proposal(proposal, "rejected", None).await?;
+        metrics::counter!("ecphoria_memory_proposals_resolved_total", "decision" => "rejected")
+            .increment(1);
+        Ok(true)
+    }
+
+    /// The pending proposal `id` of `tenant`, or `None` if it is not pending / not theirs.
+    async fn pending_of(&self, id: uuid::Uuid, tenant: &str) -> Result<Option<Memory>> {
+        Ok(self
+            .memory_store
+            .get_scoped(id, tenant)
+            .await?
+            .filter(|m| m.state == MemoryState::Pending))
+    }
+
+    async fn retire_proposal(
+        &self,
+        mut proposal: Memory,
+        decision: &str,
+        accepted_as: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now();
+        proposal.state = MemoryState::Expired;
+        proposal.valid_to = Some(now);
+        proposal.updated_at = now;
+        proposal.version += 1;
+        if let Some(map) = proposal.metadata.as_object_mut() {
+            map.insert("review_decision".into(), serde_json::json!(decision));
+            map.insert("review_decided_at".into(), serde_json::json!(now));
+            if let Some(accepted) = accepted_as {
+                map.insert(
+                    "review_accepted_as".into(),
+                    serde_json::json!(accepted.to_string()),
+                );
+            }
+        }
+        self.memory_store.upsert_raw(&proposal, None).await?;
+        self.publish_memory_change(&proposal);
+        Ok(())
     }
 
     /// Get a memory by id, scoped to a tenant (None if owned by another tenant).

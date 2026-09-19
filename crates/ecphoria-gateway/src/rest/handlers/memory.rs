@@ -11,7 +11,29 @@ use ecphoria_core::EcphoriaEngine;
 
 use crate::rest::models::*;
 
-use super::{api_error, api_ok, cluster_write_error, parse_as_of, scope_from};
+use super::{api_error, api_ok, cluster_write_error, parse_as_of, scope_with_header, TenantHeader};
+
+/// `POST /api/v1/memories` — write a memory, or **propose** one with `?status=pending`.
+///
+/// One route, two authorities: a client that may decide writes; a client that may only suggest
+/// adds `?status=pending` and lands in the review queue. Splitting them into two paths would let
+/// a caller reach the deciding one by changing a URL; splitting them by *permission* is the
+/// deployment's job, and this keeps the request body identical either way.
+pub async fn memory_add_or_propose(
+    state: State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    cluster: Option<
+        Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
+    >,
+    axum::extract::Query(params): axum::extract::Query<MemoryAddParams>,
+    body: Json<MemoryAddRequest>,
+) -> Response {
+    if params.status.as_deref() == Some("pending") {
+        return memory_propose(state, auth, tenant_header, body).await;
+    }
+    memory_add(state, auth, tenant_header, cluster, body).await
+}
 
 /// Add a memory through the cognition pipeline (dedup / contradiction / importance).
 ///
@@ -19,6 +41,7 @@ use super::{api_error, api_ok, cluster_write_error, parse_as_of, scope_from};
 pub async fn memory_add(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     cluster: Option<
         Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
     >,
@@ -34,8 +57,9 @@ pub async fn memory_add(
         );
     }
 
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -49,7 +73,7 @@ pub async fn memory_add(
         source_event_ids: vec![],
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
         mem_type: req.mem_type,
-        valid_from: None,
+        valid_from: req.valid_from,
         project: req.project,
     };
 
@@ -101,6 +125,7 @@ const MAX_BATCH_MEMORIES: usize = 10_000;
 pub async fn document_ingest(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     Json(req): Json<DocumentIngestRequest>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "document_ingest").increment(1);
@@ -120,8 +145,9 @@ pub async fn document_ingest(
         );
     }
 
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -169,6 +195,7 @@ pub async fn document_ingest(
 pub async fn document_prune(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     Json(req): Json<DocumentPruneRequest>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "document_prune").increment(1);
@@ -188,8 +215,9 @@ pub async fn document_prune(
             "keep_paths must not be empty — refusing to expire an entire project".into(),
         );
     }
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -223,6 +251,7 @@ pub async fn document_prune(
 pub async fn memory_add_batch(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     cluster: Option<
         Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
     >,
@@ -264,8 +293,9 @@ pub async fn memory_add_batch(
         .memories
         .into_iter()
         .map(|m| ecphoria_core::memory::cognition::MemoryInput {
-            scope: scope_from(
+            scope: scope_with_header(
                 &auth,
+                &tenant_header,
                 m.tenant_id.as_deref(),
                 m.user_id.as_deref(),
                 m.agent_id.as_deref(),
@@ -327,12 +357,14 @@ pub async fn memory_add_batch(
 pub async fn memory_search(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     Json(req): Json<MemorySearchRequest>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_search").increment(1);
 
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -442,12 +474,14 @@ pub async fn grant_revoke(
 pub async fn memory_list(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     axum::extract::Query(params): axum::extract::Query<MemoryListParams>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_list").increment(1);
 
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         params.tenant_id.as_deref(),
         params.user_id.as_deref(),
         params.agent_id.as_deref(),
@@ -655,6 +689,7 @@ pub async fn memory_update(
 pub async fn memory_history_by_subject(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     axum::extract::Query(q): axum::extract::Query<MemoryHistoryQuery>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_history_by_subject")
@@ -666,8 +701,9 @@ pub async fn memory_history_by_subject(
             "subject is required".into(),
         );
     }
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         q.tenant_id.as_deref(),
         q.user_id.as_deref(),
         q.agent_id.as_deref(),
@@ -878,12 +914,14 @@ pub async fn memory_feedback(
 pub async fn memory_contradictions(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     axum::extract::Query(q): axum::extract::Query<ContradictionsQuery>,
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_contradictions")
         .increment(1);
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         None,
         q.user_id.as_deref(),
         q.agent_id.as_deref(),
@@ -906,6 +944,7 @@ pub async fn memory_contradictions(
 pub async fn memory_resolve_contradiction(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     cluster: Option<
         Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
     >,
@@ -913,8 +952,9 @@ pub async fn memory_resolve_contradiction(
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_resolve_contradiction")
         .increment(1);
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         None,
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -1010,6 +1050,7 @@ pub async fn memory_reembed(
 pub async fn memory_consolidate(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     cluster: Option<
         Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
     >,
@@ -1017,8 +1058,9 @@ pub async fn memory_consolidate(
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_consolidate")
         .increment(1);
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -1083,6 +1125,7 @@ pub async fn memory_consolidate(
 pub async fn memory_consolidate_similar(
     State(engine): State<Arc<EcphoriaEngine>>,
     auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
     cluster: Option<
         Extension<std::sync::Arc<tokio::sync::RwLock<ecphoria_cluster::ClusterCoordinator>>>,
     >,
@@ -1090,8 +1133,9 @@ pub async fn memory_consolidate_similar(
 ) -> Response {
     metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_consolidate_similar")
         .increment(1);
-    let scope = scope_from(
+    let scope = scope_with_header(
         &auth,
+        &tenant_header,
         req.tenant_id.as_deref(),
         req.user_id.as_deref(),
         req.agent_id.as_deref(),
@@ -1305,4 +1349,403 @@ pub async fn memory_edges(
             e.to_string(),
         ),
     }
+}
+
+// ── Governed writes, external identity, and context packs ──────────────────────────────
+
+/// Propose a memory instead of writing one — `POST /api/v1/memories?status=pending`.
+///
+/// Same body as `memory_add`. The result is a `pending` memory: invisible to retrieval, waiting
+/// for `POST /api/v1/pending/{id}/accept`. This is the endpoint an agent gets when it may
+/// contribute to memory but not decide what is true.
+pub async fn memory_propose(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    Json(req): Json<MemoryAddRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_propose").increment(1);
+
+    if req.content.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "content is required".into(),
+        );
+    }
+    let scope = scope_with_header(
+        &auth,
+        &tenant_header,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let input = ecphoria_core::memory::cognition::MemoryInput {
+        scope,
+        subject: req.subject,
+        content: req.content,
+        importance: req.importance,
+        source_event_ids: vec![],
+        metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        mem_type: req.mem_type,
+        valid_from: req.valid_from,
+        project: req.project,
+    };
+    match engine.memory_propose(input).await {
+        Ok(memory) => api_ok(serde_json::json!({
+            "id": memory.id,
+            "status": "pending",
+            "memory": memory,
+        })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// The review queue — `GET /api/v1/pending`.
+pub async fn pending_list(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    axum::extract::Query(params): axum::extract::Query<PendingListParams>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "pending_list").increment(1);
+
+    let scope = scope_with_header(
+        &auth,
+        &tenant_header,
+        params.tenant_id.as_deref(),
+        params.user_id.as_deref(),
+        params.agent_id.as_deref(),
+        params.session_id.as_deref(),
+    );
+    match engine.memory_pending(&scope, params.limit).await {
+        Ok(items) => api_ok(serde_json::json!({ "items": items, "count": items.len() })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Accept a proposal — `POST /api/v1/pending/{id}/accept`.
+pub async fn pending_accept(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "pending_accept").increment(1);
+    let (uuid, tenant) = match proposal_target(&id, &auth, &tenant_header) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    match engine.memory_accept(uuid, &tenant).await {
+        Ok(Some(added)) => api_ok(serde_json::json!({ "accepted": true, "memory": added.memory })),
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_PENDING",
+            format!("no pending proposal {id} for this tenant"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Reject a proposal — `POST /api/v1/pending/{id}/reject`.
+pub async fn pending_reject(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    Path(id): Path<String>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "pending_reject").increment(1);
+    let (uuid, tenant) = match proposal_target(&id, &auth, &tenant_header) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    match engine.memory_reject(uuid, &tenant).await {
+        Ok(true) => api_ok(serde_json::json!({ "rejected": true, "id": id })),
+        Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_PENDING",
+            format!("no pending proposal {id} for this tenant"),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Parse a proposal id and resolve the tenant that may decide on it.
+fn proposal_target(
+    id: &str,
+    auth: &Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: &Option<Extension<TenantHeader>>,
+) -> std::result::Result<(uuid::Uuid, String), Box<Response>> {
+    let parsed = uuid::Uuid::parse_str(id).map_err(|_| {
+        Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_ID",
+            format!("'{id}' is not a valid memory id"),
+        ))
+    })?;
+    let scope = scope_with_header(auth, tenant_header, None, None, None, None);
+    Ok((parsed, scope.tenant_id))
+}
+
+/// Upsert keyed on the caller's identifier — `PUT /api/v1/memories/by-external-id`.
+///
+/// For importers and connectors: a webhook that redelivers, a backfill that reruns, a sync that
+/// restarts must all converge on **one** memory per source record. The identifier maps to a stable
+/// subject, so re-sending unchanged content confirms the existing memory and changed content
+/// supersedes it — the same cognition every other write goes through, with no duplicate row.
+pub async fn memory_upsert_by_external_id(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    Json(req): Json<MemoryExternalUpsertRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "memory_upsert_external")
+        .increment(1);
+
+    if req.external_id.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "external_id is required".into(),
+        );
+    }
+    if req.content.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "content is required".into(),
+        );
+    }
+
+    let scope = scope_with_header(
+        &auth,
+        &tenant_header,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let subject = req
+        .subject
+        .clone()
+        .unwrap_or_else(|| format!("ext:{}:{}", req.source, req.external_id));
+    let mut metadata = req
+        .metadata
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert("external_id".into(), serde_json::json!(req.external_id));
+        map.insert("source".into(), serde_json::json!(req.source));
+    }
+    let input = ecphoria_core::memory::cognition::MemoryInput {
+        scope,
+        subject: Some(subject),
+        content: req.content,
+        importance: req.importance,
+        source_event_ids: vec![],
+        metadata,
+        mem_type: req.mem_type,
+        valid_from: req.valid_from,
+        project: req.project,
+    };
+    match engine.memory_add(input).await {
+        Ok(added) => api_ok(serde_json::json!({
+            "id": added.memory.id,
+            "outcome": added.outcome,
+            "memory": added.memory,
+        })),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEMORY_ERROR",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Everything an agent should know before a task, in one call — `POST /api/v1/context-pack`.
+///
+/// An agent runtime does not want to orchestrate three retrieval calls and then guess how much of
+/// the result fits in its prompt. It wants one bounded answer. This endpoint runs the normal
+/// hybrid retrieval, splits what comes back into **memories** (what is true) and **incidents**
+/// (what went wrong), filters by allowed paths and kinds, and cuts the whole thing to a token
+/// budget — highest-ranked first, so truncation drops the least relevant, never the best.
+///
+/// The budget is a ceiling, not a target: `tokens_estimated` is what was actually kept, and
+/// `truncated` says whether anything was dropped to respect it.
+pub async fn context_pack(
+    State(engine): State<Arc<EcphoriaEngine>>,
+    auth: Option<Extension<crate::auth::middleware::AuthContext>>,
+    tenant_header: Option<Extension<TenantHeader>>,
+    Json(req): Json<ContextPackRequest>,
+) -> Response {
+    metrics::counter!("ecphoria_rest_requests_total", "endpoint" => "context_pack").increment(1);
+
+    if req.query.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FIELD",
+            "query is required".into(),
+        );
+    }
+    let scope = scope_with_header(
+        &auth,
+        &tenant_header,
+        req.tenant_id.as_deref(),
+        req.user_id.as_deref(),
+        req.agent_id.as_deref(),
+        req.session_id.as_deref(),
+    );
+    let hits = match engine
+        .memory_search_filtered(
+            &req.query,
+            &scope,
+            req.k.clamp(1, 200),
+            req.project.as_deref(),
+            None,
+        )
+        .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MEMORY_ERROR",
+                e.to_string(),
+            )
+        }
+    };
+
+    let mut memories = Vec::new();
+    let mut incidents = Vec::new();
+    let mut spent = 0usize;
+    let mut truncated = false;
+    for hit in &hits {
+        let memory = &hit.memory;
+        if !kind_allowed(memory, &req.kinds) || !paths_allow(memory, &req.paths) {
+            continue;
+        }
+        let cost = estimate_tokens(&memory.content);
+        if spent + cost > req.budget_tokens {
+            // Ranked order: everything after this point is less relevant, so stop rather than
+            // cherry-pick shorter items and hand back a pack that misrepresents the ranking.
+            truncated = true;
+            break;
+        }
+        spent += cost;
+        let item = pack_item(memory, hit.score);
+        if kind_of(memory).as_deref() == Some("incident") {
+            incidents.push(item);
+        } else {
+            memories.push(item);
+        }
+    }
+
+    api_ok(serde_json::json!({
+        "query": req.query,
+        "memories": memories,
+        "incidents": incidents,
+        "related_items": Vec::<serde_json::Value>::new(),
+        "tokens_estimated": spent,
+        "budget_tokens": req.budget_tokens,
+        "truncated": truncated,
+        "candidates": hits.len(),
+    }))
+}
+
+/// Rough token count: ~4 characters per token. Deliberately an estimate — the exact number
+/// depends on the consumer's tokenizer, and a pack that is 5 % under budget is harmless while a
+/// pack that overflows the prompt is not.
+fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+fn kind_of(memory: &ecphoria_core::memory::cognition::Memory) -> Option<String> {
+    memory
+        .metadata
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn kind_allowed(memory: &ecphoria_core::memory::cognition::Memory, kinds: &[String]) -> bool {
+    if kinds.is_empty() {
+        return true;
+    }
+    kind_of(memory).is_some_and(|kind| kinds.iter().any(|k| k == &kind))
+}
+
+/// A memory that names paths is only relevant to a task allowed to touch one of them. A memory
+/// that names none is general knowledge and always passes.
+fn paths_allow(memory: &ecphoria_core::memory::cognition::Memory, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let Some(paths) = memory.metadata.get("paths").and_then(|v| v.as_array()) else {
+        return true;
+    };
+    if paths.is_empty() {
+        return true;
+    }
+    paths
+        .iter()
+        .filter_map(|p| p.as_str())
+        .any(|path| allowed.iter().any(|pattern| overlaps(path, pattern)))
+}
+
+/// Do a memory's path and a task's allowed path refer to the same code?
+///
+/// Both sides may be globs: a memory can be filed against `src/orders/**` while a task is allowed
+/// `src/orders/total.py`, or the reverse. Matching in one direction only would drop exactly the
+/// memories a task needs, so the test is symmetric.
+fn overlaps(path: &str, pattern: &str) -> bool {
+    path_matches(path, pattern) || path_matches(pattern, path)
+}
+
+/// Glob-lite match: `src/**` and `src/*.rs` behave as a caller expects without pulling a glob
+/// crate into the gateway.
+fn path_matches(path: &str, pattern: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    if let Some(prefix) = pattern.strip_suffix("**") {
+        return path.starts_with(prefix);
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        return path.starts_with(prefix) && path.ends_with(suffix);
+    }
+    path == pattern
+}
+
+fn pack_item(memory: &ecphoria_core::memory::cognition::Memory, score: f32) -> serde_json::Value {
+    serde_json::json!({
+        "id": memory.id,
+        "kind": kind_of(memory).unwrap_or_else(|| memory.mem_type.clone()),
+        "subject": memory.subject.clone().unwrap_or_default(),
+        "content": memory.content,
+        "score": score,
+        "valid_from": memory.valid_from,
+        "valid_to": memory.valid_to,
+        "provenance": memory
+            .metadata
+            .get("provenance")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    })
 }

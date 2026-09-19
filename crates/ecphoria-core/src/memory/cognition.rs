@@ -91,6 +91,13 @@ pub enum MemoryState {
     Superseded,
     /// Aged out / forgotten.
     Expired,
+    /// **Proposed**, not believed: written by a client that may not decide on its own (an agent),
+    /// waiting for a human or a rule to accept it.
+    ///
+    /// Retrieval reads `state = 'active'` everywhere, so a pending memory is invisible to search
+    /// by construction rather than by a filter someone has to remember to add. Accepting one runs
+    /// the normal cognition path, so it supersedes what it contradicts like any other write.
+    Pending,
 }
 
 impl MemoryState {
@@ -99,6 +106,7 @@ impl MemoryState {
             MemoryState::Active => "active",
             MemoryState::Superseded => "superseded",
             MemoryState::Expired => "expired",
+            MemoryState::Pending => "pending",
         }
     }
 
@@ -106,6 +114,7 @@ impl MemoryState {
         match s {
             "superseded" => MemoryState::Superseded,
             "expired" => MemoryState::Expired,
+            "pending" => MemoryState::Pending,
             _ => MemoryState::Active,
         }
     }
@@ -1381,6 +1390,26 @@ impl MemoryStore {
             Self::SELECT_COLS,
             where_sql,
             project_sql
+        );
+        self.query_memories(&sql, &params)
+    }
+
+    /// Memories **proposed** in a scope and not yet accepted or rejected, oldest first.
+    ///
+    /// Oldest first on purpose: a review queue is worked front to back, and a proposal that has
+    /// waited two weeks matters more than one filed this morning.
+    pub async fn list_pending(
+        &self,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> crate::Result<Vec<Memory>> {
+        let (where_sql, params) = scope.where_clause();
+        let sql = format!(
+            "SELECT {} FROM memories WHERE {} AND state = 'pending' \
+             ORDER BY created_at ASC LIMIT {}",
+            Self::SELECT_COLS,
+            where_sql,
+            limit.clamp(1, 10_000)
         );
         self.query_memories(&sql, &params)
     }
