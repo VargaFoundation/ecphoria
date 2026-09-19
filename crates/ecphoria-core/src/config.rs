@@ -350,6 +350,12 @@ pub struct EmbeddingConfig {
     pub batch_size: usize,
     pub ollama_url: String,
     pub openai_api_key: String,
+    /// Base URL of the OpenAI-compatible embeddings endpoint.
+    ///
+    /// Anything that speaks `POST {base}/embeddings` works: OpenAI itself, a LiteLLM proxy, vLLM,
+    /// Ollama's OpenAI shim. Pointing it at a gateway is how a deployment keeps **one** place
+    /// where model access is priced and rate-limited.
+    pub openai_base_url: String,
     /// Anthropic API key — used by the Claude completion provider (extraction / rerank / eval).
     pub anthropic_api_key: String,
     /// Task-instruction prefix for **search queries** (asymmetric retrieval). `None` → auto-derive
@@ -401,6 +407,7 @@ impl Default for EmbeddingConfig {
             dimension: 768,
             batch_size: 64,
             ollama_url: "http://localhost:11434".into(),
+            openai_base_url: "https://api.openai.com/v1".into(),
             openai_api_key: String::new(),
             anthropic_api_key: String::new(),
             query_prefix: None,

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiProvider {
     client: Client,
     api_key: String,
+    base_url: String,
     model: String,
     dimension: usize,
     query_prefix: String,
@@ -34,11 +35,25 @@ impl OpenAiProvider {
         Self {
             client: Client::new(),
             api_key,
+            base_url: "https://api.openai.com/v1".into(),
             model,
             dimension,
             query_prefix: String::new(),
             document_prefix: String::new(),
         }
+    }
+
+    /// Point the provider at any OpenAI-compatible endpoint (LiteLLM, vLLM, a local shim).
+    ///
+    /// A trailing slash is tolerated: an operator copying a gateway URL from a dashboard should
+    /// not have to know that it matters.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let url = base_url.into();
+        let trimmed = url.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            self.base_url = trimmed.to_string();
+        }
+        self
     }
 
     /// Set the asymmetric retrieval task prefixes (query / document). OpenAI `text-embedding-3-*`
@@ -64,7 +79,7 @@ impl super::EmbeddingProvider for OpenAiProvider {
 
         let response = self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(format!("{}/embeddings", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&request)
             .send()
@@ -75,7 +90,8 @@ impl super::EmbeddingProvider for OpenAiProvider {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(crate::Error::Embedding(format!(
-                "OpenAI returned {status}: {body}"
+                "{} returned {status}: {body}",
+                self.base_url
             )));
         }
 
@@ -125,5 +141,29 @@ mod tests {
         let provider = OpenAiProvider::new("sk-test".into(), "model".into(), 1536);
         let result = provider.embed(&[]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn defaults_to_openai_and_accepts_any_compatible_endpoint() {
+        let default = OpenAiProvider::new("sk-test".into(), "model".into(), 1536);
+        assert_eq!(default.base_url, "https://api.openai.com/v1");
+
+        let gateway = OpenAiProvider::new("sk-test".into(), "model".into(), 1536)
+            .with_base_url("http://litellm:4000/v1");
+        assert_eq!(gateway.base_url, "http://litellm:4000/v1");
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_an_operator_error() {
+        let provider = OpenAiProvider::new("sk-test".into(), "model".into(), 1536)
+            .with_base_url("http://litellm:4000/v1/");
+        assert_eq!(provider.base_url, "http://litellm:4000/v1");
+    }
+
+    #[test]
+    fn an_empty_base_url_keeps_the_default() {
+        let provider =
+            OpenAiProvider::new("sk-test".into(), "model".into(), 1536).with_base_url("");
+        assert_eq!(provider.base_url, "https://api.openai.com/v1");
     }
 }

@@ -79,10 +79,15 @@ config:
     enabled: true
     # nodeId is auto-assigned from StatefulSet ordinal
   embedding:
+    # `ollama`, `openai`, `openai_compatible` (any endpoint speaking POST {baseUrl}/embeddings —
+    # LiteLLM, vLLM, an Ollama shim), `local`/`fastembed` (in-process ONNX), or `none`.
     provider: ollama
     model: nomic-embed-text
     dimension: 768
     ollamaUrl: "http://ollama:11434"
+    # Used by `openai` and `openai_compatible`. Pointing this at a gateway keeps one place where
+    # model access is priced and rate-limited.
+    openaiBaseUrl: "https://api.openai.com/v1"
 
 # -- Service configuration
 service:

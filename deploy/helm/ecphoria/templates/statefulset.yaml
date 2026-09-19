@@ -176,6 +176,10 @@ spec:
               value: {{ .Values.config.embedding.model | quote }}
             - name: ECPHORIA_EMBEDDING__OLLAMA_URL
               value: {{ .Values.config.embedding.ollamaUrl | quote }}
+            {{- with .Values.config.embedding.openaiBaseUrl }}
+            - name: ECPHORIA_EMBEDDING__OPENAI_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
           # Init script to derive node_id and peers from StatefulSet
           command:
             - /bin/sh

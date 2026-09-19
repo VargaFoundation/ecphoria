@@ -307,15 +307,26 @@ impl EcphoriaEngine {
                     .with_prefixes(qp, dp),
                 ))
             }
-            "openai" if !config.embedding.openai_api_key.is_empty() => {
+            // `openai_compatible` is the same wire protocol pointed at someone else's endpoint
+            // — a LiteLLM proxy, vLLM, an Ollama shim — where the key may be a gateway key or
+            // nothing at all. `openai` keeps requiring a key, because api.openai.com does.
+            "openai" | "openai_compatible" | "openai-compatible"
+                if !config.embedding.openai_api_key.is_empty()
+                    || config.embedding.provider != "openai" =>
+            {
                 let (qp, dp) = config.embedding.resolved_prefixes();
-                tracing::info!(model = %config.embedding.model, "embedding provider: openai");
+                tracing::info!(
+                    model = %config.embedding.model,
+                    base_url = %config.embedding.openai_base_url,
+                    "embedding provider: openai-compatible"
+                );
                 Some(Arc::new(
                     OpenAiProvider::new(
                         config.embedding.openai_api_key.clone(),
                         config.embedding.model.clone(),
                         config.embedding.dimension,
                     )
+                    .with_base_url(config.embedding.openai_base_url.clone())
                     .with_prefixes(qp, dp),
                 ))
             }
