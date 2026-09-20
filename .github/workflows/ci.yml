@@ -437,3 +437,19 @@ jobs:
           docker logs ecph-smoke 2>&1 | tail -30
           docker rm -f ecph-smoke >/dev/null 2>&1 || true
           [ "$ok" = 1 ]
+
+  actionlint:
+    name: Workflows
+    # v0.2.4 n'a rien publié : le workflow de release était invalide — une dépendance
+    # cyclique, `manifest` qui avait fini par se dépendre lui-même. GitHub l'a rejeté avant
+    # de lancer le moindre job, avec pour seule explication « This run likely failed because
+    # of a workflow file issue ». `actionlint` le dit en une ligne et pointe le numéro.
+    #
+    # Un workflow qui ne s'exécute qu'au tag ne peut pas être éprouvé autrement.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color

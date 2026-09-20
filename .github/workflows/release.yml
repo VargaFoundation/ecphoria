@@ -81,7 +81,7 @@ jobs:
 
   manifest:
     name: Manifeste, signature et SBOM (${{ matrix.variant }})
-    needs: manifest
+    needs: docker
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/vargafoundation/ecphoria
@@ -251,7 +251,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: docker
+    needs: manifest
     permissions:
       contents: write # create the GitHub Release + upload assets
     steps:
