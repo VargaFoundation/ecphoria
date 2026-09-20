@@ -57,7 +57,12 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pemfile = { version = "2" }
 
 # Database / Storage
-duckdb = { version = "1", features = ["bundled"] }
+# `json` en plus de `bundled` : l'extension est alors liée statiquement au binaire. Sans
+# elle, DuckDB essaie de la charger dynamiquement au premier `CREATE TABLE`, et sur musl
+# (l'image Alpine) le chargement dynamique n'existe pas — le serveur paniquait au
+# démarrage sur « Extension Autoloading Error … Dynamic loading not supported ». Les
+# images publiées n'auraient jamais démarré.
+duckdb = { version = "1", features = ["bundled", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Vector search

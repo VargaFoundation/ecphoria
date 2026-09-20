@@ -401,7 +401,30 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: ecphoria:ci
           build-args: FEATURES=--no-default-features
           platforms: linux/amd64
           cache-from: type=gha,scope=docker-build
           cache-to: type=gha,mode=max,scope=docker-build
+
+      # « Ça se construit » et « ça démarre » sont deux questions différentes, et la seconde
+      # est celle qui compte. L'image de la v0.2.1 se construisait et paniquait au premier
+      # `CREATE TABLE` : DuckDB tentait de charger son extension `json` dynamiquement, ce que
+      # musl ne permet pas. Un build vert ne l'aurait pas vu.
+      - name: Le serveur démarre dans l'image
+        run: |
+          docker run --rm -d --name ecph-smoke \
+            -e ECPHORIA_GATEWAY__LISTEN=127.0.0.1:8432 \
+            -e ECPHORIA_GATEWAY__PG_LISTEN=127.0.0.1:5432 \
+            -e ECPHORIA_GATEWAY__GRPC_LISTEN=127.0.0.1:9432 \
+            ecphoria:ci
+          ok=
+          for _ in $(seq 90); do
+            if docker logs ecph-smoke 2>&1 | grep -q "Ecphoria engine initialized"; then ok=1; break; fi
+            if ! docker ps -q --filter name=ecph-smoke | grep -q .; then break; fi
+            sleep 1
+          done
+          docker logs ecph-smoke 2>&1 | tail -30
+          docker rm -f ecph-smoke >/dev/null 2>&1 || true
+          [ "$ok" = 1 ]
