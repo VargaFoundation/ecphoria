@@ -13,6 +13,14 @@ jobs:
   docker:
     name: Build & Push Docker (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    # En dur et en minuscules. Une référence OCI n'accepte pas de majuscule, et
+    # `github.repository` porte la casse du dépôt (`VargaFoundation/ecphoria`) :
+    # `docker/metadata-action` la corrige pour ses tags, mais `cosign` et les attestations
+    # reçoivent la valeur brute et tombent sur « parsing reference: could not parse
+    # reference ». C'est ce qui a fait échouer la signature de l'image de l'opérateur en
+    # v0.2.0, après un push pourtant réussi. Le chart écrit déjà ce nom en dur.
+    env:
+      IMAGE: ghcr.io/vargafoundation/ecphoria
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +57,7 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -85,7 +93,6 @@ jobs:
       # Keyless signature (Sigstore/Fulcio via GitHub OIDC) over the pushed image by digest.
       - name: Sign image with cosign
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
@@ -93,7 +100,7 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -101,13 +108,12 @@ jobs:
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: ecphoria-sbom-${{ matrix.variant }}.spdx.json
 
       - name: Attest SBOM with cosign
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
           VARIANT: ${{ matrix.variant }}
         run: cosign attest --yes --predicate "ecphoria-sbom-${VARIANT}.spdx.json" --type spdxjson "${IMAGE}@${DIGEST}"
@@ -120,6 +126,8 @@ jobs:
 
   operator-docker:
     name: Build & Push operator image
+    env:
+      IMAGE: ghcr.io/vargafoundation/ecphoria-operator
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -139,7 +147,7 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/${{ github.repository_owner }}/ecphoria-operator
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -166,13 +174,12 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Sign operator image with cosign
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/ecphoria-operator
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
       - name: Attest operator build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/ecphoria-operator
+          subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
