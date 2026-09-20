@@ -8,6 +8,12 @@ docs/
 sdk/
 website/
 tests/
+# …sauf `tests/integration`, qui est un **membre du workspace** (`Cargo.toml`, ligne 9).
+# `cargo chef prepare` lit le manifeste de chaque membre : sans lui, la construction meurt
+# sur « failed to load manifest for workspace member /app/tests/integration ». C'est la
+# raison pour laquelle aucune image n'a jamais été publiée, v0.1.0 comprise.
+!tests/integration/
+!tests/integration/**
 deploy/
 *.jsx
 *.Zone.Identifier
