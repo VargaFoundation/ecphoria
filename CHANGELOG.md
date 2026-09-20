@@ -2,6 +2,17 @@
 
 All notable changes to Ecphoria will be documented in this file.
 
+## [0.2.2] - 2026-09-20
+
+### Bug Fixes
+
+- *(docker)* Alpine has no `linux/futex.h`
+- *(duckdb)* The published image would never have started
+
+### Miscellaneous
+
+- Build the container image on every pull request
+
 ## [0.2.1] - 2026-09-20
 
 ### Bug Fixes
