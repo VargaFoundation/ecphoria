@@ -382,7 +382,7 @@ jobs:
         run: tail -n 100 /tmp/ecphoria-sharded/shard-*/server.log 2>/dev/null || true
 
   docker-build:
-    name: Container image builds
+    name: Container image builds (${{ matrix.platform }})
     # Trois releases de suite sont tombées dans cette construction — `tests/integration`
     # exclu du contexte alors qu'il est membre du workspace, la casse du dépôt dans les
     # références cosign, `linux-headers` absent pour abseil — et aucune n'aurait pu être vue
@@ -393,7 +393,16 @@ jobs:
     # Pas de push, pas de signature, une seule architecture : c'est un contrôle de
     # constructibilité, pas une publication. La variante mémoire suffit — elle partage tout
     # le chemin de construction avec l'édition complète, et coûte moins.
-    runs-on: ubuntu-latest
+    #
+    # Les deux architectures, chacune sur un runner natif. `ubuntu-24.04-arm` est gratuit pour
+    # un dépôt public, et c'est la seule façon raisonnable de construire arm64 ici : sous
+    # émulation QEMU, `protobuf-src` compile abseil en C++ et la construction dépassait
+    # 3 h 30 sans finir — c'est ce qui a fait annuler la release v0.2.2.
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -404,9 +413,9 @@ jobs:
           load: true
           tags: ecphoria:ci
           build-args: FEATURES=--no-default-features
-          platforms: linux/amd64
-          cache-from: type=gha,scope=docker-build
-          cache-to: type=gha,mode=max,scope=docker-build
+          platforms: linux/${{ matrix.platform }}
+          cache-from: type=gha,scope=docker-build-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=docker-build-${{ matrix.platform }}
 
       # « Ça se construit » et « ça démarre » sont deux questions différentes, et la seconde
       # est celle qui compte. L'image de la v0.2.1 se construisait et paniquait au premier
