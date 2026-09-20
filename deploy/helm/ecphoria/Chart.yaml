@@ -2,8 +2,8 @@ apiVersion: v2
 name: ecphoria
 description: The open-source context lake for AI agents
 type: application
-version: 0.2.2
-appVersion: "0.2.2"
+version: 0.2.3
+appVersion: "0.2.3"
 keywords:
   - ai
   - agents

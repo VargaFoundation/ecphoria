@@ -79,7 +79,18 @@ jobs:
         id: build
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # amd64 seul, et c'est une décision, pas un oubli.
+          #
+          # arm64 se construisait sous QEMU sur un runner x86. Depuis que `protobuf-src`
+          # (arrivée avec tonic 0.14) compile protobuf et abseil depuis les sources C++,
+          # cette émulation ne tient plus : la construction de v0.2.2 tournait encore après
+          # **3 h 35**, sans avoir atteint la signature, pour une limite de job à 6 h. Aucune
+          # image n'ayant jamais été publiée, arm64 n'est pas une régression — c'est une
+          # plateforme qu'il faut construire sur un runner natif (`ubuntu-24.04-arm`, gratuit
+          # pour un dépôt public) avec un assemblage de manifeste par digest. À faire ; en
+          # attendant, mieux vaut une image amd64 publiée que deux plateformes qui n'existent
+          # pas.
+          platforms: linux/amd64
           push: true
           build-args: |
             FEATURES=${{ matrix.features }}
@@ -166,7 +177,18 @@ jobs:
         id: build
         with:
           context: ops/operator
-          platforms: linux/amd64,linux/arm64
+          # amd64 seul, et c'est une décision, pas un oubli.
+          #
+          # arm64 se construisait sous QEMU sur un runner x86. Depuis que `protobuf-src`
+          # (arrivée avec tonic 0.14) compile protobuf et abseil depuis les sources C++,
+          # cette émulation ne tient plus : la construction de v0.2.2 tournait encore après
+          # **3 h 35**, sans avoir atteint la signature, pour une limite de job à 6 h. Aucune
+          # image n'ayant jamais été publiée, arm64 n'est pas une régression — c'est une
+          # plateforme qu'il faut construire sur un runner natif (`ubuntu-24.04-arm`, gratuit
+          # pour un dépôt public) avec un assemblage de manifeste par digest. À faire ; en
+          # attendant, mieux vaut une image amd64 publiée que deux plateformes qui n'existent
+          # pas.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
