@@ -2,6 +2,13 @@
 
 All notable changes to Ecphoria will be documented in this file.
 
+## [0.2.1] - 2026-09-20
+
+### Bug Fixes
+
+- *(docker)* The image has never been buildable since `tests/integration` joined
+- *(release)* Cosign could not parse the image reference
+
 ## [0.2.0] - 2026-09-20
 
 ### Bug Fixes
