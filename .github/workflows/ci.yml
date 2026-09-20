@@ -380,3 +380,28 @@ jobs:
       - name: Node logs on failure
         if: failure()
         run: tail -n 100 /tmp/ecphoria-sharded/shard-*/server.log 2>/dev/null || true
+
+  docker-build:
+    name: Container image builds
+    # Trois releases de suite sont tombées dans cette construction — `tests/integration`
+    # exclu du contexte alors qu'il est membre du workspace, la casse du dépôt dans les
+    # références cosign, `linux-headers` absent pour abseil — et aucune n'aurait pu être vue
+    # avant, parce que **rien ne construisait cette image en dehors d'un tag**. Une
+    # dépendance change, l'image cesse de se construire, et on l'apprend au moment de
+    # publier. Ici, on l'apprend à la pull request.
+    #
+    # Pas de push, pas de signature, une seule architecture : c'est un contrôle de
+    # constructibilité, pas une publication. La variante mémoire suffit — elle partage tout
+    # le chemin de construction avec l'édition complète, et coûte moins.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          build-args: FEATURES=--no-default-features
+          platforms: linux/amd64
+          cache-from: type=gha,scope=docker-build
+          cache-to: type=gha,mode=max,scope=docker-build
