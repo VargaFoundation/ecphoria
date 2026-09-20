@@ -1,6 +1,10 @@
 # Stage 1: Chef — dependency caching layer
 FROM rust:1-alpine AS chef
-RUN apk add --no-cache musl-dev cmake g++ make pkgconf openssl-dev openssl-libs-static perl
+# `linux-headers` : `protobuf-src` (build-dependency arrivée avec tonic 0.14) compile
+# abseil, qui inclut `linux/futex.h`. Alpine ne le fournit pas par défaut — sans lui,
+# `cargo chef cook` meurt sur « fatal error: linux/futex.h: No such file or directory ».
+RUN apk add --no-cache musl-dev cmake g++ make pkgconf openssl-dev openssl-libs-static perl \
+      linux-headers
 RUN cargo install cargo-chef
 WORKDIR /app
 
