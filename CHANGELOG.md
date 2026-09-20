@@ -2,6 +2,13 @@
 
 All notable changes to Ecphoria will be documented in this file.
 
+## [0.2.4] - 2026-09-20
+
+### Miscellaneous
+
+- *(docker)* Construire les deux architectures, chacune sur un runner natif
+- *(release)* Publier les deux architectures, chacune construite nativement
+
 ## [0.2.2] - 2026-09-20
 
 ### Bug Fixes
