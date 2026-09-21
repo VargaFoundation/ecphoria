@@ -289,15 +289,26 @@ jobs:
       # tenant id that would arrive at the server under a different name.
       # A green backup job that uploads nothing is worse than no backup at all.
       - name: The CronJob refuses to render when it could not work
+        # `! cmd` sous `set -e` ne déclenche pas l'errexit (shellcheck SC2251) : si le rendu
+        # réussissait là où il doit échouer, les deux premières lignes le laissaient passer
+        # sans un mot, et seule la dernière faisait rougir l'étape. Deux garde-fous sur trois
+        # ne gardaient rien. Une fonction qui sort explicitement remet les trois au travail.
         run: |
-          ! helm template ecphoria deploy/helm/ecphoria \
-              --set backup.cronjob.enabled=true --set backup.cronjob.apiKeySecret=k 2>/dev/null
-          ! helm template ecphoria deploy/helm/ecphoria \
-              --set backup.cronjob.enabled=true --set config.storage.s3.bucket=b 2>/dev/null
+          refuse() {
+            local motif="$1"; shift
+            if helm template ecphoria deploy/helm/ecphoria "$@" >/dev/null 2>&1; then
+              echo "::error::le chart a rendu alors qu'il devait refuser — $motif"
+              exit 1
+            fi
+          }
+          refuse "sauvegarde S3 sans bucket" \
+            --set backup.cronjob.enabled=true --set backup.cronjob.apiKeySecret=k
+          refuse "sauvegarde sans clé d'API alors que l'auth est active" \
+            --set backup.cronjob.enabled=true --set config.storage.s3.bucket=b
           # A hyphenated tenant id becomes an underscore on the env round-trip, silently governing
           # a tenant that does not exist. The chart refuses rather than mis-scope the rules.
-          ! helm template ecphoria deploy/helm/ecphoria \
-              --set config.memory.governance.tenants.acme-prod.factValidation=strict 2>/dev/null
+          refuse "identifiant de tenant avec un tiret" \
+            --set config.memory.governance.tenants.acme-prod.factValidation=strict
 
   build:
     name: Build

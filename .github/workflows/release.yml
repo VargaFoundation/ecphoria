@@ -139,6 +139,10 @@ jobs:
       - name: Assembler la liste de manifestes
         working-directory: /tmp/digests
         run: |
+          # Le découpage en mots est ici l'effet recherché : `jq` produit la liste des `-t`,
+          # `printf` celle des références par digest. Les quoter passerait un seul argument
+          # géant à `imagetools`.
+          # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${IMAGE}@sha256:%s " *)
