@@ -128,7 +128,7 @@ sqlparser = { version = "0.53", features = ["visitor"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-rustyline = { version = "15" }
+rustyline = { version = "18" }
 
 # Global allocator — mimalloc avoids the multi-threaded slowdown of the musl allocator on
 # allocation-heavy workloads (DuckDB), measurable on ingest/query p95.
