@@ -63,7 +63,7 @@ rustls-pemfile = { version = "2" }
 # démarrage sur « Extension Autoloading Error … Dynamic loading not supported ». Les
 # images publiées n'auraient jamais démarré.
 duckdb = { version = "1", features = ["bundled", "json"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Vector search
 usearch = { version = "2" }
