@@ -52,7 +52,7 @@ tonic-prost-build = { version = "0.14" }
 protobuf-src = { version = "2" }
 
 # PostgreSQL wire protocol
-pgwire = { version = "0.28" }
+pgwire = { version = "0.41" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = { version = "2" }
 
